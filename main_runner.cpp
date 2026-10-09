@@ -379,6 +379,9 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Natural boot mode: let game initialization run naturally
+        rt.fast_boot = false;
+
         // Boot into room 0 (runs initial persistent controllers and globals)
         rt.start_room(0);
         if (target_room >= 0) {
@@ -405,14 +408,14 @@ int main(int argc, char** argv) {
 
                 rt.step();
 
+                if (f == cfg.headless_frames - 1 || !cfg.dump_frame_path.empty()) {
+                    g_current_frame = rt.draw();
+                }
+
                 g_keys_pressed.clear();
                 g_keys_released.clear();
                 rt.keys_pressed.clear();
                 rt.keys_released.clear();
-
-                if (f == cfg.headless_frames - 1 || !cfg.dump_frame_path.empty()) {
-                    g_current_frame = rt.draw();
-                }
             }
             std::printf("[runner] Headless execution completed successfully.\n");
             if (!cfg.dump_frame_path.empty() && g_current_frame.w > 0) {
@@ -482,12 +485,10 @@ int main(int argc, char** argv) {
         // High resolution timer setup
         timeBeginPeriod(1);
 
-        LARGE_INTEGER qpc_freq, qpc_prev, qpc_start;
+        LARGE_INTEGER qpc_freq, qpc_start;
         QueryPerformanceFrequency(&qpc_freq);
-        QueryPerformanceCounter(&qpc_prev);
         QueryPerformanceCounter(&qpc_start);
 
-        double accumulator = 0.0;
         int total_frames = 0;
 
         std::printf("[runner] Game loop started. Window: %dx%d (scale %dx)\n",
@@ -499,6 +500,9 @@ int main(int argc, char** argv) {
 
         // Main interactive game loop
         while (g_running && rt.running) {
+            LARGE_INTEGER frame_start;
+            QueryPerformanceCounter(&frame_start);
+
             // 1. Process Windows messages
             MSG msg;
             while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -512,10 +516,8 @@ int main(int argc, char** argv) {
             if (!g_running || !rt.running) break;
 
             // Check optional timeout
-            LARGE_INTEGER qpc_cur;
-            QueryPerformanceCounter(&qpc_cur);
             if (cfg.timeout_seconds > 0.0) {
-                double elapsed_total = (double)(qpc_cur.QuadPart - qpc_start.QuadPart) / (double)qpc_freq.QuadPart;
+                double elapsed_total = (double)(frame_start.QuadPart - qpc_start.QuadPart) / (double)qpc_freq.QuadPart;
                 if (elapsed_total >= cfg.timeout_seconds) {
                     std::printf("[runner] Reached timeout of %.2f seconds.\n", cfg.timeout_seconds);
                     break;
@@ -528,6 +530,9 @@ int main(int argc, char** argv) {
                 if (rt.globals.count("room_speed")) {
                     double spd = gm14::to_num(rt.globals["room_speed"]);
                     if (spd >= 1.0 && spd <= 240.0) target_fps = spd;
+                } else if (rt.global_builtins.count("room_speed")) {
+                    double spd = gm14::to_num(rt.global_builtins["room_speed"]);
+                    if (spd >= 1.0 && spd <= 240.0) target_fps = spd;
                 } else if (dw.rooms[rt.room_index].speed > 0) {
                     target_fps = (double)dw.rooms[rt.room_index].speed;
                 } else {
@@ -536,48 +541,45 @@ int main(int argc, char** argv) {
             }
             double frame_duration = 1.0 / target_fps;
 
-            // Frame timing accumulator
-            double dt = (double)(qpc_cur.QuadPart - qpc_prev.QuadPart) / (double)qpc_freq.QuadPart;
-            qpc_prev = qpc_cur;
+            // Sync real-time keyboard state to runtime
+            rt.keys_held = g_keys_held;
+            rt.keys_pressed = g_keys_pressed;
+            rt.keys_released = g_keys_released;
 
-            if (dt > 0.25) dt = 0.25; // Clamp delta spike (e.g. dragging titlebar)
-            accumulator += dt;
+            // Step game simulation
+            rt.step();
 
-            bool stepped = false;
-            while (accumulator >= frame_duration) {
-                // Sync real-time keyboard state to runtime
-                rt.keys_held = g_keys_held;
-                rt.keys_pressed = g_keys_pressed;
-                rt.keys_released = g_keys_released;
+            // Draw new frame
+            g_current_frame = rt.draw();
 
-                // Step game simulation (this also advances alarms, events, scripts,
-                // and renders one game frame worth of audio to WaveOutBackend)
-                rt.step();
-
-                // Clear single-step trigger sets
-                g_keys_pressed.clear();
-                g_keys_released.clear();
-                rt.keys_pressed.clear();
-                rt.keys_released.clear();
-
-                accumulator -= frame_duration;
-                stepped = true;
-                total_frames++;
+            // Blit RGBA buffer to window device context
+            HDC hdc = GetDC(g_hwnd);
+            if (hdc) {
+                render_frame(hdc);
+                ReleaseDC(g_hwnd, hdc);
             }
 
-            if (stepped) {
-                // Draw new frame
-                g_current_frame = rt.draw();
+            // Clear single-step trigger sets AFTER draw has executed
+            g_keys_pressed.clear();
+            g_keys_released.clear();
+            rt.keys_pressed.clear();
+            rt.keys_released.clear();
 
-                // Blit RGBA buffer to window device context
-                HDC hdc = GetDC(g_hwnd);
-                if (hdc) {
-                    render_frame(hdc);
-                    ReleaseDC(g_hwnd, hdc);
-                }
-            } else {
-                // Yield CPU
-                Sleep(1);
+            total_frames++;
+
+            // Precise frame limiter
+            LARGE_INTEGER qpc_now;
+            QueryPerformanceCounter(&qpc_now);
+            double elapsed_sec = (double)(qpc_now.QuadPart - frame_start.QuadPart) / (double)qpc_freq.QuadPart;
+            double remaining_ms = (frame_duration - elapsed_sec) * 1000.0;
+            if (remaining_ms > 2.0) {
+                Sleep((DWORD)(remaining_ms - 1.5));
+            }
+            while (true) {
+                QueryPerformanceCounter(&qpc_now);
+                double cur_elapsed = (double)(qpc_now.QuadPart - frame_start.QuadPart) / (double)qpc_freq.QuadPart;
+                if (cur_elapsed >= frame_duration) break;
+                YieldProcessor();
             }
         }
 

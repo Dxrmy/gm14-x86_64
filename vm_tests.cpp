@@ -385,6 +385,33 @@ int main(int argc, char** argv) {
             C("caster_free", {num(cid)});
         }
     }
+    // ================= D&D actions & controls parity =================
+    {
+        // 1. ds_map_find_value retains PC control strings without 3DS mutation
+        double mid = to_num(C("ds_map_create", {}));
+        C("ds_map_add", {num(mid), str("instructions_confirm_key"), str("[PRESS Z OR ENTER]")});
+        ok_str("ds_map_find_value keeps PC prompt", to_str(C("ds_map_find_value", {num(mid), str("instructions_confirm_key")})), "[PRESS Z OR ENTER]");
+        C("ds_map_destroy", {num(mid)});
+
+        // 2. keyboard_key_press and keyboard_key_release
+        C("keyboard_key_press", {num(37)}); // VK_LEFT
+        ok_bool("keyboard_check(37) held", C("keyboard_check", {num(37)}), true);
+        ok_bool("keyboard_check_pressed(37) pressed", C("keyboard_check_pressed", {num(37)}), true);
+        C("keyboard_key_release", {num(37)});
+        ok_bool("keyboard_check(37) released", C("keyboard_check", {num(37)}), false);
+        ok_bool("keyboard_check_released(37) released", C("keyboard_check_released", {num(37)}), true);
+
+        // 3. action_kill_object and action_move_to
+        double inst_id = to_num(C("instance_create", {num(10), num(20), num(0)}));
+        ok_bool("instance_exists created", C("instance_exists", {num(inst_id)}), true);
+        gm14::Instance* inst_ptr = rt.resolve_inst((int)inst_id);
+        rt.cur = inst_ptr;
+        C("action_move_to", {num(123), num(456)});
+        ok_num("action_move_to sets x", to_num(inst_ptr->vars["x"]), 123);
+        ok_num("action_move_to sets y", to_num(inst_ptr->vars["y"]), 456);
+        C("action_kill_object", {});
+        ok_bool("action_kill_object destroys instance", C("instance_exists", {num(inst_id)}), false);
+    }
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

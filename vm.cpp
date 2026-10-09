@@ -7,6 +7,10 @@
 #include <sstream>
 #include <cctype>
 #include <cstring>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 namespace gm14 {
 
@@ -1067,7 +1071,11 @@ void Runtime::register_builtins() {
         rt.run_event(ip, 0, 0);
         return vnum(ip->iid); };
     builtins["instance_exists"] = [](Runtime& rt, std::vector<Value>& a){
-        int v=(int)narg(a,0); for (auto& i:rt.instances) if (i->alive && (i->iid==v||i->obj==v)) return vnum(1); return vnum(0); };
+        if (a.empty()) return vnum(0);
+        int v = (int)narg(a,0);
+        if (v == -1) { for (auto& i:rt.instances) if (i->alive) return vnum(1); return vnum(0); }
+        for (auto& i:rt.instances) if (i->alive && (i->iid==v || is_obj(rt.dw, i.get(), v))) return vnum(1);
+        return vnum(0); };
     builtins["instance_destroy"] = [](Runtime& rt, std::vector<Value>& a){
         auto kill = [&](Instance* inst) {
             if (inst && inst->alive) {
@@ -1096,7 +1104,7 @@ void Runtime::register_builtins() {
     builtins["instance_find"] = [](Runtime& rt, std::vector<Value>& a){
         int obj=(int)narg(a,0), n=(int)narg(a,1); int c=0;
         for (auto& i:rt.instances) {
-            if (i->alive && i->obj == obj) {
+            if (i->alive && (obj == -1 || is_obj(rt.dw, i.get(), obj))) {
                 if (c == n) return vnum(i->iid);
                 c++;
             }
@@ -1145,15 +1153,33 @@ void Runtime::register_builtins() {
         if (perf) rt.run_event(ip, 0, 0);
         return vnum(ip->iid); };
     builtins["instance_exists"] = [](Runtime& rt, std::vector<Value>& a){
-        int v=(int)narg(a,0);
+        if (a.empty()) return vnum(0);
+        int v = (int)narg(a,0);
         if (v == -1) { for (auto& i:rt.instances) if (i->alive) return vnum(1); return vnum(0); }
-        for (auto& i:rt.instances) if (i->alive && (i->iid==v||i->obj==v)) return vnum(1);
+        for (auto& i:rt.instances) if (i->alive && (i->iid==v || is_obj(rt.dw, i.get(), v))) return vnum(1);
         return vnum(0); };
 
-    builtins["keyboard_check"] = [](Runtime& rt, std::vector<Value>& a){ return vnum(rt.keys_held.count((int)narg(a,0))?1:0); };
-    builtins["keyboard_check_direct"] = builtins["keyboard_check"];
-    builtins["keyboard_check_pressed"] = [](Runtime& rt, std::vector<Value>& a){ return vnum(rt.keys_pressed.count((int)narg(a,0))?1:0); };
-    builtins["keyboard_check_released"] = [](Runtime& rt, std::vector<Value>& a){ return vnum(rt.keys_released.count((int)narg(a,0))?1:0); };
+    builtins["keyboard_check"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.empty()) return vnum(0);
+        return vnum(rt.keys_held.count((int)narg(a,0)) ? 1 : 0);
+    };
+    builtins["keyboard_check_direct"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.empty()) return vnum(0);
+        int k = (int)narg(a,0);
+        if (rt.keys_held.count(k)) return vnum(1);
+#ifdef _WIN32
+        if (GetAsyncKeyState(k) & 0x8000) return vnum(1);
+#endif
+        return vnum(0);
+    };
+    builtins["keyboard_check_pressed"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.empty()) return vnum(0);
+        return vnum(rt.keys_pressed.count((int)narg(a,0)) ? 1 : 0);
+    };
+    builtins["keyboard_check_released"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.empty()) return vnum(0);
+        return vnum(rt.keys_released.count((int)narg(a,0)) ? 1 : 0);
+    };
     builtins["keyboard_clear"] = [](Runtime& rt, std::vector<Value>& a){
         if (a.empty()) {
             rt.keys_held.clear();
@@ -1170,8 +1196,22 @@ void Runtime::register_builtins() {
         rt.keys_pressed.clear();
         return vnum(0);
     };
-    builtins["keyboard_key_press"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
-    builtins["keyboard_key_release"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["keyboard_key_press"] = [](Runtime& rt, std::vector<Value>& a){
+        if (!a.empty()) {
+            int k = (int)narg(a,0);
+            rt.keys_held.insert(k);
+            rt.keys_pressed.insert(k);
+        }
+        return vnum(0);
+    };
+    builtins["keyboard_key_release"] = [](Runtime& rt, std::vector<Value>& a){
+        if (!a.empty()) {
+            int k = (int)narg(a,0);
+            rt.keys_held.erase(k);
+            rt.keys_released.insert(k);
+        }
+        return vnum(0);
+    };
 
     // NOTE: Undertale defines its own `control_init`/`control_update`/
     // `control_check`/`control_check_pressed`/`control_clear` scripts (CODE
@@ -1205,7 +1245,7 @@ void Runtime::register_builtins() {
         return vnum((!rt.keys_pressed.empty() || !rt.keys_held.empty()) ? 1 : 0);
     };
     for (const char* n : {"joystick_exists","joystick_xpos",
-                          "joystick_ypos","joystick_direction","joystick_pov","control_update"})
+                          "joystick_ypos","joystick_direction","joystick_pov"})
         builtins[n] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
 
     builtins["script_execute"] = [](Runtime& rt, std::vector<Value>& a){
@@ -1394,39 +1434,11 @@ void Runtime::register_builtins() {
     builtins["ds_map_find_value"] = [](Runtime& rt, std::vector<Value>& a){
         if (a.size() >= 2) {
             std::string k = to_str(a[1]);
-            if (k == "instructions_confirm_key") return Value("[A]");
-            if (k == "instructions_confirm_label") return Value("Confirm");
-            if (k == "instructions_cancel_key") return Value("[B]");
-            if (k == "instructions_cancel_label") return Value("Cancel");
-            if (k == "instructions_menu_key") return Value("[X]");
-            if (k == "instructions_menu_label") return Value("Menu");
-            if (k == "instructions_quit_key") return Value("[START]");
-            if (k == "instructions_quit_label") return Value("Quit");
-
             int id = (int)narg(a,0);
             auto it = rt.ds_maps.find(id);
             if (it != rt.ds_maps.end()) {
                 auto jt = it->second.find(k);
                 if (jt != it->second.end()) {
-                    if (jt->second.is_str()) {
-                        std::string s = jt->second.str;
-                        auto rep = [&](const std::string& from, const std::string& to) {
-                            size_t p = 0;
-                            while ((p = s.find(from, p)) != std::string::npos) {
-                                s.replace(p, from.size(), to);
-                                p += to.size();
-                            }
-                        };
-                        rep("[PRESS Z OR ENTER]", "[PRESS A]");
-                        rep("[Z or ENTER]", "[A]");
-                        rep("[X or SHIFT]", "[B]");
-                        rep("[C or CTRL]", "[X]");
-                        rep("[F4]", "");
-                        rep("Z or ENTER", "A");
-                        rep("X or SHIFT", "B");
-                        rep("C or CTRL", "X");
-                        return Value(s);
-                    }
                     return jt->second;
                 }
             }
@@ -2187,6 +2199,99 @@ void Runtime::register_builtins() {
         return vnum(0.0);
     };
 
+    // GameMaker Drag & Drop action builtins
+    builtins["action_kill_object"] = [](Runtime& rt, std::vector<Value>& a){
+        auto kill = [&](Instance* inst) {
+            if (inst && inst->alive) {
+                rt.run_event(inst, 1, 0);
+                inst->alive = false;
+            }
+        };
+        if (a.empty()) {
+            kill(rt.cur);
+        } else {
+            int target = (int)to_num(a[0]);
+            if (target == -1 || target == -4) kill(rt.cur);
+            else if (target == -2) kill(rt.other);
+            else {
+                for (auto& inst : rt.instances) {
+                    if (inst->alive && (inst->iid == target || is_obj(rt.dw, inst.get(), target))) {
+                        kill(inst.get());
+                    }
+                }
+            }
+        }
+        return vnum(0);
+    };
+    builtins["action_move_to"] = [](Runtime& rt, std::vector<Value>& a){
+        if (rt.cur && a.size() >= 2) {
+            rt.cur->vars["x"] = a[0];
+            rt.cur->vars["y"] = a[1];
+        }
+        return vnum(0);
+    };
+    builtins["action_create_object"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 3) {
+            int obj = (int)to_num(a[0]);
+            double x = to_num(a[1]), y = to_num(a[2]);
+            std::vector<Value> ca = { vnum(x), vnum(y), vnum(obj) };
+            return rt.call("instance_create", ca);
+        }
+        return vnum(-4);
+    };
+    builtins["action_set_alarm"] = [](Runtime& rt, std::vector<Value>& a){
+        if (rt.cur && a.size() >= 2) {
+            double val = to_num(a[0]);
+            int idx = (int)to_num(a[1]);
+            if (idx >= 0 && idx < 12) rt.cur->alarms[idx] = (int)val;
+        }
+        return vnum(0);
+    };
+    builtins["action_set_gravity"] = [](Runtime& rt, std::vector<Value>& a){
+        if (rt.cur && a.size() >= 2) {
+            rt.cur->vars["gravity_direction"] = a[0];
+            rt.cur->vars["gravity"] = a[1];
+        }
+        return vnum(0);
+    };
+    builtins["action_set_hspeed"] = [](Runtime& rt, std::vector<Value>& a){
+        if (rt.cur && !a.empty()) rt.cur->vars["hspeed"] = a[0];
+        return vnum(0);
+    };
+    builtins["action_move"] = [](Runtime& rt, std::vector<Value>& a){
+        if (rt.cur && a.size() >= 2) {
+            rt.cur->vars["direction"] = a[0];
+            rt.cur->vars["speed"] = a[1];
+        }
+        return vnum(0);
+    };
+    builtins["action_set_friction"] = [](Runtime& rt, std::vector<Value>& a){
+        if (rt.cur && !a.empty()) rt.cur->vars["friction"] = a[0];
+        return vnum(0);
+    };
+    builtins["action_set_relative"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["action_move_point"] = [](Runtime& rt, std::vector<Value>& a){
+        if (rt.cur && a.size() >= 3) {
+            double tx = to_num(a[0]), ty = to_num(a[1]), spd = to_num(a[2]);
+            double cx = to_num(rt.cur->vars["x"]), cy = to_num(rt.cur->vars["y"]);
+            double dir = std::atan2(-(ty - cy), tx - cx) * 180.0 / M_PI;
+            if (dir < 0) dir += 360.0;
+            rt.cur->vars["direction"] = vnum(dir);
+            rt.cur->vars["speed"] = vnum(spd);
+        }
+        return vnum(0);
+    };
+    builtins["action_set_motion"] = [](Runtime& rt, std::vector<Value>& a){
+        if (rt.cur && a.size() >= 2) {
+            rt.cur->vars["direction"] = a[0];
+            rt.cur->vars["speed"] = a[1];
+        }
+        return vnum(0);
+    };
+    builtins["action_previous_room"] = [](Runtime& rt, std::vector<Value>& a){
+        return rt.call("room_goto_previous", a);
+    };
+
     for (const char* n : {"ossafe_ini_open","ossafe_ini_close","randomize",
                           "application_surface_enable",
                           "application_surface_draw_enable","display_set_gui_size","window_set_fullscreen",
@@ -2194,7 +2299,7 @@ void Runtime::register_builtins() {
                           "show_debug_message","show_message","screen_refresh","set_automatic_draw",
                           "instance_deactivate_all","instance_activate_all",
                           "file_rename","steam_initialised","steam_file_exists",
-                          "steam_file_delete","trophy_init","action_kill_object","action_move_to"})
+                          "steam_file_delete","trophy_init"})
         if (!builtins.count(n)) builtins[n] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
     builtins["surface_get_width"] = [](Runtime& rt, std::vector<Value>&){
         auto it = rt.global_arrays.find("view_wview");
@@ -2851,8 +2956,7 @@ void Runtime::register_builtins() {
         "surface_set_target","surface_reset_target","surface_free",
         "buffer_async_group_option","buffer_async_group_begin","buffer_async_group_end","buffer_write","buffer_save_async",
         "buffer_load_async","buffer_delete","instance_change","instance_activate_object","room_set_persistent",
-        "action_set_alarm","action_set_relative","action_move","action_set_hspeed","action_set_motion","action_create_object",
-        "action_set_gravity","action_set_friction","action_previous_room","action_move_point","get_string_async",
+        "get_string_async",
         "joystick_check_button","joystick_has_pov","gamepad_axis_value","extension_stubfunc_real","ds_map_set_post"})
         if (!builtins.count(n)) builtins[n] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
     for (const char* n : {"gamepad_is_connected","window_get_fullscreen"})
@@ -2974,12 +3078,12 @@ void Runtime::start_room(int index, std::vector<std::unique_ptr<Instance>> keep)
         for (size_t i = 0; i < instances.size(); ++i)
             if (instances[i]->alive) run_event(instances[i].get(), 7, 2);
     }
-    for (size_t i = 0; i < instances.size(); ++i)
-        if (instances[i]->alive) run_event(instances[i].get(), 7, 4);
     if (fast_boot) {
         for (size_t i = 0; i < instances.size(); ++i)
             if (dw.objects[instances[i]->obj].name == "obj_time") instances[i]->vars["started"] = vnum(1.0);
     }
+    for (size_t i = 0; i < instances.size(); ++i)
+        if (instances[i]->alive) run_event(instances[i].get(), 7, 4);
     globals["room"] = vnum(index);
     global_builtins["current_time"] = globals.count("__t") ? globals["__t"] : Value(0.0);
 }
