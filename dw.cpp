@@ -205,7 +205,9 @@ void DataWin::parse_strings() {
 }
 
 void DataWin::parse_code() {
-    Chunk c = chunks.at("CODE");
+    auto it_code = chunks.find("CODE");
+    if (it_code == chunks.end() || it_code->second.size == 0) return;
+    Chunk c = it_code->second;
     uint32_t n = u32(c.off);
     std::unordered_map<uint32_t, std::pair<uint32_t,uint32_t>> blob_cache; // blob -> (start,count)
     code.reserve(n);
@@ -357,7 +359,9 @@ void DataWin::parse_scripts() {
 }
 
 void DataWin::parse_tpag() {
-    Chunk c = chunks.at("TPAG");
+    auto it_tpag = chunks.find("TPAG");
+    if (it_tpag == chunks.end() || it_tpag->second.size == 0) return;
+    Chunk c = it_tpag->second;
     for (uint32_t p : list_ptrs(*this, c.off)) {
         Tpag t;
         t.sx = u16(p); t.sy = u16(p+2); t.sw = u16(p+4); t.sh = u16(p+6);
@@ -368,12 +372,14 @@ void DataWin::parse_tpag() {
 }
 
 void DataWin::parse_sprites() {
-    Chunk c = chunks.at("SPRT");
+    auto it_sprt = chunks.find("SPRT");
+    if (it_sprt == chunks.end() || it_sprt->second.size == 0) return;
+    Chunk c = it_sprt->second;
     // tpag pointer -> index
     std::unordered_map<uint32_t, int> tmap;
-    {
-        uint32_t n = u32(c.off); (void)n;
-        Chunk t = chunks.at("TPAG");
+    auto it_tpag = chunks.find("TPAG");
+    if (it_tpag != chunks.end() && it_tpag->second.size > 0) {
+        Chunk t = it_tpag->second;
         uint32_t tn = u32(t.off);
         for (uint32_t i = 0; i < tn; ++i) tmap[u32(t.off + 4 + 4*i)] = (int)i;
     }
@@ -383,9 +389,20 @@ void DataWin::parse_sprites() {
         s.width = u32(p+4); s.height = u32(p+8);
         s.ml = i32(p+12); s.mr = i32(p+16); s.mb = i32(p+20); s.mt = i32(p+24);
         s.origin_x = i32(p+48); s.origin_y = i32(p+52);
-        uint32_t fc = u32(p+56);
+        uint32_t tag = u32(p+56);
+        uint32_t fc = 0;
+        uint32_t frames_start = 0;
+        if (tag == 0xFFFFFFFF) {
+            // Modern GMS sprite format (bytecode 17+ / GMS2 / updated GMS 1.4)
+            fc = u32(p+84);
+            frames_start = p+88;
+        } else {
+            // Classic GMS 1.4 sprite format
+            fc = tag;
+            frames_start = p+60;
+        }
         for (uint32_t i = 0; i < fc; ++i) {
-            uint32_t fp = u32(p+60+4*i);
+            uint32_t fp = u32(frames_start + 4*i);
             auto it = tmap.find(fp);
             s.frames.push_back(it == tmap.end() ? -1 : it->second);
         }
@@ -407,10 +424,18 @@ void DataWin::parse_fonts() {
         auto t = tmap.find(u32(p + 28));
         f.tpag = (t == tmap.end()) ? -1 : t->second;
         f.scale_x = f32(p + 32); f.scale_y = f32(p + 36);
-        uint32_t gc = u32(p + 40);
+        uint32_t gc = 0;
+        uint32_t glyphs_start = 0;
+        if (bytecode_version >= 17) {
+            gc = u32(p + 48);
+            glyphs_start = p + 52;
+        } else {
+            gc = u32(p + 40);
+            glyphs_start = p + 44;
+        }
         if (gc < 100000) {
             for (uint32_t i = 0; i < gc; ++i) {
-                uint32_t gp = u32(p + 44 + 4*i);
+                uint32_t gp = u32(glyphs_start + 4*i);
                 Glyph g;
                 g.ch = u16(gp); g.sx = u16(gp+2); g.sy = u16(gp+4);
                 g.sw = u16(gp+6); g.sh = u16(gp+8);
@@ -426,9 +451,11 @@ void DataWin::parse_bgnd() {
     auto it = chunks.find("BGND");
     if (it == chunks.end() || it->second.size == 0) return;
     std::unordered_map<uint32_t,int> tmap;
-    Chunk t = chunks.at("TPAG");
-    uint32_t tn = u32(t.off);
-    for (uint32_t i=0;i<tn;i++) tmap[u32(t.off+4+4*i)] = (int)i;
+    auto tc = chunks.find("TPAG");
+    if (tc != chunks.end() && tc->second.size > 0) {
+        uint32_t tn = u32(tc->second.off);
+        for (uint32_t i=0;i<tn;i++) tmap[u32(tc->second.off+4+4*i)] = (int)i;
+    }
     for (uint32_t p : list_ptrs(*this, it->second.off)) {
         Bgnd b;
         b.name = str_content(u32(p));
@@ -440,13 +467,18 @@ void DataWin::parse_bgnd() {
 }
 
 void DataWin::parse_objects() {
-    Chunk c = chunks.at("OBJT");
+    auto it_obj = chunks.find("OBJT");
+    if (it_obj == chunks.end() || it_obj->second.size == 0) return;
+    Chunk c = it_obj->second;
     for (uint32_t p : list_ptrs(*this, c.off)) {
         ObjDef o;
         o.name = str_content(u32(p));
         uint32_t q = p + 4;
         o.sprite = i32(q); q += 4;
         o.visible = u32(q)!=0; q+=4;
+        if (bytecode_version >= 17) {
+            q += 4; // skip 'managed' flag (GMS 2+)
+        }
         o.solid = u32(q)!=0; q+=4;
         o.depth = i32(q); q+=4;
         o.persistent = u32(q)!=0; q+=4;
@@ -461,6 +493,7 @@ void DataWin::parse_objects() {
             uint32_t outer = u32(q);
             for (uint32_t t = 0; t < outer; ++t) {
                 uint32_t elist = u32(q + 4 + 4*t);
+                if (elist == 0) continue;
                 uint32_t inner_n = u32(elist);
                 for (uint32_t j = 0; j < inner_n; ++j) {
                     uint32_t ep = u32(elist + 4 + 4*j);
@@ -479,7 +512,9 @@ void DataWin::parse_objects() {
 }
 
 void DataWin::parse_rooms() {
-    Chunk c = chunks.at("ROOM");
+    auto it_room = chunks.find("ROOM");
+    if (it_room == chunks.end() || it_room->second.size == 0) return;
+    Chunk c = it_room->second;
     for (uint32_t p : list_ptrs(*this, c.off)) {
         Room r;
         r.name = str_content(u32(p));
@@ -514,8 +549,14 @@ void DataWin::parse_rooms() {
             in.x=i32(ip); in.y=i32(ip+4); in.obj=i32(ip+8); in.iid=u32(ip+12);
             in.creation_code=i32(ip+16);
             in.scale_x=f32(ip+20); in.scale_y=f32(ip+24);
-            in.color=u32(ip+28); in.rotation=f32(ip+32);
-            in.precreate_code = (bytecode_version>=16) ? i32(ip+36) : -1;
+            if (bytecode_version >= 17) {
+                // GMS 2.2.2+ adds image_speed (f32) and image_index (i32) at ip+28, ip+32
+                in.color=u32(ip+36); in.rotation=f32(ip+40);
+                in.precreate_code = i32(ip+44);
+            } else {
+                in.color=u32(ip+28); in.rotation=f32(ip+32);
+                in.precreate_code = (bytecode_version>=16) ? i32(ip+36) : -1;
+            }
             r.instances.push_back(in);
         }
         if (tilep) for (uint32_t tp : list_ptrs(*this, tilep)) {

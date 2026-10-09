@@ -1434,11 +1434,42 @@ void Runtime::register_builtins() {
     builtins["ds_map_find_value"] = [](Runtime& rt, std::vector<Value>& a){
         if (a.size() >= 2) {
             std::string k = to_str(a[1]);
+#ifdef __3DS__
+            if (k == "instructions_confirm_key") return Value("[A]");
+            if (k == "instructions_confirm_label") return Value("Confirm");
+            if (k == "instructions_cancel_key") return Value("[B]");
+            if (k == "instructions_cancel_label") return Value("Cancel");
+            if (k == "instructions_menu_key") return Value("[X]");
+            if (k == "instructions_menu_label") return Value("Menu");
+            if (k == "instructions_quit_key") return Value("[START]");
+            if (k == "instructions_quit_label") return Value("Quit");
+#endif
             int id = (int)narg(a,0);
             auto it = rt.ds_maps.find(id);
             if (it != rt.ds_maps.end()) {
                 auto jt = it->second.find(k);
                 if (jt != it->second.end()) {
+#ifdef __3DS__
+                    if (jt->second.is_str()) {
+                        std::string s = jt->second.str;
+                        auto rep = [&](const std::string& from, const std::string& to) {
+                            size_t p = 0;
+                            while ((p = s.find(from, p)) != std::string::npos) {
+                                s.replace(p, from.size(), to);
+                                p += to.size();
+                            }
+                        };
+                        rep("[PRESS Z OR ENTER]", "[PRESS A]");
+                        rep("[Z or ENTER]", "[A]");
+                        rep("[X or SHIFT]", "[B]");
+                        rep("[C or CTRL]", "[X]");
+                        rep("[F4]", "");
+                        rep("Z or ENTER", "A");
+                        rep("X or SHIFT", "B");
+                        rep("C or CTRL", "X");
+                        return Value(s);
+                    }
+#endif
                     return jt->second;
                 }
             }

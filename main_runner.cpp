@@ -346,6 +346,10 @@ int main(int argc, char** argv) {
                     game_title.c_str(), dw.game_name.c_str(),
                     dw.rooms.size(), dw.objects.size(), dw.sprites.size());
 
+        if (dw.code.empty()) {
+            std::printf("[warn] No GML bytecode chunk found in data file (game was likely compiled with YYC to native code).\n");
+        }
+
         gm14::Runtime rt(dw);
 
         // Feed audio backend: attach WaveOutBackend to runtime audio engine
