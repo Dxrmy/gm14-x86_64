@@ -270,6 +270,8 @@ public:
     explicit DataWin(const std::string& path);
     ~DataWin();
 
+    std::string filepath;
+
     // chunks
     std::unordered_map<std::string, Chunk> chunks;
     std::vector<std::string> chunk_order;

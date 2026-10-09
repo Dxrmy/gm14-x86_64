@@ -76,9 +76,62 @@ struct EnvFrame {
     int loop_pc = 0;
 };
 
+struct DsGrid {
+    int width = 0;
+    int height = 0;
+    std::vector<Value> data;
+    DsGrid() = default;
+    DsGrid(int w, int h, const Value& init = Value(0.0))
+        : width(std::max(0, w)), height(std::max(0, h)),
+          data((size_t)std::max(0, w) * (size_t)std::max(0, h), init) {}
+    Value get(int x, int y) const {
+        if (x < 0 || x >= width || y < 0 || y >= height) return Value(0.0);
+        return data[(size_t)y * (size_t)width + (size_t)x];
+    }
+    void set(int x, int y, const Value& v) {
+        if (x >= 0 && x < width && y >= 0 && y < height) data[(size_t)y * (size_t)width + (size_t)x] = v;
+    }
+    void clear(const Value& v) {
+        for (auto& cell : data) cell = v;
+    }
+    void set_region(int x1, int y1, int x2, int y2, const Value& v) {
+        if (x1 > x2) std::swap(x1, x2);
+        if (y1 > y2) std::swap(y1, y2);
+        x1 = std::max(0, x1);
+        y1 = std::max(0, y1);
+        x2 = std::min(width - 1, x2);
+        y2 = std::min(height - 1, y2);
+        for (int y = y1; y <= y2; ++y) {
+            for (int x = x1; x <= x2; ++x) {
+                data[(size_t)y * (size_t)width + (size_t)x] = v;
+            }
+        }
+    }
+};
+
+struct TextFile {
+    enum Mode { READ, WRITE, APPEND } mode = READ;
+    std::string path;
+    std::string read_buf;
+    size_t read_pos = 0;
+    FILE* fp = nullptr;
+};
+
+struct IniFile {
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> sections;
+    void clear() {
+        sections.clear();
+    }
+};
+
+struct Surface {
+    Image img;
+};
+
 class Runtime {
 public:
     explicit Runtime(DataWin& dw);
+    ~Runtime();
 
     DataWin& dw;
     std::unordered_map<std::string, const CodeEntry*> scripts;
@@ -130,6 +183,24 @@ public:
     int next_ds_map = 1;
     std::unordered_map<int, std::vector<Value>> ds_lists;
     int next_ds_list = 1;
+    std::unordered_map<int, DsGrid> ds_grids;
+    int next_ds_grid = 1;
+    std::unordered_map<int, TextFile> text_files;
+    int next_text_file = 1;
+
+    std::unordered_map<std::string, IniFile> ini_files;
+    std::string current_ini_filename;
+    IniFile current_ini;
+    bool ini_is_open = false;
+
+    // surfaces
+    std::unordered_map<int, Surface> surfaces;
+    int next_surface_id = 1;
+    std::vector<Image*> surface_target_stack;
+
+    // caster audio
+    std::unordered_map<std::string, int> caster_path_to_id;
+    int next_caster_id = 500000;
 
     // audio
     std::unique_ptr<AudioEngine> audio;
@@ -148,13 +219,14 @@ public:
     Value run_entry(const CodeEntry* entry, std::vector<Value>& args,
                     Instance* self, Instance* other);
 
-private:
     void exec(Frame& fr);
     Value get_var(Frame& fr, const Instruction& ins);
     void set_var(Frame& fr, const Instruction& ins, const Value& v);
     Value get_array(Frame& fr, const Instruction& ins, int inst_type, int index);
     void set_array(Frame& fr, const Instruction& ins, int inst_type, int index, const Value& v);
     Instance* resolve_inst(int inst_type);
+
+private:
     void register_builtins();
 };
 

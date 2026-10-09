@@ -32,3 +32,7 @@ test_intro_*.png
 # Python cache
 __pycache__/
 *.pyc
+
+# Local save & test configs
+*.ini
+save/

@@ -1,4 +1,4 @@
-﻿#include "vm.hpp"
+#include "vm.hpp"
 #include <cmath>
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -55,6 +55,15 @@ Runtime::Runtime(DataWin& dw_) : dw(dw_) {
     global_builtins["delta_time"] = Value(16666.0);
     global_builtins["room_speed"] = Value(30.0);
     register_builtins();
+}
+
+Runtime::~Runtime() {
+    for (auto& pair : text_files) {
+        if (pair.second.fp) {
+            std::fclose(pair.second.fp);
+            pair.second.fp = nullptr;
+        }
+    }
 }
 
 // ---------------- audio helpers ----------------
@@ -394,9 +403,11 @@ void Runtime::exec(Frame& fr) {
             }
             fr.pc++;
         } else if (k == OP_POPZ) {
-            if (!fr.stack.empty()) fr.stack.pop_back(); fr.pc++;
+            if (!fr.stack.empty()) fr.stack.pop_back();
+            fr.pc++;
         } else if (k == OP_DUP) {
-            if (!fr.stack.empty()) fr.stack.push_back(fr.stack.back()); fr.pc++;
+            if (!fr.stack.empty()) fr.stack.push_back(fr.stack.back());
+            fr.pc++;
         } else if (k == OP_CONV) {
             Value v = stk_pop();
             uint8_t dst = ins.type2();
@@ -563,7 +574,7 @@ bool Runtime::tpag_image(int tpag_index, Image& out, int& tx, int& ty) {
     if (t.tex < 0 || t.tex >= (int)dw.tex_ptrs.size()) return false;
     const Image& pg = page(t.tex);
     if (pg.w <= 0) return false;
-    if (t.sx < 0 || t.sy < 0 || t.sx + t.sw > pg.w || t.sy + t.sh > pg.h) return false;
+    if (t.sx + t.sw > pg.w || t.sy + t.sh > pg.h) return false;
     out = crop_img(pg, t.sx, t.sy, t.sw, t.sh);
     tx = t.tx; ty = t.ty;
     return true;
@@ -703,6 +714,71 @@ void Runtime::blit_sub_screen_tint(const Image& src, int sx, int sy, int sw, int
     }
 }
 
+static void draw_rect_on_image(Image* img, int x1, int y1, int x2, int y2, uint32_t col, double alpha, bool outline) {
+    if (!img || img->w <= 0 || img->h <= 0) return;
+    if (x1 > x2) std::swap(x1, x2);
+    if (y1 > y2) std::swap(y1, y2);
+    uint8_t cr = (uint8_t)(col & 0xFF);
+    uint8_t cg = (uint8_t)((col >> 8) & 0xFF);
+    uint8_t cb = (uint8_t)((col >> 16) & 0xFF);
+    uint8_t ca = (uint8_t)(std::clamp(alpha, 0.0, 1.0) * 255.0);
+    if (ca == 0) return;
+
+    auto put_px = [&](int x, int y) {
+        if (x < 0 || x >= img->w || y < 0 || y >= img->h) return;
+        uint8_t* d = &img->rgba[((size_t)y * img->w + x) * 4];
+        if (ca == 255) {
+            d[0] = cr; d[1] = cg; d[2] = cb; d[3] = 255;
+        } else {
+            double a = ca / 255.0;
+            d[0] = (uint8_t)std::min(255.0, cr * a + d[0] * (1.0 - a));
+            d[1] = (uint8_t)std::min(255.0, cg * a + d[1] * (1.0 - a));
+            d[2] = (uint8_t)std::min(255.0, cb * a + d[2] * (1.0 - a));
+            d[3] = 255;
+        }
+    };
+
+    if (outline) {
+        for (int x = x1; x <= x2; ++x) { put_px(x, y1); put_px(x, y2); }
+        for (int y = y1; y <= y2; ++y) { put_px(x1, y); put_px(x2, y); }
+    } else {
+        int cx1 = std::max(0, x1), cx2 = std::min(img->w - 1, x2);
+        int cy1 = std::max(0, y1), cy2 = std::min(img->h - 1, y2);
+        for (int y = cy1; y <= cy2; ++y) {
+            for (int x = cx1; x <= cx2; ++x) {
+                put_px(x, y);
+            }
+        }
+    }
+}
+
+static void draw_line_on_image(Image* img, int x0, int y0, int x1, int y1, uint32_t col, double alpha) {
+    if (!img || img->w <= 0 || img->h <= 0) return;
+    int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy, e2;
+    uint8_t cr = (uint8_t)(col & 0xFF), cg = (uint8_t)((col >> 8) & 0xFF), cb = (uint8_t)((col >> 16) & 0xFF);
+    uint8_t ca = (uint8_t)(std::clamp(alpha, 0.0, 1.0) * 255.0);
+    if (ca == 0) return;
+    while (true) {
+        if (x0 >= 0 && x0 < img->w && y0 >= 0 && y0 < img->h) {
+            uint8_t* d = &img->rgba[((size_t)y0 * img->w + x0) * 4];
+            if (ca == 255) { d[0] = cr; d[1] = cg; d[2] = cb; d[3] = 255; }
+            else {
+                double a = ca / 255.0;
+                d[0] = (uint8_t)std::min(255.0, cr * a + d[0] * (1.0 - a));
+                d[1] = (uint8_t)std::min(255.0, cg * a + d[1] * (1.0 - a));
+                d[2] = (uint8_t)std::min(255.0, cb * a + d[2] * (1.0 - a));
+                d[3] = 255;
+            }
+        }
+        if (x0 == x1 && y0 == y1) break;
+        e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
 static void draw_sprite_impl(Runtime& rt, double sprite, double subimg, double x, double y,
                              double xs, double ys, double alpha) {
     int si = (int)sprite;
@@ -716,7 +792,7 @@ static void draw_sprite_impl(Runtime& rt, double sprite, double subimg, double x
     const Tpag& t = rt.dw.tpags[tpag_idx];
     if (t.tex < 0 || t.tex >= (int)rt.dw.tex_ptrs.size()) return;
     const Image& pg = rt.page(t.tex);
-    if (pg.w <= 0 || t.sx < 0 || t.sy < 0 || t.sx + t.sw > pg.w || t.sy + t.sh > pg.h) return;
+    if (pg.w <= 0 || t.sx + t.sw > pg.w || t.sy + t.sh > pg.h) return;
     // Destination top-left in screen space (origin-relative).
     int dx = (int)std::lround(x - sp.origin_x * xs) + t.tx - rt.view_x;
     int dy = (int)std::lround(y - sp.origin_y * ys) + t.ty - rt.view_y;
@@ -1019,7 +1095,14 @@ void Runtime::register_builtins() {
     };
     builtins["instance_find"] = [](Runtime& rt, std::vector<Value>& a){
         int obj=(int)narg(a,0), n=(int)narg(a,1); int c=0;
-        for (auto& i:rt.instances) if (i->alive&&i->obj==obj){ if (c==n) return vnum(i->iid); c++; } return vnum(-4); };
+        for (auto& i:rt.instances) {
+            if (i->alive && i->obj == obj) {
+                if (c == n) return vnum(i->iid);
+                c++;
+            }
+        }
+        return vnum(-4);
+    };
     builtins["instance_number"] = [](Runtime& rt, std::vector<Value>& a){
         int obj = (int)narg(a,0);
         if (obj == -1) { double c=0; for (auto& i:rt.instances) if (i->alive) c++; return vnum(c); }
@@ -1217,6 +1300,7 @@ void Runtime::register_builtins() {
     builtins["floor"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::floor(narg(a,0))); };
     builtins["ceil"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::ceil(narg(a,0))); };
     builtins["round"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::floor(narg(a,0)+0.5)); };
+    builtins["frac"] = [](Runtime&, std::vector<Value>& a){ double intpart; return vnum(std::modf(narg(a,0), &intpart)); };
     builtins["sqrt"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::sqrt(narg(a,0))); };
     builtins["sin"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::sin(narg(a,0))); };
     builtins["cos"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::cos(narg(a,0))); };
@@ -1230,6 +1314,7 @@ void Runtime::register_builtins() {
     builtins["min"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::min(narg(a,0),narg(a,1))); };
     builtins["max"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::max(narg(a,0),narg(a,1))); };
     builtins["clamp"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::max(narg(a,1),std::min(narg(a,2),narg(a,0)))); };
+    builtins["lerp"] = [](Runtime&, std::vector<Value>& a){ return vnum(narg(a,0) + (narg(a,1) - narg(a,0)) * narg(a,2)); };
     builtins["random"] = [](Runtime&, std::vector<Value>& a){ return vnum((double)std::rand()/RAND_MAX*narg(a,0)); };
     builtins["irandom"] = [](Runtime&, std::vector<Value>& a){ int m=(int)narg(a,0); return vnum(m>0?std::rand()%(m+1):0); };
     builtins["random_range"] = [](Runtime&, std::vector<Value>& a){
@@ -1245,13 +1330,13 @@ void Runtime::register_builtins() {
     builtins["random_get_seed"] = [](Runtime&, std::vector<Value>&){ return vnum((double)std::rand()); };
 
     builtins["collision_rectangle"] = [](Runtime& rt, std::vector<Value>& a){
-        return vnum(collision_rect(rt, narg(a,0),narg(a,1),narg(a,2),narg(a,3),(int)narg(a,4), a.size()>6?(int)narg(a,6):-1)); };
+        return vnum(collision_rect(rt, narg(a,0),narg(a,1),narg(a,2),narg(a,3),(int)narg(a,4), a.size()>6?(narg(a,6)!=0.0):false)); };
     builtins["collision_point"] = [](Runtime& rt, std::vector<Value>& a){
-        return vnum(collision_rect(rt, narg(a,0),narg(a,1),narg(a,0),narg(a,1),(int)narg(a,2), a.size()>4?(int)narg(a,4):-1)); };
+        return vnum(collision_rect(rt, narg(a,0),narg(a,1),narg(a,0),narg(a,1),(int)narg(a,2), a.size()>4?(narg(a,4)!=0.0):false)); };
     builtins["collision_circle"] = [](Runtime& rt, std::vector<Value>& a){
-        double r=narg(a,2); return vnum(collision_rect(rt,narg(a,0)-r,narg(a,1)-r,narg(a,0)+r,narg(a,1)+r,(int)narg(a,4),-1)); };
+        double r=narg(a,2); return vnum(collision_rect(rt,narg(a,0)-r,narg(a,1)-r,narg(a,0)+r,narg(a,1)+r,(int)narg(a,4),false)); };
     builtins["collision_line"] = [](Runtime& rt, std::vector<Value>& a){
-        return vnum(collision_rect(rt,narg(a,0),narg(a,1),narg(a,2),narg(a,3),(int)narg(a,4),-1)); };
+        return vnum(collision_rect(rt,narg(a,0),narg(a,1),narg(a,2),narg(a,3),(int)narg(a,4),false)); };
     builtins["instance_place"] = [](Runtime& rt, std::vector<Value>& a){
         return vnum(instance_place_impl(rt,narg(a,0),narg(a,1),(int)narg(a,2))); };
     builtins["place_meeting"] = [](Runtime& rt, std::vector<Value>& a){
@@ -1385,20 +1470,732 @@ void Runtime::register_builtins() {
         if (!a.empty()) rt.ds_lists[(int)narg(a,0)].clear();
         return vnum(0);
     };
+    builtins["ds_list_delete"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 2) {
+            int id = (int)narg(a,0);
+            int pos = (int)narg(a,1);
+            auto it = rt.ds_lists.find(id);
+            if (it != rt.ds_lists.end() && pos >= 0 && pos < (int)it->second.size()) {
+                it->second.erase(it->second.begin() + pos);
+            }
+        }
+        return vnum(0);
+    };
+    builtins["ds_list_find_index"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 2) {
+            int id = (int)narg(a,0);
+            auto it = rt.ds_lists.find(id);
+            if (it != rt.ds_lists.end()) {
+                for (size_t i = 0; i < it->second.size(); ++i) {
+                    const auto& v = it->second[i];
+                    if (v.is_str() && a[1].is_str()) {
+                        if (v.str == a[1].str) return vnum((double)i);
+                    } else if (v.is_num() && a[1].is_num()) {
+                        if (v.num == a[1].num) return vnum((double)i);
+                    }
+                }
+            }
+        }
+        return vnum(-1);
+    };
+    builtins["ds_list_insert"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 3) {
+            int id = (int)narg(a,0);
+            int pos = (int)narg(a,1);
+            auto it = rt.ds_lists.find(id);
+            if (it != rt.ds_lists.end()) {
+                if (pos < 0) pos = 0;
+                if (pos > (int)it->second.size()) pos = (int)it->second.size();
+                it->second.insert(it->second.begin() + pos, a[2]);
+            }
+        }
+        return vnum(0);
+    };
+    builtins["ds_list_replace"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 3) {
+            int id = (int)narg(a,0);
+            int pos = (int)narg(a,1);
+            auto it = rt.ds_lists.find(id);
+            if (it != rt.ds_lists.end() && pos >= 0 && pos < (int)it->second.size()) {
+                it->second[pos] = a[2];
+            }
+        }
+        return vnum(0);
+    };
+    builtins["ds_list_set"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 3) {
+            int id = (int)narg(a,0);
+            int pos = (int)narg(a,1);
+            auto it = rt.ds_lists.find(id);
+            if (it != rt.ds_lists.end() && pos >= 0) {
+                if (pos >= (int)it->second.size()) it->second.resize(pos + 1, Value(0.0));
+                it->second[pos] = a[2];
+            }
+        }
+        return vnum(0);
+    };
+    builtins["ds_list_empty"] = [](Runtime& rt, std::vector<Value>& a){
+        if (!a.empty()) {
+            auto it = rt.ds_lists.find((int)narg(a,0));
+            if (it != rt.ds_lists.end()) return vnum(it->second.empty() ? 1.0 : 0.0);
+        }
+        return vnum(1);
+    };
+    builtins["ds_list_copy"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 2) {
+            int id = (int)narg(a,0);
+            int src = (int)narg(a,1);
+            auto sit = rt.ds_lists.find(src);
+            if (sit != rt.ds_lists.end()) rt.ds_lists[id] = sit->second;
+        }
+        return vnum(0);
+    };
+    builtins["ds_list_sort"] = [](Runtime& rt, std::vector<Value>& a){
+        if (!a.empty()) {
+            int id = (int)narg(a,0);
+            bool asc = (a.size() >= 2) ? to_bool(a[1]) : true;
+            auto it = rt.ds_lists.find(id);
+            if (it != rt.ds_lists.end()) {
+                std::sort(it->second.begin(), it->second.end(), [asc](const Value& v1, const Value& v2){
+                    if (v1.is_num() && v2.is_num()) return asc ? (v1.num < v2.num) : (v1.num > v2.num);
+                    if (v1.is_str() && v2.is_str()) return asc ? (v1.str < v2.str) : (v1.str > v2.str);
+                    return asc ? (to_str(v1) < to_str(v2)) : (to_str(v1) > to_str(v2));
+                });
+            }
+        }
+        return vnum(0);
+    };
 
-    for (const char* n : {"file_exists","ini_open",
-                          "ini_close","ini_read_real","ini_read_string","ini_section_exists",
-                          "ossafe_ini_open","ossafe_ini_close","randomize",
+    builtins["ds_map_size"] = [](Runtime& rt, std::vector<Value>& a){
+        if (!a.empty()) {
+            auto it = rt.ds_maps.find((int)narg(a,0));
+            if (it != rt.ds_maps.end()) return vnum((double)it->second.size());
+        }
+        return vnum(0);
+    };
+    builtins["ds_map_empty"] = [](Runtime& rt, std::vector<Value>& a){
+        if (!a.empty()) {
+            auto it = rt.ds_maps.find((int)narg(a,0));
+            if (it != rt.ds_maps.end()) return vnum(it->second.empty() ? 1.0 : 0.0);
+        }
+        return vnum(1);
+    };
+    builtins["ds_map_clear"] = [](Runtime& rt, std::vector<Value>& a){
+        if (!a.empty()) {
+            auto it = rt.ds_maps.find((int)narg(a,0));
+            if (it != rt.ds_maps.end()) it->second.clear();
+        }
+        return vnum(0);
+    };
+    builtins["ds_map_copy"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 2) {
+            int id = (int)narg(a,0);
+            int src = (int)narg(a,1);
+            auto sit = rt.ds_maps.find(src);
+            if (sit != rt.ds_maps.end()) rt.ds_maps[id] = sit->second;
+        }
+        return vnum(0);
+    };
+    builtins["ds_map_add_list"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 3) {
+            int id = (int)narg(a,0);
+            std::string k = to_str(a[1]);
+            rt.ds_maps[id][k] = a[2];
+            return vnum(1);
+        }
+        return vnum(0);
+    };
+    builtins["ds_map_add_map"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 3) {
+            int id = (int)narg(a,0);
+            std::string k = to_str(a[1]);
+            rt.ds_maps[id][k] = a[2];
+            return vnum(1);
+        }
+        return vnum(0);
+    };
+
+    builtins["ds_grid_create"] = [](Runtime& rt, std::vector<Value>& a){
+        int w = a.size() >= 1 ? (int)narg(a,0) : 0;
+        int h = a.size() >= 2 ? (int)narg(a,1) : 0;
+        int id = rt.next_ds_grid++;
+        rt.ds_grids[id] = DsGrid(w, h, Value(0.0));
+        return vnum(id);
+    };
+    builtins["ds_grid_destroy"] = [](Runtime& rt, std::vector<Value>& a){
+        if (!a.empty()) rt.ds_grids.erase((int)narg(a,0));
+        return vnum(0);
+    };
+    builtins["ds_grid_width"] = [](Runtime& rt, std::vector<Value>& a){
+        if (!a.empty()) {
+            auto it = rt.ds_grids.find((int)narg(a,0));
+            if (it != rt.ds_grids.end()) return vnum(it->second.width);
+        }
+        return vnum(0);
+    };
+    builtins["ds_grid_height"] = [](Runtime& rt, std::vector<Value>& a){
+        if (!a.empty()) {
+            auto it = rt.ds_grids.find((int)narg(a,0));
+            if (it != rt.ds_grids.end()) return vnum(it->second.height);
+        }
+        return vnum(0);
+    };
+    builtins["ds_grid_resize"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 3) {
+            int id = (int)narg(a,0);
+            int nw = std::max(0, (int)narg(a,1));
+            int nh = std::max(0, (int)narg(a,2));
+            auto it = rt.ds_grids.find(id);
+            if (it != rt.ds_grids.end()) {
+                DsGrid next_g(nw, nh, Value(0.0));
+                for (int y = 0; y < std::min(it->second.height, nh); ++y) {
+                    for (int x = 0; x < std::min(it->second.width, nw); ++x) {
+                        next_g.set(x, y, it->second.get(x, y));
+                    }
+                }
+                it->second = std::move(next_g);
+            }
+        }
+        return vnum(0);
+    };
+    builtins["ds_grid_clear"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 2) {
+            int id = (int)narg(a,0);
+            Value val = a[1];
+            auto it = rt.ds_grids.find(id);
+            if (it != rt.ds_grids.end()) {
+                std::fill(it->second.data.begin(), it->second.data.end(), val);
+            }
+        }
+        return vnum(0);
+    };
+    builtins["ds_grid_set"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 4) {
+            int id = (int)narg(a,0);
+            int x = (int)narg(a,1), y = (int)narg(a,2);
+            auto it = rt.ds_grids.find(id);
+            if (it != rt.ds_grids.end()) it->second.set(x, y, a[3]);
+        }
+        return vnum(0);
+    };
+    builtins["ds_grid_get"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 3) {
+            int id = (int)narg(a,0);
+            int x = (int)narg(a,1), y = (int)narg(a,2);
+            auto it = rt.ds_grids.find(id);
+            if (it != rt.ds_grids.end()) return it->second.get(x, y);
+        }
+        return Value(0.0);
+    };
+    builtins["ds_grid_add"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 4) {
+            int id = (int)narg(a,0);
+            int x = (int)narg(a,1), y = (int)narg(a,2);
+            auto it = rt.ds_grids.find(id);
+            if (it != rt.ds_grids.end()) {
+                Value cur = it->second.get(x, y);
+                if (cur.is_str() || a[3].is_str()) {
+                    it->second.set(x, y, Value(to_str(cur) + to_str(a[3])));
+                } else {
+                    it->second.set(x, y, Value(to_num(cur) + to_num(a[3])));
+                }
+            }
+        }
+        return vnum(0);
+    };
+    builtins["ds_grid_multiply"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 4) {
+            int id = (int)narg(a,0);
+            int x = (int)narg(a,1), y = (int)narg(a,2);
+            auto it = rt.ds_grids.find(id);
+            if (it != rt.ds_grids.end()) {
+                Value cur = it->second.get(x, y);
+                it->second.set(x, y, Value(to_num(cur) * to_num(a[3])));
+            }
+        }
+        return vnum(0);
+    };
+    builtins["ds_grid_set_region"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 6) {
+            int id = (int)narg(a,0);
+            int x1 = (int)narg(a,1), y1 = (int)narg(a,2);
+            int x2 = (int)narg(a,3), y2 = (int)narg(a,4);
+            Value val = a[5];
+            auto it = rt.ds_grids.find(id);
+            if (it != rt.ds_grids.end()) {
+                if (x1 > x2) std::swap(x1, x2);
+                if (y1 > y2) std::swap(y1, y2);
+                for (int y = std::max(0, y1); y <= std::min(it->second.height - 1, y2); ++y) {
+                    for (int x = std::max(0, x1); x <= std::min(it->second.width - 1, x2); ++x) {
+                        it->second.set(x, y, val);
+                    }
+                }
+            }
+        }
+        return vnum(0);
+    };
+    builtins["ds_grid_set_grid_region"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 8) {
+            int id = (int)narg(a,0), src_id = (int)narg(a,1);
+            int x1 = (int)narg(a,2), y1 = (int)narg(a,3);
+            int x2 = (int)narg(a,4), y2 = (int)narg(a,5);
+            int xpos = (int)narg(a,6), ypos = (int)narg(a,7);
+            auto it = rt.ds_grids.find(id);
+            auto sit = rt.ds_grids.find(src_id);
+            if (it != rt.ds_grids.end() && sit != rt.ds_grids.end()) {
+                if (x1 > x2) std::swap(x1, x2);
+                if (y1 > y2) std::swap(y1, y2);
+                for (int sy = y1; sy <= y2; ++sy) {
+                    for (int sx = x1; sx <= x2; ++sx) {
+                        int dx = xpos + (sx - x1);
+                        int dy = ypos + (sy - y1);
+                        it->second.set(dx, dy, sit->second.get(sx, sy));
+                    }
+                }
+            }
+        }
+        return vnum(0);
+    };
+    builtins["ds_grid_get_sum"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 5) {
+            int id = (int)narg(a,0);
+            int x1 = (int)narg(a,1), y1 = (int)narg(a,2);
+            int x2 = (int)narg(a,3), y2 = (int)narg(a,4);
+            auto it = rt.ds_grids.find(id);
+            if (it != rt.ds_grids.end()) {
+                if (x1 > x2) std::swap(x1, x2);
+                if (y1 > y2) std::swap(y1, y2);
+                double sum = 0.0;
+                for (int y = std::max(0, y1); y <= std::min(it->second.height - 1, y2); ++y) {
+                    for (int x = std::max(0, x1); x <= std::min(it->second.width - 1, x2); ++x) {
+                        sum += to_num(it->second.get(x, y));
+                    }
+                }
+                return vnum(sum);
+            }
+        }
+        return vnum(0);
+    };
+    builtins["ds_grid_get_mean"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 5) {
+            int id = (int)narg(a,0);
+            int x1 = (int)narg(a,1), y1 = (int)narg(a,2);
+            int x2 = (int)narg(a,3), y2 = (int)narg(a,4);
+            auto it = rt.ds_grids.find(id);
+            if (it != rt.ds_grids.end()) {
+                if (x1 > x2) std::swap(x1, x2);
+                if (y1 > y2) std::swap(y1, y2);
+                double sum = 0.0;
+                int cnt = 0;
+                for (int y = std::max(0, y1); y <= std::min(it->second.height - 1, y2); ++y) {
+                    for (int x = std::max(0, x1); x <= std::min(it->second.width - 1, x2); ++x) {
+                        sum += to_num(it->second.get(x, y));
+                        cnt++;
+                    }
+                }
+                return vnum(cnt > 0 ? (sum / cnt) : 0.0);
+            }
+        }
+        return vnum(0);
+    };
+    builtins["ds_grid_get_min"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 5) {
+            int id = (int)narg(a,0);
+            int x1 = (int)narg(a,1), y1 = (int)narg(a,2);
+            int x2 = (int)narg(a,3), y2 = (int)narg(a,4);
+            auto it = rt.ds_grids.find(id);
+            if (it != rt.ds_grids.end()) {
+                if (x1 > x2) std::swap(x1, x2);
+                if (y1 > y2) std::swap(y1, y2);
+                double m = 1e30;
+                bool found = false;
+                for (int y = std::max(0, y1); y <= std::min(it->second.height - 1, y2); ++y) {
+                    for (int x = std::max(0, x1); x <= std::min(it->second.width - 1, x2); ++x) {
+                        double v = to_num(it->second.get(x, y));
+                        if (!found || v < m) { m = v; found = true; }
+                    }
+                }
+                return vnum(found ? m : 0.0);
+            }
+        }
+        return vnum(0);
+    };
+    builtins["ds_grid_get_max"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 5) {
+            int id = (int)narg(a,0);
+            int x1 = (int)narg(a,1), y1 = (int)narg(a,2);
+            int x2 = (int)narg(a,3), y2 = (int)narg(a,4);
+            auto it = rt.ds_grids.find(id);
+            if (it != rt.ds_grids.end()) {
+                if (x1 > x2) std::swap(x1, x2);
+                if (y1 > y2) std::swap(y1, y2);
+                double m = -1e30;
+                bool found = false;
+                for (int y = std::max(0, y1); y <= std::min(it->second.height - 1, y2); ++y) {
+                    for (int x = std::max(0, x1); x <= std::min(it->second.width - 1, x2); ++x) {
+                        double v = to_num(it->second.get(x, y));
+                        if (!found || v > m) { m = v; found = true; }
+                    }
+                }
+                return vnum(found ? m : 0.0);
+            }
+        }
+        return vnum(0);
+    };
+
+    // ---- ini files ----
+    builtins["ini_open"] = [](Runtime& rt, std::vector<Value>& a){
+        std::string fname = a.empty() ? "" : to_str(a[0]);
+        if (rt.ini_is_open) {
+            if (!rt.current_ini_filename.empty()) rt.ini_files[rt.current_ini_filename] = rt.current_ini;
+        }
+        rt.current_ini_filename = fname;
+        auto it = rt.ini_files.find(fname);
+        if (it != rt.ini_files.end()) rt.current_ini = it->second;
+        else rt.current_ini = IniFile{};
+        rt.ini_is_open = true;
+        return vnum(0);
+    };
+    builtins["ini_open_from_string"] = [](Runtime& rt, std::vector<Value>& a){
+        std::string content = a.empty() ? "" : to_str(a[0]);
+        if (rt.ini_is_open) {
+            if (!rt.current_ini_filename.empty()) rt.ini_files[rt.current_ini_filename] = rt.current_ini;
+        }
+        rt.current_ini_filename = "";
+        rt.current_ini = IniFile{};
+        rt.ini_is_open = true;
+        std::string current_sec = "";
+        size_t pos = 0;
+        while (pos < content.size()) {
+            size_t next = content.find_first_of("\r\n", pos);
+            std::string line = (next == std::string::npos) ? content.substr(pos) : content.substr(pos, next - pos);
+            pos = (next == std::string::npos) ? content.size() : next + 1;
+            if (pos < content.size() && content[pos-1] == '\r' && content[pos] == '\n') pos++;
+            size_t first = line.find_first_not_of(" \t");
+            if (first == std::string::npos) continue;
+            size_t last = line.find_last_not_of(" \t");
+            line = line.substr(first, last - first + 1);
+            if (line.empty() || line[0] == ';' || line[0] == '#') continue;
+            if (line.front() == '[' && line.back() == ']') {
+                current_sec = line.substr(1, line.size() - 2);
+            } else {
+                size_t eq = line.find('=');
+                if (eq != std::string::npos) {
+                    std::string key = line.substr(0, eq);
+                    std::string val = line.substr(eq + 1);
+                    size_t klast = key.find_last_not_of(" \t");
+                    if (klast != std::string::npos) key = key.substr(0, klast + 1);
+                    if (val.size() >= 2 && ((val.front() == '"' && val.back() == '"') || (val.front() == '\'' && val.back() == '\'')))
+                        val = val.substr(1, val.size() - 2);
+                    rt.current_ini.sections[current_sec][key] = val;
+                }
+            }
+        }
+        return vnum(0);
+    };
+    builtins["ini_close"] = [](Runtime& rt, std::vector<Value>&){
+        std::string out;
+        for (const auto& sec : rt.current_ini.sections) {
+            out += "[" + sec.first + "]\r\n";
+            for (const auto& kv : sec.second) {
+                out += kv.first + "=" + kv.second + "\r\n";
+            }
+        }
+        if (!rt.current_ini_filename.empty()) {
+            rt.ini_files[rt.current_ini_filename] = rt.current_ini;
+        }
+        rt.current_ini = IniFile{};
+        rt.current_ini_filename = "";
+        rt.ini_is_open = false;
+        return Value(out);
+    };
+    builtins["ini_read_real"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() < 3) return vnum(0);
+        std::string sec = to_str(a[0]);
+        std::string key = to_str(a[1]);
+        double def_val = to_num(a[2]);
+        auto sit = rt.current_ini.sections.find(sec);
+        if (sit != rt.current_ini.sections.end()) {
+            auto kit = sit->second.find(key);
+            if (kit != sit->second.end()) {
+                try { return vnum(std::stod(kit->second)); } catch (...) {}
+            }
+        }
+        return vnum(def_val);
+    };
+    builtins["ini_read_string"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() < 3) return Value(std::string(""));
+        std::string sec = to_str(a[0]);
+        std::string key = to_str(a[1]);
+        std::string def_val = to_str(a[2]);
+        auto sit = rt.current_ini.sections.find(sec);
+        if (sit != rt.current_ini.sections.end()) {
+            auto kit = sit->second.find(key);
+            if (kit != sit->second.end()) {
+                return Value(kit->second);
+            }
+        }
+        return Value(def_val);
+    };
+    builtins["ini_write_real"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 3) {
+            std::string sec = to_str(a[0]);
+            std::string key = to_str(a[1]);
+            double val = to_num(a[2]);
+            char buf[64];
+            if (std::floor(val) == val && std::fabs(val) < 1e15) {
+                std::snprintf(buf, sizeof(buf), "%lld", (long long)val);
+            } else {
+                std::snprintf(buf, sizeof(buf), "%.6g", val);
+            }
+            rt.current_ini.sections[sec][key] = buf;
+        }
+        return vnum(0);
+    };
+    builtins["ini_write_string"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 3) {
+            std::string sec = to_str(a[0]);
+            std::string key = to_str(a[1]);
+            std::string val = to_str(a[2]);
+            rt.current_ini.sections[sec][key] = val;
+        }
+        return vnum(0);
+    };
+    builtins["ini_key_exists"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 2) {
+            std::string sec = to_str(a[0]);
+            std::string key = to_str(a[1]);
+            auto sit = rt.current_ini.sections.find(sec);
+            if (sit != rt.current_ini.sections.end()) {
+                return vnum(sit->second.count(key) ? 1.0 : 0.0);
+            }
+        }
+        return vnum(0);
+    };
+    builtins["ini_section_exists"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 1) {
+            std::string sec = to_str(a[0]);
+            return vnum(rt.current_ini.sections.count(sec) ? 1.0 : 0.0);
+        }
+        return vnum(0);
+    };
+    builtins["ini_key_delete"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 2) {
+            std::string sec = to_str(a[0]);
+            std::string key = to_str(a[1]);
+            auto sit = rt.current_ini.sections.find(sec);
+            if (sit != rt.current_ini.sections.end()) {
+                sit->second.erase(key);
+            }
+        }
+        return vnum(0);
+    };
+    builtins["ini_section_delete"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 1) {
+            std::string sec = to_str(a[0]);
+            rt.current_ini.sections.erase(sec);
+        }
+        return vnum(0);
+    };
+
+    // ---- File I/O builtins ----
+    builtins["file_exists"] = [](Runtime&, std::vector<Value>& a){
+        if (a.empty()) return vnum(0);
+        std::string fn = to_str(a[0]);
+        FILE* fp = std::fopen(fn.c_str(), "rb");
+        if (fp) {
+            std::fclose(fp);
+            return vnum(1.0);
+        }
+        return vnum(0.0);
+    };
+    builtins["file_delete"] = [](Runtime&, std::vector<Value>& a){
+        if (a.empty()) return vnum(0);
+        std::string fn = to_str(a[0]);
+        int rc = std::remove(fn.c_str());
+        return vnum(rc == 0 ? 1.0 : 0.0);
+    };
+    builtins["file_text_open_read"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.empty()) return vnum(-1.0);
+        std::string fn = to_str(a[0]);
+        FILE* fp = std::fopen(fn.c_str(), "rb");
+        if (!fp) return vnum(-1.0);
+        std::fseek(fp, 0, SEEK_END);
+        long sz = std::ftell(fp);
+        std::fseek(fp, 0, SEEK_SET);
+        TextFile tf;
+        tf.mode = TextFile::READ;
+        if (sz > 0) {
+            tf.read_buf.resize(sz);
+            size_t r = std::fread(&tf.read_buf[0], 1, sz, fp);
+            tf.read_buf.resize(r);
+        }
+        std::fclose(fp);
+        tf.read_pos = 0;
+        int id = rt.next_text_file++;
+        rt.text_files[id] = std::move(tf);
+        return vnum(id);
+    };
+    builtins["file_text_open_write"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.empty()) return vnum(-1.0);
+        std::string fn = to_str(a[0]);
+        FILE* fp = std::fopen(fn.c_str(), "wb");
+        if (!fp) return vnum(-1.0);
+        TextFile tf;
+        tf.mode = TextFile::WRITE;
+        tf.fp = fp;
+        int id = rt.next_text_file++;
+        rt.text_files[id] = std::move(tf);
+        return vnum(id);
+    };
+    builtins["file_text_open_append"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.empty()) return vnum(-1.0);
+        std::string fn = to_str(a[0]);
+        FILE* fp = std::fopen(fn.c_str(), "ab");
+        if (!fp) return vnum(-1.0);
+        TextFile tf;
+        tf.mode = TextFile::APPEND;
+        tf.fp = fp;
+        int id = rt.next_text_file++;
+        rt.text_files[id] = std::move(tf);
+        return vnum(id);
+    };
+    builtins["file_text_close"] = [](Runtime& rt, std::vector<Value>& a){
+        if (!a.empty()) {
+            int id = (int)narg(a,0);
+            auto it = rt.text_files.find(id);
+            if (it != rt.text_files.end()) {
+                if (it->second.fp) {
+                    std::fclose(it->second.fp);
+                    it->second.fp = nullptr;
+                }
+                rt.text_files.erase(it);
+            }
+        }
+        return vnum(0.0);
+    };
+    builtins["file_text_eof"] = [](Runtime& rt, std::vector<Value>& a){
+        if (!a.empty()) {
+            int id = (int)narg(a,0);
+            auto it = rt.text_files.find(id);
+            if (it != rt.text_files.end()) {
+                if (it->second.mode == TextFile::READ) {
+                    return vnum(it->second.read_pos >= it->second.read_buf.size() ? 1.0 : 0.0);
+                }
+                return vnum(0.0);
+            }
+        }
+        return vnum(1.0);
+    };
+    builtins["file_text_read_string"] = [](Runtime& rt, std::vector<Value>& a){
+        if (!a.empty()) {
+            int id = (int)narg(a,0);
+            auto it = rt.text_files.find(id);
+            if (it != rt.text_files.end() && it->second.mode == TextFile::READ) {
+                const std::string& buf = it->second.read_buf;
+                size_t start = it->second.read_pos;
+                size_t p = start;
+                while (p < buf.size() && buf[p] != '\r' && buf[p] != '\n') {
+                    p++;
+                }
+                it->second.read_pos = p;
+                return Value(buf.substr(start, p - start));
+            }
+        }
+        return Value(std::string(""));
+    };
+    builtins["file_text_readln"] = [](Runtime& rt, std::vector<Value>& a){
+        if (!a.empty()) {
+            int id = (int)narg(a,0);
+            auto it = rt.text_files.find(id);
+            if (it != rt.text_files.end() && it->second.mode == TextFile::READ) {
+                const std::string& buf = it->second.read_buf;
+                size_t start = it->second.read_pos;
+                size_t p = start;
+                while (p < buf.size() && buf[p] != '\r' && buf[p] != '\n') {
+                    p++;
+                }
+                std::string rem = buf.substr(start, p - start);
+                if (p < buf.size() && buf[p] == '\r') p++;
+                if (p < buf.size() && buf[p] == '\n') p++;
+                it->second.read_pos = p;
+                return Value(rem);
+            }
+        }
+        return Value(std::string(""));
+    };
+    builtins["file_text_read_real"] = [](Runtime& rt, std::vector<Value>& a){
+        if (!a.empty()) {
+            int id = (int)narg(a,0);
+            auto it = rt.text_files.find(id);
+            if (it != rt.text_files.end() && it->second.mode == TextFile::READ) {
+                const std::string& buf = it->second.read_buf;
+                size_t p = it->second.read_pos;
+                while (p < buf.size() && (std::isspace((unsigned char)buf[p]) || buf[p] == '\0')) {
+                    p++;
+                }
+                if (p < buf.size()) {
+                    const char* start_ptr = buf.c_str() + p;
+                    char* end_ptr = nullptr;
+                    double val = std::strtod(start_ptr, &end_ptr);
+                    if (end_ptr > start_ptr) {
+                        it->second.read_pos = p + (size_t)(end_ptr - start_ptr);
+                        return vnum(val);
+                    }
+                }
+                it->second.read_pos = p;
+            }
+        }
+        return vnum(0.0);
+    };
+    builtins["file_text_write_string"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 2) {
+            int id = (int)narg(a,0);
+            auto it = rt.text_files.find(id);
+            if (it != rt.text_files.end() && it->second.fp) {
+                std::string s = to_str(a[1]);
+                if (!s.empty()) {
+                    std::fwrite(s.data(), 1, s.size(), it->second.fp);
+                    std::fflush(it->second.fp);
+                }
+            }
+        }
+        return vnum(0.0);
+    };
+    builtins["file_text_write_real"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() >= 2) {
+            int id = (int)narg(a,0);
+            auto it = rt.text_files.find(id);
+            if (it != rt.text_files.end() && it->second.fp) {
+                std::string s = to_str(a[1]);
+                std::fwrite(s.data(), 1, s.size(), it->second.fp);
+                std::fflush(it->second.fp);
+            }
+        }
+        return vnum(0.0);
+    };
+    builtins["file_text_writeln"] = [](Runtime& rt, std::vector<Value>& a){
+        if (!a.empty()) {
+            int id = (int)narg(a,0);
+            auto it = rt.text_files.find(id);
+            if (it != rt.text_files.end() && it->second.fp) {
+                const char nl[] = "\r\n";
+                std::fwrite(nl, 1, 2, it->second.fp);
+                std::fflush(it->second.fp);
+            }
+        }
+        return vnum(0.0);
+    };
+
+    for (const char* n : {"ossafe_ini_open","ossafe_ini_close","randomize",
                           "application_surface_enable",
                           "application_surface_draw_enable","display_set_gui_size","window_set_fullscreen",
                           "window_set_caption","texture_set_interpolation","draw_enable_alphablend",
                           "show_debug_message","show_message","screen_refresh","set_automatic_draw",
                           "instance_deactivate_all","instance_activate_all",
-                          "file_text_open_write","file_text_write_string","file_text_close",
-                          "file_delete","file_rename","steam_initialised","steam_file_exists",
+                          "file_rename","steam_initialised","steam_file_exists",
                           "steam_file_delete","trophy_init","action_kill_object","action_move_to"})
         if (!builtins.count(n)) builtins[n] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
-    builtins["ini_read_string"] = [](Runtime&, std::vector<Value>&){ return Value(std::string("")); };
     builtins["surface_get_width"] = [](Runtime& rt, std::vector<Value>&){
         auto it = rt.global_arrays.find("view_wview");
         if (it != rt.global_arrays.end() && !it->second.empty() && to_num(it->second[0]) > 0)
@@ -1435,10 +2232,32 @@ void Runtime::register_builtins() {
         s.erase((size_t)pos - 1, (size_t)cnt);
         return Value(s);
     };
+    builtins["string_insert"] = [](Runtime&, std::vector<Value>& a){
+        std::string sub = sarg(a,0);
+        std::string str = sarg(a,1);
+        int pos = (int)narg(a,2);
+        if (pos <= 1) return Value(sub + str);
+        if (pos > (int)str.size()) return Value(str + sub);
+        return Value(str.substr(0, (size_t)pos - 1) + sub + str.substr((size_t)pos - 1));
+    };
     builtins["string_repeat"] = [](Runtime&, std::vector<Value>& a){
         std::string s = sarg(a,0), out; int n = (int)narg(a,1);
         for (int i = 0; i < n; ++i) out += s;
         return Value(out);
+    };
+    builtins["string_format"] = [](Runtime&, std::vector<Value>& a){
+        if (a.empty()) return Value(std::string(""));
+        double val = narg(a, 0);
+        int tot = a.size() > 1 ? (int)narg(a, 1) : 0;
+        int dec = a.size() > 2 ? (int)narg(a, 2) : 0;
+        if (dec < 0) dec = 0;
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "%.*f", dec, val);
+        std::string s(buf);
+        if ((int)s.size() < tot) {
+            s = std::string((size_t)(tot - (int)s.size()), ' ') + s;
+        }
+        return Value(s);
     };
     builtins["string_byte_length"] = [](Runtime&, std::vector<Value>& a){ return vnum((double)sarg(a,0).size()); };
     builtins["choose"] = [](Runtime&, std::vector<Value>& a){
@@ -1684,6 +2503,344 @@ void Runtime::register_builtins() {
     builtins["sound_volume"] = builtins["audio_sound_gain"];
     builtins["sound_global_volume"] = builtins["audio_master_gain"];
 
+    // ---- Undertale caster_* audio engine ----
+    builtins["caster_load"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio();
+        if (a.empty()) return vnum(-1);
+        std::string raw_name = to_str(a[0]);
+        if (raw_name.empty()) return vnum(-1);
+
+        auto it = rt.caster_path_to_id.find(raw_name);
+        if (it != rt.caster_path_to_id.end()) return vnum(it->second);
+
+        int s_idx = rt.dw.sound_index_by_name(raw_name);
+        if (s_idx >= 0) {
+            rt.caster_path_to_id[raw_name] = s_idx;
+            return vnum(s_idx);
+        }
+
+        std::string base_dir = ".";
+        size_t last_slash = rt.dw.filepath.find_last_of("/\\");
+        if (last_slash != std::string::npos) {
+            base_dir = rt.dw.filepath.substr(0, last_slash);
+        }
+
+        std::string clean = raw_name;
+        if (clean.rfind("./", 0) == 0) clean = clean.substr(2);
+        else if (clean.rfind(".\\", 0) == 0) clean = clean.substr(2);
+
+        std::string fname_only = clean;
+        size_t slash_pos = clean.find_last_of("/\\");
+        if (slash_pos != std::string::npos) fname_only = clean.substr(slash_pos + 1);
+
+        std::vector<std::string> candidates = {
+            base_dir + "/" + clean,
+            base_dir + "/mus/" + clean,
+            base_dir + "/music/" + clean,
+            base_dir + "/" + fname_only,
+            clean
+        };
+        if (fname_only.rfind("mus_", 0) != 0) {
+            candidates.push_back(base_dir + "/mus_" + fname_only);
+            candidates.push_back("mus_" + fname_only);
+        }
+        size_t n_cands = candidates.size();
+        for (size_t ci = 0; ci < n_cands; ++ci) {
+            std::string c = candidates[ci];
+            if (c.size() < 4 || c.substr(c.size() - 4) != ".ogg") {
+                candidates.push_back(c + ".ogg");
+            }
+        }
+
+        std::vector<uint8_t> file_bytes;
+        for (const auto& path : candidates) {
+            FILE* fp = std::fopen(path.c_str(), "rb");
+            if (fp) {
+                std::fseek(fp, 0, SEEK_END);
+                long sz = std::ftell(fp);
+                std::fseek(fp, 0, SEEK_SET);
+                if (sz > 0) {
+                    file_bytes.resize((size_t)sz);
+                    if (std::fread(file_bytes.data(), 1, sz, fp) == (size_t)sz) {
+                        std::fclose(fp);
+                        break;
+                    }
+                }
+                std::fclose(fp);
+                file_bytes.clear();
+            }
+        }
+
+        if (file_bytes.empty()) return vnum(-1);
+
+        AudioClip clip;
+        if (!decode_audio(file_bytes.data(), file_bytes.size(), clip)) return vnum(-1);
+
+        int id = rt.next_caster_id++;
+        rt.audio->set_clip(id, std::make_shared<AudioClip>(std::move(clip)));
+        rt.caster_path_to_id[raw_name] = id;
+        return vnum(id);
+    };
+    builtins["caster_play"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio();
+        if (a.empty()) return vnum(-1);
+        int asset = (int)narg(a, 0);
+        double vol = a.size() > 1 ? narg(a, 1) : 1.0;
+        double pitch = a.size() > 2 ? narg(a, 2) : 1.0;
+        return vnum(rt.audio->play(asset, false, vol, 0.0, pitch, 1.0));
+    };
+    builtins["caster_play_l"] = builtins["caster_play"];
+    builtins["caster_loop"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio();
+        if (a.empty()) return vnum(-1);
+        int asset = (int)narg(a, 0);
+        double vol = a.size() > 1 ? narg(a, 1) : 1.0;
+        double pitch = a.size() > 2 ? narg(a, 2) : 1.0;
+        return vnum(rt.audio->play(asset, true, vol, 0.0, pitch, 1.0));
+    };
+    builtins["caster_stop"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio();
+        if (a.empty()) return vnum(0);
+        int id = (int)narg(a, 0);
+        if (id >= kHandleBase) rt.audio->stop_handle(id);
+        else rt.audio->stop_asset(id);
+        return vnum(0);
+    };
+    builtins["caster_pause"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio();
+        if (a.empty()) return vnum(0);
+        int id = (int)narg(a, 0);
+        if (id >= kHandleBase) rt.audio->pause_handle(id);
+        else rt.audio->pause_asset(id);
+        return vnum(0);
+    };
+    builtins["caster_resume"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio();
+        if (a.empty()) return vnum(0);
+        int id = (int)narg(a, 0);
+        if (id >= kHandleBase) rt.audio->resume_handle(id);
+        else rt.audio->resume_asset(id);
+        return vnum(0);
+    };
+    builtins["caster_free"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio();
+        if (!a.empty()) {
+            int id = (int)narg(a, 0);
+            if (id >= kHandleBase) rt.audio->stop_handle(id);
+            else rt.audio->stop_asset(id);
+        }
+        return vnum(0);
+    };
+    builtins["caster_set_volume"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio();
+        if (a.size() >= 2) {
+            int id = (int)narg(a, 0);
+            double v = narg(a, 1);
+            if (id >= kHandleBase) rt.audio->set_gain_handle(id, v);
+            else rt.audio->set_gain_asset(id, v);
+        }
+        return vnum(0);
+    };
+    builtins["caster_get_volume"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio();
+        if (a.empty()) return vnum(0);
+        int id = (int)narg(a, 0);
+        return vnum(id >= kHandleBase ? rt.audio->get_gain_handle(id) : rt.audio->get_gain_asset(id));
+    };
+    builtins["caster_set_pitch"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio();
+        if (a.size() >= 2) {
+            int id = (int)narg(a, 0);
+            double p = narg(a, 1);
+            if (id >= kHandleBase) rt.audio->set_pitch_handle(id, p);
+            else rt.audio->set_pitch_asset(id, p);
+        }
+        return vnum(0);
+    };
+    builtins["caster_get_pitch"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio();
+        if (a.empty()) return vnum(1);
+        int id = (int)narg(a, 0);
+        return vnum(id >= kHandleBase ? rt.audio->get_pitch_handle(id) : rt.audio->get_pitch_asset(id));
+    };
+    builtins["caster_set_panning"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["caster_is_playing"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        rt.ensure_audio();
+        if (a.empty()) return vnum(0);
+        int id = (int)narg(a, 0);
+        return vnum(rt.audio->is_playing(id) ? 1.0 : 0.0);
+    };
+
+    // ---- surfaces ----
+    builtins["surface_create"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        int w = a.size() > 0 ? (int)narg(a, 0) : 320;
+        int h = a.size() > 1 ? (int)narg(a, 1) : 240;
+        if (w <= 0) w = 1;
+        if (h <= 0) h = 1;
+        int id = rt.next_surface_id++;
+        Surface s;
+        s.img.w = w;
+        s.img.h = h;
+        s.img.rgba.assign((size_t)w * h * 4, 0);
+        rt.surfaces[id] = std::move(s);
+        return vnum(id);
+    };
+    builtins["surface_free"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (!a.empty()) rt.surfaces.erase((int)narg(a, 0));
+        return vnum(0);
+    };
+    builtins["surface_exists"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.empty()) return vnum(0);
+        int id = (int)narg(a, 0);
+        return vnum(rt.surfaces.count(id) ? 1.0 : 0.0);
+    };
+    builtins["surface_get_width"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (!a.empty()) {
+            int id = (int)narg(a, 0);
+            auto it = rt.surfaces.find(id);
+            if (it != rt.surfaces.end()) return vnum(it->second.img.w);
+        }
+        auto it = rt.global_arrays.find("view_wview");
+        if (it != rt.global_arrays.end() && !it->second.empty() && to_num(it->second[0]) > 0)
+            return it->second[0];
+        return vnum(320.0);
+    };
+    builtins["surface_get_height"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (!a.empty()) {
+            int id = (int)narg(a, 0);
+            auto it = rt.surfaces.find(id);
+            if (it != rt.surfaces.end()) return vnum(it->second.img.h);
+        }
+        auto it = rt.global_arrays.find("view_hview");
+        if (it != rt.global_arrays.end() && !it->second.empty() && to_num(it->second[0]) > 0)
+            return it->second[0];
+        return vnum(240.0);
+    };
+    builtins["surface_set_target"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (!a.empty()) {
+            int id = (int)narg(a, 0);
+            auto it = rt.surfaces.find(id);
+            if (it != rt.surfaces.end()) {
+                rt.surface_target_stack.push_back(rt.screen);
+                rt.screen = &it->second.img;
+            }
+        }
+        return vnum(0);
+    };
+    builtins["surface_reset_target"] = [](Runtime& rt, std::vector<Value>&) -> Value {
+        if (!rt.surface_target_stack.empty()) {
+            rt.screen = rt.surface_target_stack.back();
+            rt.surface_target_stack.pop_back();
+        }
+        return vnum(0);
+    };
+    builtins["draw_surface"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.size() >= 3) {
+            int id = (int)narg(a, 0);
+            int dx = (int)narg(a, 1);
+            int dy = (int)narg(a, 2);
+            auto it = rt.surfaces.find(id);
+            if (it != rt.surfaces.end() && it->second.img.w > 0 && it->second.img.h > 0) {
+                rt.blit_sub_screen(it->second.img, 0, 0, it->second.img.w, it->second.img.h,
+                                   dx - rt.view_x, dy - rt.view_y, rt.draw_alpha);
+            }
+        }
+        return vnum(0);
+    };
+    builtins["draw_surface_ext"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.size() >= 3) {
+            int id = (int)narg(a, 0);
+            int dx = (int)narg(a, 1);
+            int dy = (int)narg(a, 2);
+            double xs = a.size() > 3 ? narg(a, 3) : 1.0;
+            double ys = a.size() > 4 ? narg(a, 4) : 1.0;
+            double rot = a.size() > 5 ? narg(a, 5) : 0.0;
+            uint32_t col = a.size() > 6 ? (uint32_t)narg(a, 6) : 0xFFFFFF;
+            double alpha = a.size() > 7 ? narg(a, 7) : 1.0;
+            auto it = rt.surfaces.find(id);
+            if (it != rt.surfaces.end() && it->second.img.w > 0 && it->second.img.h > 0) {
+                int out_w = (int)std::lround(it->second.img.w * xs);
+                int out_h = (int)std::lround(it->second.img.h * ys);
+                rt.blit_sub_screen_scaled(it->second.img, 0, 0, it->second.img.w, it->second.img.h,
+                                          dx - rt.view_x, dy - rt.view_y, out_w, out_h,
+                                          alpha, col, rot);
+            }
+        }
+        return vnum(0);
+    };
+    builtins["draw_surface_part"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.size() >= 7) {
+            int id = (int)narg(a, 0);
+            int sx = (int)narg(a, 1), sy = (int)narg(a, 2);
+            int sw = (int)narg(a, 3), sh = (int)narg(a, 4);
+            int dx = (int)narg(a, 5), dy = (int)narg(a, 6);
+            auto it = rt.surfaces.find(id);
+            if (it != rt.surfaces.end()) {
+                rt.blit_sub_screen(it->second.img, sx, sy, sw, sh, dx - rt.view_x, dy - rt.view_y, rt.draw_alpha);
+            }
+        }
+        return vnum(0);
+    };
+    builtins["draw_clear"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (rt.screen && !a.empty()) {
+            uint32_t col = (uint32_t)narg(a, 0);
+            uint8_t px[4] = { (uint8_t)(col & 0xFF), (uint8_t)((col >> 8) & 0xFF),
+                              (uint8_t)((col >> 16) & 0xFF), 255 };
+            for (size_t i = 0; i < rt.screen->rgba.size(); i += 4) {
+                std::memcpy(&rt.screen->rgba[i], px, 4);
+            }
+        }
+        return vnum(0);
+    };
+    builtins["draw_clear_alpha"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (rt.screen && !a.empty()) {
+            uint32_t col = (uint32_t)narg(a, 0);
+            uint8_t alpha = a.size() > 1 ? (uint8_t)(std::clamp(narg(a, 1), 0.0, 1.0) * 255.0) : 255;
+            uint8_t px[4] = { (uint8_t)(col & 0xFF), (uint8_t)((col >> 8) & 0xFF),
+                              (uint8_t)((col >> 16) & 0xFF), alpha };
+            for (size_t i = 0; i < rt.screen->rgba.size(); i += 4) {
+                std::memcpy(&rt.screen->rgba[i], px, 4);
+            }
+        }
+        return vnum(0);
+    };
+
+    // ---- 2D drawing primitives ----
+    builtins["draw_rectangle"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.size() >= 4) {
+            bool outline = a.size() > 4 ? to_bool(a[4]) : false;
+            draw_rect_on_image(rt.screen, (int)narg(a, 0) - rt.view_x, (int)narg(a, 1) - rt.view_y,
+                               (int)narg(a, 2) - rt.view_x, (int)narg(a, 3) - rt.view_y,
+                               (uint32_t)rt.draw_color, rt.draw_alpha, outline);
+        }
+        return vnum(0);
+    };
+    builtins["draw_rectangle_colour"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.size() >= 4) {
+            uint32_t c1 = a.size() > 4 ? (uint32_t)narg(a, 4) : (uint32_t)rt.draw_color;
+            bool outline = a.size() > 8 ? to_bool(a[8]) : false;
+            draw_rect_on_image(rt.screen, (int)narg(a, 0) - rt.view_x, (int)narg(a, 1) - rt.view_y,
+                               (int)narg(a, 2) - rt.view_x, (int)narg(a, 3) - rt.view_y,
+                               c1, rt.draw_alpha, outline);
+        }
+        return vnum(0);
+    };
+    builtins["draw_rectangle_color"] = builtins["draw_rectangle_colour"];
+    builtins["draw_line"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.size() >= 4) {
+            draw_line_on_image(rt.screen, (int)narg(a, 0) - rt.view_x, (int)narg(a, 1) - rt.view_y,
+                               (int)narg(a, 2) - rt.view_x, (int)narg(a, 3) - rt.view_y,
+                               (uint32_t)rt.draw_color, rt.draw_alpha);
+        }
+        return vnum(0);
+    };
+    builtins["draw_line_width"] = builtins["draw_line"];
+    builtins["draw_get_color"] = [](Runtime& rt, std::vector<Value>&) -> Value { return vnum(rt.draw_color); };
+    builtins["draw_get_colour"] = builtins["draw_get_color"];
+    builtins["draw_get_alpha"] = [](Runtime& rt, std::vector<Value>&) -> Value { return vnum(rt.draw_alpha); };
+    builtins["draw_set_blend_mode"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["draw_set_blend_mode_ext"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+
     // ---- harmless stubs (no 3DS equivalent / not needed yet) ----
     for (const char* n : {"ini_write_real","ini_write_string","ini_open_from_string","sprite_replace","sprite_delete",
         "sprite_create_from_surface","sprite_collision_mask","path_start","path_end","tile_layer_shift","tile_layer_hide",
@@ -1691,7 +2848,7 @@ void Runtime::register_builtins() {
         "draw_ellipse_color","draw_triangle","draw_triangle_color","draw_roundrect","draw_point_color","draw_clear_alpha",
         "draw_background_part_ext","draw_background_stretched","draw_surface","draw_surface_ext",
         "window_set_position","window_center","steam_file_write_file",
-        "file_text_writeln","file_text_write_real","surface_set_target","surface_reset_target","surface_free",
+        "surface_set_target","surface_reset_target","surface_free",
         "buffer_async_group_option","buffer_async_group_begin","buffer_async_group_end","buffer_write","buffer_save_async",
         "buffer_load_async","buffer_delete","instance_change","instance_activate_object","room_set_persistent",
         "action_set_alarm","action_set_relative","action_move","action_set_hspeed","action_set_motion","action_create_object",
@@ -1700,12 +2857,9 @@ void Runtime::register_builtins() {
         if (!builtins.count(n)) builtins[n] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
     for (const char* n : {"gamepad_is_connected","window_get_fullscreen"})
         if (!builtins.count(n)) builtins[n] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
-    builtins["file_text_eof"] = [](Runtime&, std::vector<Value>&){ return vnum(1); };
     for (const char* n : {"joystick_buttons","gamepad_get_device_count","window_get_x","window_get_y","buffer_create",
         "buffer_get_size","buffer_read","surface_create",
         "draw_getpixel","date_current_datetime","json_decode","json_encode"})
-        if (!builtins.count(n)) builtins[n] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
-    for (const char* n : {"file_text_open_read","file_text_read_string","file_text_readln","file_text_read_real"})
         if (!builtins.count(n)) builtins[n] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
 }
 
@@ -2006,7 +3160,7 @@ Image Runtime::draw() {
         const Tpag& t = dw.tpags[tp];
         if (t.tex < 0 || t.tex >= (int)dw.tex_ptrs.size()) continue;
         const Image& pg = page(t.tex);
-        if (pg.w <= 0 || t.sx < 0 || t.sy < 0 || t.sx + t.sw > pg.w || t.sy + t.sh > pg.h) continue;
+        if (pg.w <= 0 || t.sx + t.sw > pg.w || t.sy + t.sh > pg.h) continue;
 
         int bg_w = t.sw, bg_h = t.sh;
         if (bg_w <= 0 || bg_h <= 0) continue;

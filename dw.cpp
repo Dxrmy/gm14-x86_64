@@ -32,7 +32,7 @@ static void log_status(const char* msg) {
 
 namespace gm14 {
 
-DataWin::DataWin(const std::string& path) {
+DataWin::DataWin(const std::string& path) : filepath(path) {
     log_status("[1/10] Opening data.win...\n");
     m_fp = std::fopen(path.c_str(), "rb");
     if (!m_fp) throw std::runtime_error("cannot open " + path);

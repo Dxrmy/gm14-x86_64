@@ -49,5 +49,12 @@ target_link_libraries(vm_host PRIVATE gm14_core)
 add_executable(vm_tests vm_tests.cpp)
 target_link_libraries(vm_tests PRIVATE gm14_core)
 
+# Interactive PC runner (Win32)
+if(WIN32)
+    add_executable(gm14_runner main_runner.cpp)
+    target_link_libraries(gm14_runner PRIVATE gm14_core gdi32 winmm)
+endif()
+
 enable_testing()
 add_test(NAME vm_unit_tests COMMAND vm_tests)
+

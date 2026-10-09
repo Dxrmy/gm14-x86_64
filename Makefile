@@ -4,13 +4,15 @@ CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter
 # Platform detection
 ifeq ($(OS),Windows_NT)
     EXE := .exe
-    LDFLAGS ?= -lwinmm -static
+    LDFLAGS ?= -lwinmm -lgdi32 -static
+    RUNNER_TARGET := gm14_runner$(EXE)
 else
     EXE :=
     LDFLAGS ?= -lasound -lpthread
+    RUNNER_TARGET :=
 endif
 
-TARGETS = gm14_host$(EXE) vm_host$(EXE) vm_tests$(EXE)
+TARGETS = gm14_host$(EXE) vm_host$(EXE) vm_tests$(EXE) $(RUNNER_TARGET)
 
 all: $(TARGETS)
 
@@ -38,10 +40,14 @@ vm_host$(EXE): vm_host.cpp $(VM_OBJS)
 vm_tests$(EXE): vm_tests.cpp $(VM_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ vm_tests.cpp $(VM_OBJS) $(LDFLAGS)
 
+gm14_runner$(EXE): main_runner.cpp $(VM_OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ main_runner.cpp $(VM_OBJS) $(LDFLAGS)
+
 # Aliases without extension
 gm14_host: gm14_host$(EXE)
 vm_host: vm_host$(EXE)
 vm_tests: vm_tests$(EXE)
+gm14_runner: gm14_runner$(EXE)
 
 clean:
-	rm -f $(TARGETS) *.o out_room_*.png vm_frame.png test_intro_*.png
+	rm -f $(TARGETS) gm14_runner$(EXE) *.o out_room_*.png vm_frame.png test_intro_*.png

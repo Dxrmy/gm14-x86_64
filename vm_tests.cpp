@@ -281,6 +281,111 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ================= ds_grid =================
+    {
+        double g = to_num(C("ds_grid_create", {num(4), num(4)}));
+        ok_bool("ds_grid_create valid id", Value(g > 0 ? 1.0 : 0.0), true);
+        ok_num("ds_grid_width", to_num(C("ds_grid_width", {num(g)})), 4);
+        ok_num("ds_grid_height", to_num(C("ds_grid_height", {num(g)})), 4);
+        C("ds_grid_set", {num(g), num(1), num(2), num(42)});
+        ok_num("ds_grid_get set cell", to_num(C("ds_grid_get", {num(g), num(1), num(2)})), 42);
+        ok_num("ds_grid_get unset cell", to_num(C("ds_grid_get", {num(g), num(0), num(0)})), 0);
+        C("ds_grid_clear", {num(g), num(5)});
+        ok_num("ds_grid_clear applied", to_num(C("ds_grid_get", {num(g), num(1), num(2)})), 5);
+        C("ds_grid_set_region", {num(g), num(1), num(1), num(2), num(2), num(10)});
+        ok_num("ds_grid_set_region cell (1,1)", to_num(C("ds_grid_get", {num(g), num(1), num(1)})), 10);
+        ok_num("ds_grid_set_region cell (2,2)", to_num(C("ds_grid_get", {num(g), num(2), num(2)})), 10);
+        ok_num("ds_grid_set_region untouched (0,0)", to_num(C("ds_grid_get", {num(g), num(0), num(0)})), 5);
+        // Region sums & stats: (4x4, 12 cells at 5 = 60, 4 cells at 10 = 40, total 100)
+        ok_num("ds_grid_get_sum", to_num(C("ds_grid_get_sum", {num(g), num(0), num(0), num(3), num(3)})), 100);
+        ok_num("ds_grid_get_mean", to_num(C("ds_grid_get_mean", {num(g), num(0), num(0), num(3), num(3)})), 6.25);
+        ok_num("ds_grid_get_max", to_num(C("ds_grid_get_max", {num(g), num(0), num(0), num(3), num(3)})), 10);
+        C("ds_grid_destroy", {num(g)});
+    }
+
+    // ================= INI save system =================
+    {
+        C("ini_open", {str("test_save.ini")});
+        C("ini_write_real", {str("General"), str("hp"), num(20)});
+        C("ini_write_string", {str("General"), str("name"), str("Frisk")});
+        C("ini_write_real", {str("General"), str("love"), num(1)});
+        C("ini_write_real", {str("Flags"), str("plot"), num(105)});
+        ok_bool("ini_key_exists true", C("ini_key_exists", {str("General"), str("hp")}), true);
+        ok_bool("ini_key_exists false", C("ini_key_exists", {str("General"), str("nonexistent")}), false);
+        ok_bool("ini_section_exists true", C("ini_section_exists", {str("General")}), true);
+        ok_bool("ini_section_exists false", C("ini_section_exists", {str("Missing")}), false);
+        ok_num("ini_read_real hp", to_num(C("ini_read_real", {str("General"), str("hp"), num(0)})), 20);
+        ok_str("ini_read_string name", to_str(C("ini_read_string", {str("General"), str("name"), str("")})), "Frisk");
+        ok_num("ini_read_real default", to_num(C("ini_read_real", {str("General"), str("missing"), num(999)})), 999);
+        Value ini_text = C("ini_close", {});
+        ok_bool("ini_close returns non-empty string", Value(to_str(ini_text).size() > 10 ? 1.0 : 0.0), true);
+
+        // Reopen from cache and verify persistence
+        C("ini_open", {str("test_save.ini")});
+        ok_num("ini reloaded hp", to_num(C("ini_read_real", {str("General"), str("hp"), num(0)})), 20);
+        ok_str("ini reloaded name", to_str(C("ini_read_string", {str("General"), str("name"), str("")})), "Frisk");
+        ok_num("ini reloaded plot", to_num(C("ini_read_real", {str("Flags"), str("plot"), num(0)})), 105);
+        C("ini_close", {});
+    }
+
+    // ================= math & vector builtins =================
+    {
+        ok_num("clamp middle", to_num(C("clamp", {num(5), num(0), num(10)})), 5);
+        ok_num("clamp low", to_num(C("clamp", {num(-5), num(0), num(10)})), 0);
+        ok_num("clamp high", to_num(C("clamp", {num(15), num(0), num(10)})), 10);
+        ok_num("lerp 50%", to_num(C("lerp", {num(10), num(20), num(0.5)})), 15);
+        ok_num("lerp 0%", to_num(C("lerp", {num(10), num(20), num(0.0)})), 10);
+        ok_num("lerp 100%", to_num(C("lerp", {num(10), num(20), num(1.0)})), 20);
+        ok_num("point_distance 3-4-5", to_num(C("point_distance", {num(0), num(0), num(3), num(4)})), 5);
+        ok_num("point_direction right", to_num(C("point_direction", {num(0), num(0), num(10), num(0)})), 0);
+        ok_num("point_direction down", to_num(C("point_direction", {num(0), num(0), num(0), num(10)})), 270);
+        ok_num("lengthdir_x right", to_num(C("lengthdir_x", {num(10), num(0)})), 10, 1e-6);
+        ok_num("lengthdir_y right", to_num(C("lengthdir_y", {num(10), num(0)})), 0, 1e-6);
+        ok_num("lengthdir_x up", to_num(C("lengthdir_x", {num(10), num(90)})), 0, 1e-6);
+        ok_num("lengthdir_y up", to_num(C("lengthdir_y", {num(10), num(90)})), -10, 1e-6);
+        ok_num("darctan2 45deg", to_num(C("darctan2", {num(1), num(1)})), 45, 1e-6);
+        ok_num("degtorad 180", to_num(C("degtorad", {num(180)})), M_PI, 1e-6);
+    }
+
+    // ================= additional strings =================
+    {
+        ok_str("string_format 2 dec", to_str(C("string_format", {num(3.14159), num(0), num(2)})), "3.14");
+        ok_str("string_insert middle", to_str(C("string_insert", {str("world"), str("hello "), num(7)})), "hello world");
+        ok_num("string_byte_length", to_num(C("string_byte_length", {str("Antigravity")})), 11);
+    }
+
+    // ================= surfaces =================
+    {
+        double surf = to_num(C("surface_create", {num(64), num(64)}));
+        ok_bool("surface_create id > 0", Value(surf > 0 ? 1.0 : 0.0), true);
+        ok_bool("surface_exists true", C("surface_exists", {num(surf)}), true);
+        ok_num("surface_get_width", to_num(C("surface_get_width", {num(surf)})), 64);
+        ok_num("surface_get_height", to_num(C("surface_get_height", {num(surf)})), 64);
+        C("surface_set_target", {num(surf)});
+        C("draw_clear", {num((double)0xFF0000)});
+        C("surface_reset_target", {});
+        C("surface_free", {num(surf)});
+        ok_bool("surface_exists false after free", C("surface_exists", {num(surf)}), false);
+    }
+
+    // ================= Undertale caster_* audio engine =================
+    {
+        double cid = to_num(C("caster_load", {str("mus_story.ogg")}));
+        if (cid > 0) {
+            ok_bool("caster_load found mus_story.ogg", Value(1.0), true);
+            double cv = to_num(C("caster_play", {num(cid), num(0.75), num(1.0)}));
+            ok_bool("caster_play returns voice handle", Value(cv >= 300000 ? 1.0 : 0.0), true);
+            ok_bool("caster_is_playing true", C("caster_is_playing", {num(cid)}), true);
+            C("caster_set_volume", {num(cid), num(0.5)});
+            ok_num("caster_get_volume round-trip", to_num(C("caster_get_volume", {num(cid)})), 0.5, 1e-9);
+            C("caster_set_pitch", {num(cid), num(1.25)});
+            ok_num("caster_get_pitch round-trip", to_num(C("caster_get_pitch", {num(cid)})), 1.25, 1e-9);
+            C("caster_stop", {num(cid)});
+            ok_bool("caster_is_playing false after stop", C("caster_is_playing", {num(cid)}), false);
+            C("caster_free", {num(cid)});
+        }
+    }
+
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
