@@ -501,6 +501,9 @@ void Runtime::set_array(Frame& fr, const Instruction& ins, int inst_type, int in
         return;
     }
     if (inst_type == -5) {
+        if (!global_arrays.count(name) && globals.count(name) && globals[name].is_arr() && globals[name].arrref) {
+            global_arrays[name] = *globals[name].arrref;
+        }
         auto& arr = global_arrays[name];
         Value av; av.type = Value::VARPTR; av.arrref = &arr;
         globals[name] = av;
@@ -512,6 +515,9 @@ void Runtime::set_array(Frame& fr, const Instruction& ins, int inst_type, int in
     }
     if (inst_type == -7) {
         int varid = (ins.var >= 0) ? dw.variables[ins.var].varid : 0;
+        if (varid >= 0 && varid < (int)fr.locals.size() && !fr.local_arrays.count(varid) && fr.locals[varid].is_arr() && fr.locals[varid].arrref) {
+            fr.local_arrays[varid] = *fr.locals[varid].arrref;
+        }
         auto& arr = fr.local_arrays[varid];
         Value av; av.type = Value::VARPTR; av.arrref = &arr;
         if (varid >= 0) {
@@ -527,6 +533,9 @@ void Runtime::set_array(Frame& fr, const Instruction& ins, int inst_type, int in
 
     auto set_inst_arr = [&](Instance* inst) {
         if (!inst) return;
+        if (!inst->arrays.count(name) && inst->vars.count(name) && inst->vars[name].is_arr() && inst->vars[name].arrref) {
+            inst->arrays[name] = *inst->vars[name].arrref;
+        }
         auto& arr = inst->arrays[name];
         Value av; av.type = Value::VARPTR; av.arrref = &arr;
         inst->vars[name] = av;
