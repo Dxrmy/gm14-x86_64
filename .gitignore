@@ -35,4 +35,16 @@ __pycache__/
 
 # Local save & test configs
 *.ini
+*.sav
+*.rec
 save/
+saves/
+fresh_saves/
+
+# Scratch & local debug files
+inspect_*
+dump_*
+check_*
+find_*
+test_*
+*.txt

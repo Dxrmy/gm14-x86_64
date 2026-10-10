@@ -16,10 +16,13 @@ TARGETS = gm14_host$(EXE) vm_host$(EXE) vm_tests$(EXE) $(RUNNER_TARGET)
 
 all: $(TARGETS)
 
-COMMON_OBJS = dw.o audio.o stb_vorbis_impl.o
+COMMON_OBJS = dw.o audio.o stb_vorbis_impl.o bunzip.o
 VM_OBJS     = vm.o $(COMMON_OBJS)
 
-dw.o: dw.cpp dw.hpp stb_image.h
+bunzip.o: bunzip.cpp bunzip.hpp
+	$(CXX) $(CXXFLAGS) -c bunzip.cpp -o $@
+
+dw.o: dw.cpp dw.hpp stb_image.h bunzip.hpp qoi.hpp
 	$(CXX) $(CXXFLAGS) -c dw.cpp -o $@
 
 audio.o: audio.cpp audio.hpp stb_vorbis.c
@@ -31,8 +34,8 @@ stb_vorbis_impl.o: stb_vorbis_impl.c stb_vorbis.c
 vm.o: vm.cpp vm.hpp dw.hpp audio.hpp
 	$(CXX) $(CXXFLAGS) -c vm.cpp -o $@
 
-gm14_host$(EXE): main_host.cpp dw.o
-	$(CXX) $(CXXFLAGS) -o $@ main_host.cpp dw.o $(LDFLAGS)
+gm14_host$(EXE): main_host.cpp dw.o bunzip.o
+	$(CXX) $(CXXFLAGS) -o $@ main_host.cpp dw.o bunzip.o $(LDFLAGS)
 
 vm_host$(EXE): vm_host.cpp $(VM_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ vm_host.cpp $(VM_OBJS) $(LDFLAGS)

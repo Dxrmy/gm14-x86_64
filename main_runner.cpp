@@ -23,8 +23,11 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <map>
 #include <algorithm>
 #include <iostream>
+#include <ctime>
+#include <sstream>
 
 namespace {
 
@@ -37,6 +40,11 @@ struct RunnerConfig {
     int headless_frames = -1;    // > 0 = headless mode
     double timeout_seconds = 0.0;// > 0 = exit after timeout
     std::string dump_frame_path;
+    std::string save_dir = "./saves";
+    bool fresh_save = false;
+    std::string record_path;
+    std::string replay_path;
+    bool verbose = true;
 };
 
 // Global state
@@ -51,6 +59,225 @@ std::vector<uint32_t> g_bgra_buffer;
 std::set<int> g_keys_held;
 std::set<int> g_keys_pressed;
 std::set<int> g_keys_released;
+int g_mouse_raw_x = 0;
+int g_mouse_raw_y = 0;
+std::set<int> g_mouse_buttons_held;
+std::set<int> g_mouse_buttons_pressed;
+std::set<int> g_mouse_buttons_released;
+int g_mouse_wheel_delta = 0;
+std::map<int, int> g_key_remap;
+
+// Debug control flags
+int g_debug_skip_room = 0;
+bool g_debug_unfreeze = false;
+bool g_debug_restart_room = false;
+bool g_debug_dump_info = false;
+bool g_debug_toggle_record = false;
+
+struct InputRecorder {
+    bool recording = false;
+    std::string filename;
+    FILE* fp = nullptr;
+    int frames_recorded = 0;
+
+    void start(const std::string& path) {
+        stop();
+        filename = path;
+        fp = std::fopen(filename.c_str(), "w");
+        if (fp) {
+            recording = true;
+            frames_recorded = 0;
+            std::fprintf(fp, "# gm14 recording v1\n");
+            std::fflush(fp);
+            std::printf("\n=======================================================\n");
+            std::printf("[recorder] *** RECORDING STARTED *** -> %s\n", filename.c_str());
+            std::printf("[recorder] Press F9 at any time to finish and save.\n");
+            std::printf("=======================================================\n\n");
+            std::fflush(stdout);
+        } else {
+            std::fprintf(stderr, "[recorder] Failed to open %s for recording\n", path.c_str());
+        }
+    }
+
+    void record_frame(int frame,
+                      const std::set<int>& held,
+                      const std::set<int>& pressed,
+                      const std::set<int>& released,
+                      int mx, int my,
+                      const std::set<int>& mb_held,
+                      const std::set<int>& mb_pressed,
+                      const std::set<int>& mb_released,
+                      int wheel,
+                      int room) {
+        if (!recording || !fp) return;
+        frames_recorded++;
+        std::fprintf(fp, "F %d R:%d", frame, room);
+        if (!held.empty()) {
+            std::fprintf(fp, " H:");
+            for (int k : held) std::fprintf(fp, "%d,", k);
+        }
+        if (!pressed.empty()) {
+            std::fprintf(fp, " P:");
+            for (int k : pressed) std::fprintf(fp, "%d,", k);
+        }
+        if (!released.empty()) {
+            std::fprintf(fp, " Rel:");
+            for (int k : released) std::fprintf(fp, "%d,", k);
+        }
+        std::fprintf(fp, " M:%d,%d", mx, my);
+        if (!mb_held.empty()) {
+            std::fprintf(fp, " MBH:");
+            for (int b : mb_held) std::fprintf(fp, "%d,", b);
+        }
+        if (!mb_pressed.empty()) {
+            std::fprintf(fp, " MBP:");
+            for (int b : mb_pressed) std::fprintf(fp, "%d,", b);
+        }
+        if (!mb_released.empty()) {
+            std::fprintf(fp, " MBR:");
+            for (int b : mb_released) std::fprintf(fp, "%d,", b);
+        }
+        if (wheel != 0) {
+            std::fprintf(fp, " W:%d", wheel);
+        }
+        std::fprintf(fp, "\n");
+        if (frames_recorded % 30 == 0) std::fflush(fp);
+    }
+
+    void stop() {
+        if (recording && fp) {
+            std::fclose(fp);
+            fp = nullptr;
+            recording = false;
+            std::printf("\n=======================================================\n");
+            std::printf("[recorder] *** RECORDING SAVED ***\n");
+            std::printf("[recorder] File: %s (%d frames)\n", filename.c_str(), frames_recorded);
+            std::printf("=======================================================\n\n");
+            std::fflush(stdout);
+        }
+    }
+} g_recorder;
+
+struct RecordedFrame {
+    std::set<int> held, pressed, released;
+    int mx = 0, my = 0;
+    std::set<int> mb_held, mb_pressed, mb_released;
+    int wheel = 0;
+    int room = -1;
+};
+
+struct InputReplayer {
+    bool replaying = false;
+    std::map<int, RecordedFrame> frames;
+    int max_frame = 0;
+
+    bool load(const std::string& path) {
+        frames.clear();
+        FILE* fp = std::fopen(path.c_str(), "r");
+        if (!fp) {
+            std::fprintf(stderr, "[replayer] Failed to open %s\n", path.c_str());
+            return false;
+        }
+        char line[1024];
+        while (std::fgets(line, sizeof(line), fp)) {
+            if (line[0] != 'F') continue;
+            RecordedFrame rf;
+            int fnum = 0;
+            char* p = line + 1;
+            fnum = std::strtol(p, &p, 10);
+            while (*p) {
+                while (*p == ' ') p++;
+                if (strncmp(p, "R:", 2) == 0) {
+                    p += 2; rf.room = std::strtol(p, &p, 10);
+                } else if (strncmp(p, "H:", 2) == 0) {
+                    p += 2;
+                    while (*p >= '0' && *p <= '9') {
+                        rf.held.insert(std::strtol(p, &p, 10));
+                        if (*p == ',') p++;
+                    }
+                } else if (strncmp(p, "P:", 2) == 0) {
+                    p += 2;
+                    while (*p >= '0' && *p <= '9') {
+                        rf.pressed.insert(std::strtol(p, &p, 10));
+                        if (*p == ',') p++;
+                    }
+                } else if (strncmp(p, "Rel:", 4) == 0) {
+                    p += 4;
+                    while (*p >= '0' && *p <= '9') {
+                        rf.released.insert(std::strtol(p, &p, 10));
+                        if (*p == ',') p++;
+                    }
+                } else if (strncmp(p, "M:", 2) == 0) {
+                    p += 2;
+                    rf.mx = std::strtol(p, &p, 10);
+                    if (*p == ',') p++;
+                    rf.my = std::strtol(p, &p, 10);
+                } else if (strncmp(p, "MBH:", 4) == 0) {
+                    p += 4;
+                    while (*p >= '0' && *p <= '9') {
+                        rf.mb_held.insert(std::strtol(p, &p, 10));
+                        if (*p == ',') p++;
+                    }
+                } else if (strncmp(p, "MBP:", 4) == 0) {
+                    p += 4;
+                    while (*p >= '0' && *p <= '9') {
+                        rf.mb_pressed.insert(std::strtol(p, &p, 10));
+                        if (*p == ',') p++;
+                    }
+                } else if (strncmp(p, "MBR:", 4) == 0) {
+                    p += 4;
+                    while (*p >= '0' && *p <= '9') {
+                        rf.mb_released.insert(std::strtol(p, &p, 10));
+                        if (*p == ',') p++;
+                    }
+                } else if (strncmp(p, "W:", 2) == 0) {
+                    p += 2;
+                    rf.wheel = std::strtol(p, &p, 10);
+                } else {
+                    p++;
+                }
+            }
+            frames[fnum] = rf;
+            if (fnum > max_frame) max_frame = fnum;
+        }
+        std::fclose(fp);
+        replaying = true;
+        std::printf("[replayer] Loaded recording %s: %zu frames (up to frame %d)\n",
+                    path.c_str(), frames.size(), max_frame);
+        std::fflush(stdout);
+        return true;
+    }
+
+    bool step(int frame, gm14::Runtime& rt) {
+        if (!replaying) return false;
+        auto it = frames.find(frame);
+        if (it != frames.end()) {
+            rt.keys_held = it->second.held;
+            rt.keys_pressed = it->second.pressed;
+            rt.keys_released = it->second.released;
+            rt.mouse_x = it->second.mx;
+            rt.mouse_y = it->second.my;
+            rt.mouse_buttons_held = it->second.mb_held;
+            rt.mouse_buttons_pressed = it->second.mb_pressed;
+            rt.mouse_buttons_released = it->second.mb_released;
+            rt.mouse_wheel_delta = it->second.wheel;
+        } else {
+            rt.keys_held.clear();
+            rt.keys_pressed.clear();
+            rt.keys_released.clear();
+            rt.mouse_buttons_held.clear();
+            rt.mouse_buttons_pressed.clear();
+            rt.mouse_buttons_released.clear();
+            rt.mouse_wheel_delta = 0;
+        }
+        if (frame >= max_frame) {
+            std::printf("[replayer] Replay finished at frame %d.\n", frame);
+            std::fflush(stdout);
+            replaying = false;
+        }
+        return true;
+    }
+} g_replayer;
 
 // Fullscreen toggle state
 bool g_is_fullscreen = false;
@@ -59,6 +286,7 @@ DWORD g_saved_window_style = 0;
 
 // Map Windows Virtual-Key code to GameMaker 1.4 key code
 int map_vk_to_gm(WPARAM vk) {
+    if (g_key_remap.count((int)vk)) return g_key_remap[(int)vk];
     switch (vk) {
         case VK_LEFT:     return 37; // vk_left
         case VK_UP:       return 38; // vk_up
@@ -108,6 +336,54 @@ int map_vk_to_gm(WPARAM vk) {
         case VK_F12:      return 123;
         default:
             return (int)vk; // Letters 'A'-'Z' (65-90), Digits '0'-'9' (48-57)
+    }
+}
+
+int parse_key_str(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+    if (s == "left") return VK_LEFT;
+    if (s == "right") return VK_RIGHT;
+    if (s == "up") return VK_UP;
+    if (s == "down") return VK_DOWN;
+    if (s == "enter" || s == "return") return VK_RETURN;
+    if (s == "shift") return VK_SHIFT;
+    if (s == "ctrl" || s == "control") return VK_CONTROL;
+    if (s == "alt" || s == "menu") return VK_MENU;
+    if (s == "space") return VK_SPACE;
+    if (s == "esc" || s == "escape") return VK_ESCAPE;
+    if (s == "tab") return VK_TAB;
+    if (s == "backspace" || s == "back") return VK_BACK;
+    if (s.size() == 1) {
+        char c = s[0];
+        if (c >= 'a' && c <= 'z') return (int)('A' + (c - 'a'));
+        if (c >= '0' && c <= '9') return (int)c;
+    }
+    return 0;
+}
+
+int parse_action_str(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+    if (s == "left" || s == "vk_left") return 37;
+    if (s == "up" || s == "vk_up") return 38;
+    if (s == "right" || s == "vk_right") return 39;
+    if (s == "down" || s == "vk_down") return 40;
+    if (s == "confirm" || s == "accept" || s == "z" || s == "enter" || s == "face1") return 90;
+    if (s == "cancel" || s == "back" || s == "x" || s == "shift" || s == "face2") return 88;
+    if (s == "menu" || s == "item" || s == "c" || s == "ctrl" || s == "face3") return 67;
+    int k = parse_key_str(s);
+    return map_vk_to_gm((WPARAM)k);
+}
+
+void parse_bind(const std::string& spec) {
+    size_t eq = spec.find('=');
+    if (eq == std::string::npos) return;
+    std::string action = spec.substr(0, eq);
+    std::string key = spec.substr(eq + 1);
+    int vk = parse_key_str(key);
+    int target_gm = parse_action_str(action);
+    if (vk > 0 && target_gm > 0) {
+        g_key_remap[vk] = target_gm;
+        std::printf("[runner] Bound key 0x%X -> GM key %d (%s -> %s)\n", vk, target_gm, key.c_str(), action.c_str());
     }
 }
 
@@ -219,6 +495,32 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         }
 
         case WM_KEYDOWN: {
+            // Debug hotkeys
+            if (wParam == VK_NEXT) { // PageDown
+                g_debug_skip_room = 1;
+                return 0;
+            }
+            if (wParam == VK_PRIOR) { // PageUp
+                g_debug_skip_room = -1;
+                return 0;
+            }
+            if (wParam == VK_F1) {
+                g_debug_unfreeze = true;
+                return 0;
+            }
+            if (wParam == VK_F2) {
+                g_debug_dump_info = true;
+                return 0;
+            }
+            if (wParam == VK_HOME) {
+                g_debug_restart_room = true;
+                return 0;
+            }
+            if (wParam == VK_F9) {
+                g_debug_toggle_record = true;
+                return 0;
+            }
+
             int gm_key = map_vk_to_gm(wParam);
             bool repeat = (lParam & (1 << 30)) != 0;
             if (!repeat || !g_keys_held.count(gm_key)) {
@@ -241,11 +543,75 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
         }
 
+        case WM_MOUSEMOVE: {
+            g_mouse_raw_x = (short)LOWORD(lParam);
+            g_mouse_raw_y = (short)HIWORD(lParam);
+            return 0;
+        }
+
+        case WM_LBUTTONDOWN: {
+            g_mouse_raw_x = (short)LOWORD(lParam);
+            g_mouse_raw_y = (short)HIWORD(lParam);
+            g_mouse_buttons_held.insert(1);
+            g_mouse_buttons_pressed.insert(1);
+            return 0;
+        }
+
+        case WM_LBUTTONUP: {
+            g_mouse_raw_x = (short)LOWORD(lParam);
+            g_mouse_raw_y = (short)HIWORD(lParam);
+            g_mouse_buttons_held.erase(1);
+            g_mouse_buttons_released.insert(1);
+            return 0;
+        }
+
+        case WM_RBUTTONDOWN: {
+            g_mouse_raw_x = (short)LOWORD(lParam);
+            g_mouse_raw_y = (short)HIWORD(lParam);
+            g_mouse_buttons_held.insert(2);
+            g_mouse_buttons_pressed.insert(2);
+            return 0;
+        }
+
+        case WM_RBUTTONUP: {
+            g_mouse_raw_x = (short)LOWORD(lParam);
+            g_mouse_raw_y = (short)HIWORD(lParam);
+            g_mouse_buttons_held.erase(2);
+            g_mouse_buttons_released.insert(2);
+            return 0;
+        }
+
+        case WM_MBUTTONDOWN: {
+            g_mouse_raw_x = (short)LOWORD(lParam);
+            g_mouse_raw_y = (short)HIWORD(lParam);
+            g_mouse_buttons_held.insert(3);
+            g_mouse_buttons_pressed.insert(3);
+            return 0;
+        }
+
+        case WM_MBUTTONUP: {
+            g_mouse_raw_x = (short)LOWORD(lParam);
+            g_mouse_raw_y = (short)HIWORD(lParam);
+            g_mouse_buttons_held.erase(3);
+            g_mouse_buttons_released.insert(3);
+            return 0;
+        }
+
+        case WM_MOUSEWHEEL: {
+            short delta = (short)HIWORD(wParam);
+            g_mouse_wheel_delta += (delta / WHEEL_DELTA);
+            return 0;
+        }
+
         case WM_KILLFOCUS: {
             for (int k : g_keys_held) {
                 g_keys_released.insert(k);
             }
             g_keys_held.clear();
+            for (int b : g_mouse_buttons_held) {
+                g_mouse_buttons_released.insert(b);
+            }
+            g_mouse_buttons_held.clear();
             return 0;
         }
 
@@ -275,13 +641,24 @@ void print_usage(const char* prog) {
     std::printf("  --headless <frames>   Run N frames headless without opening a window\n");
     std::printf("  --timeout <seconds>   Run for N seconds then exit cleanly\n");
     std::printf("  --dump-frame <path>   Save final frame as PNG\n");
+    std::printf("  --save-dir <path>     Directory for game save/INI files (default: ./saves)\n");
+    std::printf("  --fresh               Start fresh: wipe save directory before running\n");
+    std::printf("  --bind <action>=<key> Custom key mapping (e.g. up=w, confirm=space)\n");
+    std::printf("  --record [path]       Record gameplay input to file (default: session_<timestamp>.rec)\n");
+    std::printf("  --replay <path>       Replay recorded input frame-by-frame\n");
+    std::printf("  --verbose, -v         Enable verbose diagnostic logging\n");
     std::printf("  --help, -h            Show this help text\n");
-    std::printf("\nControls:\n");
+    std::printf("\nControls & Hotkeys:\n");
     std::printf("  Arrow Keys            Movement / Navigation (vk_left, vk_right, vk_up, vk_down)\n");
     std::printf("  Z / Enter             Confirm / Interact (gp_face1)\n");
     std::printf("  X / Shift             Cancel / Run (gp_face2)\n");
     std::printf("  C / Ctrl              Menu / Item (gp_face3)\n");
     std::printf("  F4 / Alt+Enter        Toggle Fullscreen\n");
+    std::printf("  [PageDown]/[PageUp]   Skip room forward / backward\n");
+    std::printf("  [Home]                Reload current room\n");
+    std::printf("  [F1]                  Unfreeze player (reset global.interact = 0)\n");
+    std::printf("  [F2]                  Dump room, player and instance state\n");
+    std::printf("  [F9]                  Toggle real-time input recording\n");
     std::printf("  Esc                   Exit / Back\n");
 }
 
@@ -307,6 +684,24 @@ int main(int argc, char** argv) {
             cfg.timeout_seconds = std::atof(argv[++i]);
         } else if (arg == "--dump-frame" && i + 1 < argc) {
             cfg.dump_frame_path = argv[++i];
+        } else if (arg == "--save-dir" && i + 1 < argc) {
+            cfg.save_dir = argv[++i];
+        } else if (arg == "--fresh") {
+            cfg.fresh_save = true;
+        } else if (arg == "--record") {
+            if (i + 1 < argc && argv[i + 1][0] != '-') cfg.record_path = argv[++i];
+            else {
+                time_t now = time(nullptr);
+                char tstr[64];
+                strftime(tstr, sizeof(tstr), "session_%Y%m%d_%H%M%S.rec", localtime(&now));
+                cfg.record_path = tstr;
+            }
+        } else if (arg == "--replay" && i + 1 < argc) {
+            cfg.replay_path = argv[++i];
+        } else if (arg == "--verbose" || arg == "-v") {
+            cfg.verbose = true;
+        } else if (arg == "--bind" && i + 1 < argc) {
+            parse_bind(argv[++i]);
         } else if (arg[0] != '-' && cfg.data_win_path.empty()) {
             cfg.data_win_path = arg;
         }
@@ -317,7 +712,9 @@ int main(int argc, char** argv) {
         const char* candidates[] = {
             "data.win",
             "game.win",
-            "E:\\SteamLibrary\\steamapps\\common\\Undertale\\data.win"
+            "game.unx",
+            "game.ios",
+            "game.droid"
         };
         for (const char* c : candidates) {
             DWORD attr = GetFileAttributesA(c);
@@ -351,6 +748,25 @@ int main(int argc, char** argv) {
         }
 
         gm14::Runtime rt(dw);
+        rt.save_dir = cfg.save_dir;
+        if (!cfg.save_dir.empty()) {
+            CreateDirectoryA(cfg.save_dir.c_str(), nullptr);
+            if (cfg.fresh_save) {
+                std::string search = cfg.save_dir + "/*";
+                WIN32_FIND_DATAA fd;
+                HANDLE hFind = FindFirstFileA(search.c_str(), &fd);
+                if (hFind != INVALID_HANDLE_VALUE) {
+                    do {
+                        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                            std::string fpath = cfg.save_dir + "/" + fd.cFileName;
+                            DeleteFileA(fpath.c_str());
+                        }
+                    } while (FindNextFileA(hFind, &fd));
+                    FindClose(hFind);
+                }
+                std::printf("[save] Cleaned save directory for fresh run: %s\n", cfg.save_dir.c_str());
+            }
+        }
 
         // Feed audio backend: attach WaveOutBackend to runtime audio engine
         rt.ensure_audio();
@@ -388,18 +804,9 @@ int main(int argc, char** argv) {
 
         // Boot into room 0 (runs initial persistent controllers and globals)
         rt.start_room(0);
-        if (target_room >= 0) {
-            if (target_room != 0) {
-                std::printf("[room] Transitioning to room %d (%s)\n", target_room, dw.rooms[target_room].name.c_str());
-                rt.change_room(target_room);
-            }
-        } else {
-            // Default transition: if room 0 is room_start and room 1 is room_introstory (like Undertale),
-            // proceed to room 1.
-            if (dw.rooms.size() > 1 && dw.rooms[0].name == "room_start" && dw.rooms[1].name == "room_introstory") {
-                std::printf("[room] Transitioning to room 1 (%s)\n", dw.rooms[1].name.c_str());
-                rt.change_room(1);
-            }
+        if (target_room >= 0 && target_room != 0) {
+            std::printf("[room] Transitioning to room %d (%s)\n", target_room, dw.rooms[target_room].name.c_str());
+            rt.change_room(target_room);
         }
 
         // Headless execution mode (ideal for automated testing / verification)
@@ -409,6 +816,11 @@ int main(int argc, char** argv) {
                 rt.keys_held = g_keys_held;
                 rt.keys_pressed = g_keys_pressed;
                 rt.keys_released = g_keys_released;
+                rt.mouse_buttons_held = g_mouse_buttons_held;
+                rt.mouse_buttons_pressed = g_mouse_buttons_pressed;
+                rt.mouse_buttons_released = g_mouse_buttons_released;
+                rt.mouse_wheel_delta = g_mouse_wheel_delta;
+                g_mouse_wheel_delta = 0;
 
                 rt.step();
 
@@ -420,6 +832,11 @@ int main(int argc, char** argv) {
                 g_keys_released.clear();
                 rt.keys_pressed.clear();
                 rt.keys_released.clear();
+                g_mouse_buttons_pressed.clear();
+                g_mouse_buttons_released.clear();
+                rt.mouse_buttons_pressed.clear();
+                rt.mouse_buttons_released.clear();
+                rt.mouse_wheel_delta = 0;
             }
             std::printf("[runner] Headless execution completed successfully.\n");
             if (!cfg.dump_frame_path.empty() && g_current_frame.w > 0) {
@@ -493,6 +910,28 @@ int main(int argc, char** argv) {
         QueryPerformanceFrequency(&qpc_freq);
         QueryPerformanceCounter(&qpc_start);
 
+        // Load replay or start recording if configured
+        if (!cfg.replay_path.empty()) {
+            g_replayer.load(cfg.replay_path);
+        }
+        if (!cfg.record_path.empty()) {
+            g_recorder.start(cfg.record_path);
+        }
+
+        std::printf("\n=======================================================\n");
+        std::printf("  gm14 runner - Undertale Engine & Debug Tools\n");
+        std::printf("  Room: %d (%s) | Scale: %dx\n",
+                    rt.room_index, dw.rooms[rt.room_index].name.c_str(), cfg.scale);
+        std::printf("  Hotkeys:\n");
+        std::printf("    [PageDown] / [PageUp] : Skip to next / previous room\n");
+        std::printf("    [Home]                : Reload current room\n");
+        std::printf("    [F1]                  : Unfreeze player (reset interact = 0)\n");
+        std::printf("    [F2]                  : Print room and player debug status\n");
+        std::printf("    [F4]                  : Toggle fullscreen\n");
+        std::printf("    [F9]                  : Toggle input recording\n");
+        std::printf("=======================================================\n\n");
+        std::fflush(stdout);
+
         int total_frames = 0;
 
         std::printf("[runner] Game loop started. Window: %dx%d (scale %dx)\n",
@@ -518,6 +957,62 @@ int main(int argc, char** argv) {
                 DispatchMessageA(&msg);
             }
             if (!g_running || !rt.running) break;
+
+            // Handle debug hotkeys
+            if (g_debug_skip_room != 0) {
+                int target = rt.room_index + g_debug_skip_room;
+                if (target >= 0 && target < (int)dw.rooms.size()) {
+                    std::printf("\n[debug] Room skip (%s): room %d (%s) -> room %d (%s)\n\n",
+                                (g_debug_skip_room > 0 ? "PageDown" : "PageUp"),
+                                rt.room_index, dw.rooms[rt.room_index].name.c_str(),
+                                target, dw.rooms[target].name.c_str());
+                    std::fflush(stdout);
+                    rt.change_room(target);
+                }
+                g_debug_skip_room = 0;
+            }
+            if (g_debug_restart_room) {
+                g_debug_restart_room = false;
+                std::printf("\n[debug] Reloading room %d (%s)\n\n", rt.room_index, dw.rooms[rt.room_index].name.c_str());
+                std::fflush(stdout);
+                rt.change_room(rt.room_index);
+            }
+            if (g_debug_unfreeze) {
+                g_debug_unfreeze = false;
+                rt.globals["interact"] = gm14::Value(0.0);
+                std::printf("\n[debug] Player unfreeze: global.interact reset to 0\n\n");
+                std::fflush(stdout);
+            }
+            if (g_debug_dump_info) {
+                g_debug_dump_info = false;
+                std::printf("\n================ [DEBUG DUMP] ================\n");
+                std::printf("Room: %d / %zu (%s)\n", rt.room_index, dw.rooms.size(), dw.rooms[rt.room_index].name.c_str());
+                std::printf("Active Instances: %zu\n", rt.instances.size());
+                std::printf("Camera view: (%d, %d)\n", rt.view_x, rt.view_y);
+                if (rt.globals.count("interact")) {
+                    std::printf("global.interact: %.1f\n", gm14::to_num(rt.globals["interact"]));
+                }
+                for (auto& inst : rt.instances) {
+                    if (inst->alive && dw.objects[inst->obj].name == "obj_mainchara") {
+                        double px = gm14::to_num(inst->vars.count("x") ? inst->vars["x"] : gm14::Value(0.0));
+                        double py = gm14::to_num(inst->vars.count("y") ? inst->vars["y"] : gm14::Value(0.0));
+                        std::printf("Player obj_mainchara: (x=%.1f, y=%.1f)\n", px, py);
+                    }
+                }
+                std::printf("==============================================\n\n");
+                std::fflush(stdout);
+            }
+            if (g_debug_toggle_record) {
+                g_debug_toggle_record = false;
+                if (g_recorder.recording) {
+                    g_recorder.stop();
+                } else {
+                    time_t now = time(nullptr);
+                    char tstr[64];
+                    strftime(tstr, sizeof(tstr), "session_%Y%m%d_%H%M%S.rec", localtime(&now));
+                    g_recorder.start(tstr);
+                }
+            }
 
             // Check optional timeout
             if (cfg.timeout_seconds > 0.0) {
@@ -545,13 +1040,54 @@ int main(int argc, char** argv) {
             }
             double frame_duration = 1.0 / target_fps;
 
-            // Sync real-time keyboard state to runtime
-            rt.keys_held = g_keys_held;
-            rt.keys_pressed = g_keys_pressed;
-            rt.keys_released = g_keys_released;
+            // Sync input: replayer or live user input
+            if (g_replayer.replaying) {
+                g_replayer.step(total_frames, rt);
+            } else {
+                rt.keys_held = g_keys_held;
+                rt.keys_pressed = g_keys_pressed;
+                rt.keys_released = g_keys_released;
 
-            // Step game simulation
+                // Sync real-time mouse state with aspect-ratio letterbox compensation
+                if (g_current_frame.w > 0 && g_current_frame.h > 0) {
+                    double scale_x = (double)g_client_w / (double)g_current_frame.w;
+                    double scale_y = (double)g_client_h / (double)g_current_frame.h;
+                    double scale = std::min(scale_x, scale_y);
+                    if (scale > 0.0) {
+                        int dst_w = (int)(g_current_frame.w * scale);
+                        int dst_h = (int)(g_current_frame.h * scale);
+                        int dst_x = (g_client_w - dst_w) / 2;
+                        int dst_y = (g_client_h - dst_h) / 2;
+                        double gx = (g_mouse_raw_x - dst_x) / scale;
+                        double gy = (g_mouse_raw_y - dst_y) / scale;
+                        gx = std::max(0.0, std::min((double)g_current_frame.w - 1.0, gx));
+                        gy = std::max(0.0, std::min((double)g_current_frame.h - 1.0, gy));
+                        rt.mouse_x = gx + rt.view_x;
+                        rt.mouse_y = gy + rt.view_y;
+                    }
+                }
+                rt.mouse_buttons_held = g_mouse_buttons_held;
+                rt.mouse_buttons_pressed = g_mouse_buttons_pressed;
+                rt.mouse_buttons_released = g_mouse_buttons_released;
+                rt.mouse_wheel_delta = g_mouse_wheel_delta;
+                g_mouse_wheel_delta = 0;
+            }
+
+            if (g_recorder.recording) {
+                g_recorder.record_frame(total_frames, rt.keys_held, rt.keys_pressed, rt.keys_released,
+                                        rt.mouse_x, rt.mouse_y,
+                                        rt.mouse_buttons_held, rt.mouse_buttons_pressed, rt.mouse_buttons_released,
+                                        rt.mouse_wheel_delta, rt.room_index);
+            }
+
+            // Step game simulation with room transition tracking
+            int prev_room = rt.room_index;
             rt.step();
+            if (rt.room_index != prev_room) {
+                std::printf("[room] Switched to room %d (%s) - %zu active instances\n",
+                            rt.room_index, dw.rooms[rt.room_index].name.c_str(), rt.instances.size());
+                std::fflush(stdout);
+            }
 
             // Draw new frame
             g_current_frame = rt.draw();
@@ -568,6 +1104,12 @@ int main(int argc, char** argv) {
             g_keys_released.clear();
             rt.keys_pressed.clear();
             rt.keys_released.clear();
+
+            g_mouse_buttons_pressed.clear();
+            g_mouse_buttons_released.clear();
+            rt.mouse_buttons_pressed.clear();
+            rt.mouse_buttons_released.clear();
+            rt.mouse_wheel_delta = 0;
 
             total_frames++;
 
@@ -587,6 +1129,7 @@ int main(int argc, char** argv) {
             }
         }
 
+        g_recorder.stop();
         timeEndPeriod(1);
 
         if (!cfg.dump_frame_path.empty() && g_current_frame.w > 0) {

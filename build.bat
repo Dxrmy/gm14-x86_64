@@ -1,4 +1,7 @@
 @echo off
-set "MINGW=C:\Users\kmric\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin"
-set "PATH=%MINGW%;%PATH%"
+if not "%MINGW%"=="" set "PATH=%MINGW%;%PATH%"
+where mingw32-make >nul 2>nul
+if errorlevel 1 (
+    if exist "C:\mingw64\bin" set "PATH=C:\mingw64\bin;%PATH%"
+)
 mingw32-make %*

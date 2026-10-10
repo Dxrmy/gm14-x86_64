@@ -156,6 +156,9 @@ public:
 
     // input
     std::set<int> keys_held, keys_pressed, keys_released;
+    int mouse_x = 0, mouse_y = 0;
+    std::set<int> mouse_buttons_held, mouse_buttons_pressed, mouse_buttons_released;
+    int mouse_wheel_delta = 0;
 
     // drawing
     Image* screen = nullptr;
@@ -192,6 +195,8 @@ public:
     std::string current_ini_filename;
     IniFile current_ini;
     bool ini_is_open = false;
+    std::string save_dir;
+    std::string resolve_path(const std::string& fn) const;
 
     // surfaces
     std::unordered_map<int, Surface> surfaces;
@@ -200,7 +205,7 @@ public:
 
     // caster audio
     std::unordered_map<std::string, int> caster_path_to_id;
-    int next_caster_id = 500000;
+    int next_caster_id = 10000;
 
     // audio
     std::unique_ptr<AudioEngine> audio;
@@ -212,6 +217,12 @@ public:
     void start_room(int index, std::vector<std::unique_ptr<Instance>> keep = {});
     void change_room(int index);
     void run_event(Instance* inst, int etype, int subtype);
+    bool action_relative = false;
+    bool gui_drawing = false;
+    int gui_width = -1;
+    int gui_height = -1;
+    void update_camera();
+
     void step();
     Image draw();
 
@@ -221,7 +232,8 @@ public:
 
     void exec(Frame& fr);
     Value get_var(Frame& fr, const Instruction& ins);
-    void set_var(Frame& fr, const Instruction& ins, const Value& v);
+    void set_var(Frame& fr, const Instruction& ins, int inst_type, const Value& v);
+    void set_var_inst(Instance* inst, const std::string& name, const Value& v);
     Value get_array(Frame& fr, const Instruction& ins, int inst_type, int index);
     void set_array(Frame& fr, const Instruction& ins, int inst_type, int index, const Value& v);
     Instance* resolve_inst(int inst_type);

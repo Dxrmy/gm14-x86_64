@@ -590,6 +590,7 @@ void AudioEngine::evict_if_needed(int protect_asset) {
         for (size_t a = 0; a < m_clips.size(); ++a) {
             if (!m_clips[a]) continue;
             if ((int)a == protect_asset) continue;
+            if ((int)a >= 10000) continue; // Caster / external audio clips are managed explicitly
             bool playing = false;
             for (auto& v : m_voices) {
                 if (v.active && v.asset == (int)a) {
