@@ -793,7 +793,18 @@ int main(int argc, char** argv) {
             std::printf("[warn] No GML bytecode chunk found in data file (game was likely compiled with YYC to native code).\n");
         }
 
-        gm14::Runtime rt(dw);
+        gm14::EngineConfig eng_cfg = gm14::load_engine_config("gm14.ini");
+        if (eng_cfg.target_fps > 0 && cfg.override_fps == 0.0) {
+            cfg.override_fps = eng_cfg.target_fps;
+        }
+        if (eng_cfg.start_room >= 0 && cfg.start_room_str.empty()) {
+            cfg.start_room_str = std::to_string(eng_cfg.start_room);
+        }
+        if (eng_cfg.save_directory != "./saves" && cfg.save_dir == "./saves") {
+            cfg.save_dir = eng_cfg.save_directory;
+        }
+
+        gm14::Runtime rt(dw, eng_cfg);
         rt.save_dir = cfg.save_dir;
         if (!cfg.save_dir.empty()) {
             CreateDirectoryA(cfg.save_dir.c_str(), nullptr);

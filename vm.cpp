@@ -7,12 +7,74 @@
 #include <sstream>
 #include <cctype>
 #include <cstring>
+#if (defined(_3DS) || defined(__arm__) || defined(__linux__)) && !defined(_WIN32)
+#include <malloc.h>
+#endif
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #endif
 
 namespace gm14 {
+
+// Global execution context trackers for crash and OOM diagnostics
+const char* g_diag_code_name = nullptr;
+int g_diag_pc = -1;
+const char* g_diag_obj_name = nullptr;
+int g_diag_inst_id = -1;
+const char* g_diag_func_name = nullptr;
+
+EngineConfig load_engine_config(const std::string& ini_path) {
+    EngineConfig cfg;
+    FILE* fp = std::fopen(ini_path.c_str(), "r");
+    if (!fp) return cfg;
+    char line[512];
+    std::string cur_sec;
+    while (std::fgets(line, sizeof(line), fp)) {
+        std::string s(line);
+        size_t start = s.find_first_not_of(" \t\r\n");
+        if (start == std::string::npos) continue;
+        size_t end = s.find_last_not_of(" \t\r\n");
+        s = s.substr(start, end - start + 1);
+        if (s.empty() || s[0] == ';' || s[0] == '#') continue;
+        if (s.front() == '[' && s.back() == ']') {
+            cur_sec = s.substr(1, s.size() - 2);
+            continue;
+        }
+        size_t eq = s.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = s.substr(0, eq);
+        std::string v = s.substr(eq + 1);
+        size_t ke = k.find_last_not_of(" \t");
+        if (ke != std::string::npos) k = k.substr(0, ke + 1);
+        size_t vs = v.find_first_not_of(" \t");
+        if (vs != std::string::npos) v = v.substr(vs); else v = "";
+        size_t ve = v.find_last_not_of(" \t\r\n");
+        if (ve != std::string::npos) v = v.substr(0, ve + 1);
+
+        if (k == "texture_cache_limit" || k == "max_texture_pages") {
+            try { cfg.max_texture_pages = std::stoi(v); } catch (...) {}
+        } else if (k == "pcm_cache_budget_mb") {
+            try { cfg.audio_pcm_budget_bytes = (size_t)std::stoul(v) * 1024u * 1024u; } catch (...) {}
+        } else if (k == "instruction_budget") {
+            try { cfg.instruction_budget = std::stoll(v); } catch (...) {}
+        } else if (k == "culling_margin") {
+            try { cfg.culling_margin = std::stoi(v); } catch (...) {}
+        } else if (k == "enable_blend_modes") {
+            cfg.enable_blend_modes = (v == "1" || v == "true" || v == "yes");
+        } else if (k == "save_directory") {
+            cfg.save_directory = v;
+        } else if (k == "fps" || k == "target_fps") {
+            try { cfg.target_fps = std::stoi(v); } catch (...) {}
+        } else if (k == "start_room") {
+            try { cfg.start_room = std::stoi(v); } catch (...) {}
+        } else if (k == "verbose_logging") {
+            cfg.verbose_logging = (v == "1" || v == "true" || v == "yes");
+        }
+    }
+    std::fclose(fp);
+    return cfg;
+}
 
 // ---------------- value helpers ----------------
 double to_num(const Value& v) {
@@ -47,7 +109,8 @@ static int jump_offset(const Instruction& ins) {
 }
 
 // ---------------- construction ----------------
-Runtime::Runtime(DataWin& dw_) : dw(dw_) {
+Runtime::Runtime(DataWin& dw_, const EngineConfig& cfg_) : dw(dw_), cfg(cfg_) {
+    save_dir = cfg.save_directory;
     for (const auto& sp : dw.scripts) {
         if (sp.second >= 0 && sp.second < (int)dw.code.size()) {
             scripts[sp.first] = &dw.code[sp.second];
@@ -62,7 +125,7 @@ Runtime::Runtime(DataWin& dw_) : dw(dw_) {
     }
     global_builtins["current_time"] = Value(0.0);
     global_builtins["delta_time"] = Value(16666.0);
-    global_builtins["room_speed"] = Value(30.0);
+    global_builtins["room_speed"] = Value((double)(cfg.target_fps > 0 ? cfg.target_fps : 30.0));
     register_builtins();
 }
 
@@ -131,7 +194,7 @@ void Runtime::ensure_audio() {
             std::shared_ptr<AudioClip> clip = std::make_shared<AudioClip>();
             if (!decode_audio(bytes.data(), bytes.size(), *clip)) return nullptr;
             return clip;
-        }, 64u * 1024u * 1024u);  // 64 MB PCM budget
+        }, cfg.audio_pcm_budget_bytes);  // 64 MB PCM budget
     }
 }
 
@@ -617,6 +680,9 @@ void Runtime::set_array(Frame& fr, const Instruction& ins, int inst_type, int in
 
 // ---------------- execution ----------------
 Value Runtime::call(const std::string& name, std::vector<Value>& args) {
+    const char* prev_func = g_diag_func_name;
+    g_diag_func_name = name.c_str();
+
     if (diag_sink) {
         std::string line = "call " + name + " argc=" + std::to_string(args.size());
         for (size_t i = 0; i < args.size() && i < 6; ++i) {
@@ -630,9 +696,17 @@ Value Runtime::call(const std::string& name, std::vector<Value>& args) {
     // SHADOWS the builtin. This matters for Undertale, which defines its own
     // control_* / draw_* etc. scripts. Check scripts first.
     auto s = scripts.find(name);
-    if (s != scripts.end()) return run_entry(s->second, args, cur, other);
+    if (s != scripts.end()) {
+        Value res = run_entry(s->second, args, cur, other);
+        g_diag_func_name = prev_func;
+        return res;
+    }
     auto b = builtins.find(name);
-    if (b != builtins.end()) return b->second(*this, args);
+    if (b != builtins.end()) {
+        Value res = b->second(*this, args);
+        g_diag_func_name = prev_func;
+        return res;
+    }
     // Unknown function: log once, record it, pop nothing extra (args are already
     // consumed by the caller), and push a default real 0.0 so the game keeps
     // running instead of crashing.
@@ -643,10 +717,20 @@ Value Runtime::call(const std::string& name, std::vector<Value>& args) {
         m_unimplemented.push_back(name);
     }
     if (diag_sink) { std::string l = "UNIMPLEMENTED " + name; diag_sink(l.c_str()); }
+    g_diag_func_name = prev_func;
     return Value(0.0);
 }
 
 Value Runtime::run_entry(const CodeEntry* entry, std::vector<Value>& args, Instance* self, Instance* other_) {
+    const char* prev_code = g_diag_code_name;
+    g_diag_code_name = entry ? entry->name.c_str() : nullptr;
+    const char* prev_obj = g_diag_obj_name;
+    int prev_id = g_diag_inst_id;
+    if (self) {
+        g_diag_obj_name = (self->obj >= 0 && self->obj < (int)dw.objects.size()) ? dw.objects[self->obj].name.c_str() : "unknown";
+        g_diag_inst_id = self->iid;
+    }
+
     Frame fr;
     fr.entry = entry;
     fr.base = dw.all_instrs.data() + entry->instr_start;
@@ -671,18 +755,28 @@ Value Runtime::run_entry(const CodeEntry* entry, std::vector<Value>& args, Insta
     Instance* oc = cur; Instance* oo = other;
     cur = self; other = other_;
     try { exec(fr); }
-    catch (...) { cur = oc; other = oo; throw; }
+    catch (...) {
+        cur = oc; other = oo;
+        g_diag_code_name = prev_code;
+        g_diag_obj_name = prev_obj;
+        g_diag_inst_id = prev_id;
+        throw;
+    }
     cur = oc; other = oo;
+    g_diag_code_name = prev_code;
+    g_diag_obj_name = prev_obj;
+    g_diag_inst_id = prev_id;
     return fr.value;
 }
 
 void Runtime::exec(Frame& fr) {
     const Instruction* ins_list = fr.base;
     int n = fr.n;
-    long long budget = 20000000;
+    long long budget = cfg.instruction_budget > 0 ? cfg.instruction_budget : 20000000;
     long long steps = 0;
     while (fr.pc < n) {
         if (++steps > budget) throw std::runtime_error("instruction budget exceeded in " + fr.entry->name);
+        g_diag_pc = fr.pc;
         const Instruction& ins = ins_list[fr.pc];
         uint8_t k = ins.kind(), t1 = ins.type1();
         if (diag_sink && fr.entry && fr.entry->name == "gml_Object_obj_overworldcontroller_Draw_0" && fr.pc >= 2345 && fr.pc <= 2385) {
@@ -889,7 +983,25 @@ void Runtime::exec(Frame& fr) {
 // ---------------- images / drawing ----------------
 const Image& Runtime::page(int tex_index) {
     auto it = page_cache.find(tex_index);
-    if (it == page_cache.end()) it = page_cache.emplace(tex_index, dw.load_texture(tex_index)).first;
+    if (it != page_cache.end()) {
+        auto lit = std::find(page_lru.begin(), page_lru.end(), tex_index);
+        if (lit != page_lru.end()) page_lru.erase(lit);
+        page_lru.push_back(tex_index);
+        return it->second;
+    }
+    size_t limit = cfg.max_texture_pages > 0 ? (size_t)cfg.max_texture_pages : 0;
+    if (limit > 0) {
+        while (page_cache.size() >= limit && !page_lru.empty()) {
+            int evict_idx = page_lru.front();
+            page_lru.erase(page_lru.begin());
+            page_cache.erase(evict_idx);
+#if (defined(_3DS) || defined(__arm__) || defined(__linux__)) && !defined(_WIN32)
+            malloc_trim(0);
+#endif
+        }
+    }
+    page_lru.push_back(tex_index);
+    it = page_cache.emplace(tex_index, dw.load_texture(tex_index)).first;
     return it->second;
 }
 
@@ -915,11 +1027,26 @@ bool Runtime::tpag_image(int tpag_index, Image& out, int& tx, int& ty) {
     return true;
 }
 
+static inline void blend_pixel(uint8_t* d, uint8_t sr, uint8_t sg, uint8_t sb, double sa, int blend_mode) {
+    if (blend_mode == 1) { // bm_add
+        d[0] = (uint8_t)std::min(255.0, (double)d[0] + sr * sa);
+        d[1] = (uint8_t)std::min(255.0, (double)d[1] + sg * sa);
+        d[2] = (uint8_t)std::min(255.0, (double)d[2] + sb * sa);
+        d[3] = 255;
+    } else { // bm_normal
+        d[0] = (uint8_t)std::min(255.0, sr * sa + d[0] * (1.0 - sa));
+        d[1] = (uint8_t)std::min(255.0, sg * sa + d[1] * (1.0 - sa));
+        d[2] = (uint8_t)std::min(255.0, sb * sa + d[2] * (1.0 - sa));
+        d[3] = 255;
+    }
+}
+
 void Runtime::blit_screen(const Image& src, int dx, int dy, double alpha) {
     if (!screen || src.w <= 0 || src.h <= 0) return;
     dx -= view_x;
     dy -= view_y;
     int a = (int)(std::max(0.0, std::min(1.0, alpha)) * 255);
+    int mode = cfg.enable_blend_modes ? draw_blend_mode : 0;
     for (int y = 0; y < src.h; ++y) {
         int ty = dy + y; if (ty < 0 || ty >= screen->h) continue;
         for (int x = 0; x < src.w; ++x) {
@@ -928,7 +1055,7 @@ void Runtime::blit_screen(const Image& src, int dx, int dy, double alpha) {
             uint8_t* d = &screen->rgba[((size_t)ty * screen->w + tx) * 4];
             double sa = (s[3] / 255.0) * (a / 255.0);
             if (sa <= 0) continue;
-            for (int c = 0; c < 3; ++c) d[c] = (uint8_t)std::min(255.0, s[c] * sa + d[c] * (1 - sa));
+            blend_pixel(d, s[0], s[1], s[2], sa, mode);
         }
     }
 }
@@ -937,6 +1064,7 @@ void Runtime::blit_sub_screen(const Image& src, int sx, int sy, int sw, int sh, 
     if (!screen || sw <= 0 || sh <= 0 || src.w <= 0 || src.h <= 0) return;
     int a = (int)(std::max(0.0, std::min(1.0, alpha)) * 255);
     if (a <= 0) return;
+    int mode = cfg.enable_blend_modes ? draw_blend_mode : 0;
     for (int y = 0; y < sh; ++y) {
         int ty = dy + y; if (ty < 0 || ty >= screen->h) continue;
         int sy_pos = sy + y; if (sy_pos < 0 || sy_pos >= src.h) continue;
@@ -946,12 +1074,11 @@ void Runtime::blit_sub_screen(const Image& src, int sx, int sy, int sw, int sh, 
             const uint8_t* s = &src.rgba[((size_t)sy_pos * src.w + sx_pos) * 4];
             uint8_t* d = &screen->rgba[((size_t)ty * screen->w + tx) * 4];
             if (s[3] == 0) continue;
-            if (s[3] == 255 && a == 255) {
+            if (s[3] == 255 && a == 255 && mode == 0) {
                 d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = 255;
             } else {
                 double sa = (s[3] / 255.0) * (a / 255.0);
-                for (int c = 0; c < 3; ++c) d[c] = (uint8_t)std::min(255.0, s[c] * sa + d[c] * (1.0 - sa));
-                d[3] = 255;
+                blend_pixel(d, s[0], s[1], s[2], sa, mode);
             }
         }
     }
@@ -959,7 +1086,8 @@ void Runtime::blit_sub_screen(const Image& src, int sx, int sy, int sw, int sh, 
 
 void Runtime::blit_sub_screen_scaled(const Image& src, int sx, int sy, int sw, int sh,
                                      int dx, int dy, int out_w, int out_h,
-                                     double alpha, uint32_t color, double angle_deg) {
+                                     double alpha, uint32_t color, double angle_deg,
+                                     double pivot_x, double pivot_y, bool use_pivot) {
     if (!screen || sw <= 0 || sh <= 0 || src.w <= 0 || src.h <= 0) return;
     if (out_w == 0 || out_h == 0) return;
     bool flip_x = false;
@@ -971,49 +1099,89 @@ void Runtime::blit_sub_screen_scaled(const Image& src, int sx, int sy, int sw, i
     uint8_t tr = (uint8_t)(color & 0xFF);
     uint8_t tg = (uint8_t)((color >> 8) & 0xFF);
     uint8_t tb = (uint8_t)((color >> 16) & 0xFF);
-    double ang = angle_deg * 3.14159265358979 / 180.0;
+    int mode = cfg.enable_blend_modes ? draw_blend_mode : 0;
+
+    if (std::abs(angle_deg) < 1e-4) {
+        for (int py = 0; py < out_h; ++py) {
+            int ty = dy + py; if (ty < 0 || ty >= screen->h) continue;
+            int ssy = sy + (flip_y ? (out_h - 1 - py) * sh / out_h : py * sh / out_h);
+            if (ssy < 0 || ssy >= src.h) continue;
+            for (int px = 0; px < out_w; ++px) {
+                int tx = dx + px; if (tx < 0 || tx >= screen->w) continue;
+                int ssx = sx + (flip_x ? (out_w - 1 - px) * sw / out_w : px * sw / out_w);
+                if (ssx < 0 || ssx >= src.w) continue;
+                const uint8_t* s = &src.rgba[((size_t)ssy * src.w + ssx) * 4];
+                if (s[3] == 0) continue;
+                uint8_t* d = &screen->rgba[((size_t)ty * screen->w + tx) * 4];
+                uint8_t sr = (uint8_t)((s[0] * tr) / 255);
+                uint8_t sg = (uint8_t)((s[1] * tg) / 255);
+                uint8_t sb = (uint8_t)((s[2] * tb) / 255);
+                if (s[3] == 255 && a255 == 255 && mode == 0) {
+                    d[0] = sr; d[1] = sg; d[2] = sb; d[3] = 255;
+                } else {
+                    double sfa = (s[3] / 255.0) * (a255 / 255.0);
+                    blend_pixel(d, sr, sg, sb, sfa, mode);
+                }
+            }
+        }
+        return;
+    }
+
+    if (!use_pivot) {
+        pivot_x = dx + out_w * 0.5;
+        pivot_y = dy + out_h * 0.5;
+    }
+    double r_left = dx - pivot_x;
+    double r_top = dy - pivot_y;
+    double r_right = r_left + out_w;
+    double r_bottom = r_top + out_h;
+
+    double ang = angle_deg * 3.14159265358979323846 / 180.0;
     double ca = std::cos(ang), sa = std::sin(ang);
-    // Centre of the destination rect (rotation pivot).
-    double cx = dx + out_w * 0.5;
-    double cy = dy + out_h * 0.5;
-    // Bounding box of the rotated rect so we know which dest pixels to visit.
-    double hw = out_w * 0.5, hh = out_h * 0.5;
-    int bb_w = (int)std::ceil(std::abs(out_w * ca) + std::abs(out_h * sa)) + 2;
-    int bb_h = (int)std::ceil(std::abs(out_w * sa) + std::abs(out_h * ca)) + 2;
-    int bb_x = (int)(cx - bb_w * 0.5);
-    int bb_y = (int)(cy - bb_h * 0.5);
-    for (int py = 0; py < bb_h; ++py) {
-        int ty = bb_y + py; if (ty < 0 || ty >= screen->h) continue;
-        for (int px = 0; px < bb_w; ++px) {
-            int tx = bb_x + px; if (tx < 0 || tx >= screen->w) continue;
-            // Inverse-rotate the dest point into the unrotated dest rect space.
-            double rx = (tx + 0.5) - cx;
-            double ry = (ty + 0.5) - cy;
-            double ux = rx * ca + ry * sa;   // -hw..hw
-            double uy = -rx * sa + ry * ca;  // -hh..hh
-            if (ux < -hw || ux >= hw || uy < -hh || uy >= hh) continue;
-            // Map into source sub-rect.
-            double fx = (ux + hw) / (double)out_w;   // 0..1
-            double fy = (uy + hh) / (double)out_h;   // 0..1
+
+    double c0x = r_left * ca + r_top * sa,     c0y = -r_left * sa + r_top * ca;
+    double c1x = r_right * ca + r_top * sa,    c1y = -r_right * sa + r_top * ca;
+    double c2x = r_left * ca + r_bottom * sa,  c2y = -r_left * sa + r_bottom * ca;
+    double c3x = r_right * ca + r_bottom * sa, c3y = -r_right * sa + r_bottom * ca;
+
+    double min_rx = std::min({c0x, c1x, c2x, c3x});
+    double max_rx = std::max({c0x, c1x, c2x, c3x});
+    double min_ry = std::min({c0y, c1y, c2y, c3y});
+    double max_ry = std::max({c0y, c1y, c2y, c3y});
+
+    int bb_x0 = std::max(0, (int)std::floor(pivot_x + min_rx));
+    int bb_x1 = std::min(screen->w - 1, (int)std::ceil(pivot_x + max_rx));
+    int bb_y0 = std::max(0, (int)std::floor(pivot_y + min_ry));
+    int bb_y1 = std::min(screen->h - 1, (int)std::ceil(pivot_y + max_ry));
+
+    for (int ty = bb_y0; ty <= bb_y1; ++ty) {
+        for (int tx = bb_x0; tx <= bb_x1; ++tx) {
+            double rx = (tx + 0.5) - pivot_x;
+            double ry = (ty + 0.5) - pivot_y;
+            double ux = rx * ca - ry * sa;
+            double uy = rx * sa + ry * ca;
+            if (ux < r_left || ux >= r_right || uy < r_top || uy >= r_bottom) continue;
+
+            double fx = (ux - r_left) / (double)out_w;
+            double fy = (uy - r_top) / (double)out_h;
             if (flip_x) fx = 1.0 - fx;
             if (flip_y) fy = 1.0 - fy;
+
             int ssx = sx + (int)(fx * sw);
             int ssy = sy + (int)(fy * sh);
             if (ssx < 0 || ssx >= src.w || ssy < 0 || ssy >= src.h) continue;
+
             const uint8_t* s = &src.rgba[((size_t)ssy * src.w + ssx) * 4];
             if (s[3] == 0) continue;
             uint8_t* d = &screen->rgba[((size_t)ty * screen->w + tx) * 4];
             uint8_t sr = (uint8_t)((s[0] * tr) / 255);
             uint8_t sg = (uint8_t)((s[1] * tg) / 255);
             uint8_t sb = (uint8_t)((s[2] * tb) / 255);
-            if (s[3] == 255 && a255 == 255) {
+            if (s[3] == 255 && a255 == 255 && mode == 0) {
                 d[0] = sr; d[1] = sg; d[2] = sb; d[3] = 255;
             } else {
                 double sfa = (s[3] / 255.0) * (a255 / 255.0);
-                d[0] = (uint8_t)std::min(255.0, sr * sfa + d[0] * (1.0 - sfa));
-                d[1] = (uint8_t)std::min(255.0, sg * sfa + d[1] * (1.0 - sfa));
-                d[2] = (uint8_t)std::min(255.0, sb * sfa + d[2] * (1.0 - sfa));
-                d[3] = 255;
+                blend_pixel(d, sr, sg, sb, sfa, mode);
             }
         }
     }
@@ -1027,6 +1195,7 @@ void Runtime::blit_sub_screen_tint(const Image& src, int sx, int sy, int sw, int
     uint8_t tr = (uint8_t)(color & 0xFF);
     uint8_t tg = (uint8_t)((color >> 8) & 0xFF);
     uint8_t tb = (uint8_t)((color >> 16) & 0xFF);
+    int mode = cfg.enable_blend_modes ? draw_blend_mode : 0;
 
     for (int y = 0; y < sh; ++y) {
         int ty = dy + y; if (ty < 0 || ty >= screen->h) continue;
@@ -1042,14 +1211,11 @@ void Runtime::blit_sub_screen_tint(const Image& src, int sx, int sy, int sw, int
             uint8_t sg = (uint8_t)((s[1] * tg) / 255);
             uint8_t sb = (uint8_t)((s[2] * tb) / 255);
 
-            if (s[3] == 255 && a == 255) {
+            if (s[3] == 255 && a == 255 && mode == 0) {
                 d[0] = sr; d[1] = sg; d[2] = sb; d[3] = 255;
             } else {
                 double sa = (s[3] / 255.0) * (a / 255.0);
-                d[0] = (uint8_t)std::min(255.0, sr * sa + d[0] * (1.0 - sa));
-                d[1] = (uint8_t)std::min(255.0, sg * sa + d[1] * (1.0 - sa));
-                d[2] = (uint8_t)std::min(255.0, sb * sa + d[2] * (1.0 - sa));
-                d[3] = 255;
+                blend_pixel(d, sr, sg, sb, sa, mode);
             }
         }
     }
@@ -1121,7 +1287,7 @@ static void draw_line_on_image(Image* img, int x0, int y0, int x1, int y1, uint3
 }
 
 static void draw_sprite_impl(Runtime& rt, double sprite, double subimg, double x, double y,
-                             double xs, double ys, double alpha) {
+                             double xs, double ys, double alpha, double angle = 0.0, uint32_t color = 0xFFFFFF) {
     if (rt.gui_drawing && rt.gui_width > 0 && rt.gui_height > 0 && rt.screen) {
         double gui_sx = (double)rt.screen->w / rt.gui_width;
         double gui_sy = (double)rt.screen->h / rt.gui_height;
@@ -1143,14 +1309,23 @@ static void draw_sprite_impl(Runtime& rt, double sprite, double subimg, double x
     const Image& pg = rt.page(t.tex);
     if (pg.w <= 0 || t.sx + t.sw > pg.w || t.sy + t.sh > pg.h) return;
     // Destination top-left in screen space (origin-relative).
-    int dx = (int)std::lround(x - sp.origin_x * xs) + t.tx - rt.view_x;
-    int dy = (int)std::lround(y - sp.origin_y * ys) + t.ty - rt.view_y;
+    int dx = (int)std::lround(x + (t.tx - sp.origin_x) * xs) - rt.view_x;
+    int dy = (int)std::lround(y + (t.ty - sp.origin_y) * ys) - rt.view_y;
     int out_w = (int)std::lround(t.sw * xs);
     int out_h = (int)std::lround(t.sh * ys);
-    if (out_w == t.sw && out_h == t.sh) {
-        rt.blit_sub_screen(pg, t.sx, t.sy, t.sw, t.sh, dx, dy, alpha);
+    double pivot_x = x - rt.view_x;
+    double pivot_y = y - rt.view_y;
+
+    if (std::abs(angle) < 1e-4) {
+        if (out_w == t.sw && out_h == t.sh && color == 0xFFFFFF) {
+            rt.blit_sub_screen(pg, t.sx, t.sy, t.sw, t.sh, dx, dy, alpha);
+        } else if (out_w == t.sw && out_h == t.sh) {
+            rt.blit_sub_screen_tint(pg, t.sx, t.sy, t.sw, t.sh, dx, dy, alpha, color);
+        } else {
+            rt.blit_sub_screen_scaled(pg, t.sx, t.sy, t.sw, t.sh, dx, dy, out_w, out_h, alpha, color, 0.0);
+        }
     } else {
-        rt.blit_sub_screen_scaled(pg, t.sx, t.sy, t.sw, t.sh, dx, dy, out_w, out_h, alpha, 0xFFFFFF, 0.0);
+        rt.blit_sub_screen_scaled(pg, t.sx, t.sy, t.sw, t.sh, dx, dy, out_w, out_h, alpha, color, angle, pivot_x, pivot_y, true);
     }
 }
 
@@ -1262,10 +1437,20 @@ std::string Runtime::resolve_path(const std::string& fn) const {
 
 void Runtime::register_builtins() {
     builtins["draw_sprite"] = [](Runtime& rt, std::vector<Value>& a){
-        draw_sprite_impl(rt, narg(a,0), narg(a,1), narg(a,2), narg(a,3), 1, 1, 1); return vnum(0); };
+        draw_sprite_impl(rt, narg(a,0), narg(a,1), narg(a,2), narg(a,3), 1, 1, 1, 0.0, 0xFFFFFF); return vnum(0); };
     builtins["draw_sprite_ext"] = [](Runtime& rt, std::vector<Value>& a){
-        draw_sprite_impl(rt, narg(a,0), narg(a,1), narg(a,2), narg(a,3), narg(a,4), narg(a,5),
-                         a.size()>7?narg(a,7):1); return vnum(0); };
+        double spr = narg(a, 0);
+        double sub = narg(a, 1);
+        double x = narg(a, 2);
+        double y = narg(a, 3);
+        double xs = a.size() > 4 ? narg(a, 4) : 1.0;
+        double ys = a.size() > 5 ? narg(a, 5) : 1.0;
+        double rot = a.size() > 6 ? narg(a, 6) : 0.0;
+        uint32_t col = a.size() > 7 ? (uint32_t)narg(a, 7) : 0xFFFFFF;
+        double alpha = a.size() > 8 ? narg(a, 8) : 1.0;
+        draw_sprite_impl(rt, spr, sub, x, y, xs, ys, alpha, rot, col);
+        return vnum(0);
+    };
     builtins["draw_sprite_stretched"] = [](Runtime& rt, std::vector<Value>& a){
         draw_sprite_stretched_impl(rt, narg(a,0), narg(a,1), narg(a,2), narg(a,3), narg(a,4), narg(a,5), 1.0);
         return vnum(0); };
@@ -1281,7 +1466,9 @@ void Runtime::register_builtins() {
                          v.count("x")?to_num(v["x"]):0, v.count("y")?to_num(v["y"]):0,
                          v.count("image_xscale")?to_num(v["image_xscale"]):1,
                          v.count("image_yscale")?to_num(v["image_yscale"]):1,
-                         v.count("image_alpha")?to_num(v["image_alpha"]):1);
+                         v.count("image_alpha")?to_num(v["image_alpha"]):1,
+                         v.count("image_angle")?to_num(v["image_angle"]):0.0,
+                         v.count("image_blend")?(uint32_t)to_num(v["image_blend"]):0xFFFFFF);
         return vnum(0); };
     builtins["draw_set_color"] = [](Runtime& rt, std::vector<Value>& a){ rt.draw_color=(int)narg(a,0); return vnum(0); };
     builtins["draw_set_colour"] = builtins["draw_set_color"];
@@ -1421,7 +1608,7 @@ void Runtime::register_builtins() {
     builtins["draw_set_font"] = [](Runtime& rt, std::vector<Value>& a){ rt.draw_font = (int)narg(a,0); return vnum(0); };
     builtins["draw_set_halign"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
     builtins["draw_set_valign"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
-    builtins["draw_set_blend_mode"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["draw_set_blend_mode"] = [](Runtime& rt, std::vector<Value>& a){ rt.draw_blend_mode = a.empty() ? 0 : (int)to_num(a[0]); return vnum(0); };
 
     builtins["room_goto"] = [](Runtime& rt, std::vector<Value>& a){ rt.pending_room=(int)narg(a,0); return vnum(0); };
     builtins["room_goto_next"] = [](Runtime& rt, std::vector<Value>&){
@@ -3438,7 +3625,25 @@ void Runtime::register_builtins() {
         rt.blit_sub_screen(pg, t.sx + l, t.sy + tt, w, h, (int)narg(a,6) - rt.view_x, (int)narg(a,7) - rt.view_y, rt.draw_alpha);
         return vnum(0);
     };
-    builtins["draw_sprite_part_ext"] = builtins["draw_sprite_part"];
+    builtins["draw_sprite_part_ext"] = [](Runtime& rt, std::vector<Value>& a){
+        int si = (int)narg(a,0); if (si < 0 || si >= (int)rt.dw.sprites.size()) return vnum(0);
+        const Sprite& sp = rt.dw.sprites[si]; if (sp.frames.empty()) return vnum(0);
+        int n = (int)sp.frames.size(); int fi = (((int)narg(a,1)) % n + n) % n;
+        int tp = sp.frames[fi]; if (tp < 0 || tp >= (int)rt.dw.tpags.size()) return vnum(0);
+        const Tpag& t = rt.dw.tpags[tp];
+        if (t.tex < 0 || t.tex >= (int)rt.dw.tex_ptrs.size()) return vnum(0);
+        const Image& pg = rt.page(t.tex); if (pg.w <= 0) return vnum(0);
+        int l = (int)narg(a,2), tt = (int)narg(a,3), w = (int)narg(a,4), h = (int)narg(a,5);
+        int dx = (int)narg(a,6), dy = (int)narg(a,7);
+        double xs = a.size() > 8 ? narg(a,8) : 1.0;
+        double ys = a.size() > 9 ? narg(a,9) : 1.0;
+        uint32_t col = a.size() > 10 ? (uint32_t)narg(a,10) : 0xFFFFFF;
+        double alpha = a.size() > 11 ? narg(a,11) * rt.draw_alpha : rt.draw_alpha;
+        int out_w = (int)std::lround(w * xs);
+        int out_h = (int)std::lround(h * ys);
+        rt.blit_sub_screen_scaled(pg, t.sx + l, t.sy + tt, w, h, dx - rt.view_x, dy - rt.view_y, out_w, out_h, alpha, col, 0.0);
+        return vnum(0);
+    };
 
     // ================= AUDIO =================
     // Semantics: GameMaker Studio HTML5 runtime (Function_Sound.js +
@@ -3973,8 +4178,12 @@ void Runtime::register_builtins() {
     builtins["draw_get_color"] = [](Runtime& rt, std::vector<Value>&) -> Value { return vnum(rt.draw_color); };
     builtins["draw_get_colour"] = builtins["draw_get_color"];
     builtins["draw_get_alpha"] = [](Runtime& rt, std::vector<Value>&) -> Value { return vnum(rt.draw_alpha); };
-    builtins["draw_set_blend_mode"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
-    builtins["draw_set_blend_mode_ext"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["draw_set_blend_mode"] = [](Runtime& rt, std::vector<Value>& a){
+        rt.draw_blend_mode = a.empty() ? 0 : (int)to_num(a[0]);
+        return vnum(0);
+    };
+    builtins["draw_set_blend_mode_ext"] = builtins["draw_set_blend_mode"];
+    builtins["draw_get_blend_mode"] = [](Runtime& rt, std::vector<Value>&){ return vnum(rt.draw_blend_mode); };
 
     // Path builtins
     builtins["path_start"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
@@ -4244,6 +4453,11 @@ void Runtime::start_room(int index, std::vector<std::unique_ptr<Instance>> keep)
 }
 
 void Runtime::change_room(int index) {
+    page_cache.clear();
+    page_lru.clear();
+#if (defined(_3DS) || defined(__arm__) || defined(__linux__)) && !defined(_WIN32)
+    malloc_trim(0);
+#endif
     for (size_t i = 0; i < instances.size(); ++i)
         if (instances[i]->alive) run_event(instances[i].get(), 7, 5);
     if (index < 0 || index >= (int)dw.rooms.size()) { running = false; return; }
@@ -4768,7 +4982,7 @@ Image Runtime::draw() {
 
     // Tiles (with frustum culling and zero-copy blitting)
     std::vector<const Tile*> ts;
-    const int margin = 32;
+    const int margin = cfg.culling_margin;
     for (auto& t : room.tiles) {
         if (t.x + t.w < view_x - margin || t.x > view_x + canvas.w + margin ||
             t.y + t.h < view_y - margin || t.y > view_y + canvas.h + margin) continue;
@@ -4818,7 +5032,9 @@ Image Runtime::draw() {
                                  to_num(inst->vars.count("y")?inst->vars["y"]:Value(0.0)),
                                  to_num(inst->vars.count("image_xscale")?inst->vars["image_xscale"]:Value(1.0)),
                                  to_num(inst->vars.count("image_yscale")?inst->vars["image_yscale"]:Value(1.0)),
-                                 to_num(inst->vars.count("image_alpha")?inst->vars["image_alpha"]:Value(1.0)));
+                                 to_num(inst->vars.count("image_alpha")?inst->vars["image_alpha"]:Value(1.0)),
+                                 to_num(inst->vars.count("image_angle")?inst->vars["image_angle"]:Value(0.0)),
+                                 (uint32_t)to_num(inst->vars.count("image_blend")?inst->vars["image_blend"]:Value((double)0xFFFFFF)));
             }
         }
     };

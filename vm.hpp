@@ -138,12 +138,34 @@ struct Surface {
     Image img;
 };
 
+// Global execution context trackers for crash and OOM diagnostics
+extern const char* g_diag_code_name;
+extern int g_diag_pc;
+extern const char* g_diag_obj_name;
+extern int g_diag_inst_id;
+extern const char* g_diag_func_name;
+
+struct EngineConfig {
+    int max_texture_pages = 6;            // Max texture sheets kept in RAM (2 on 3DS, 6 on low-spec/PC, 0 = unlimited)
+    size_t audio_pcm_budget_bytes = 16 * 1024 * 1024; // Bounded PCM sound cache (8MB on 3DS, 16MB on low-spec/PC)
+    long long instruction_budget = 2000000;// Bytecode loop watchdog (250k on 3DS, 2M on PC)
+    int culling_margin = 32;              // Safety margin for tile culling
+    bool enable_blend_modes = true;       // Enable bm_add additive blending
+    std::string save_directory = "./saves";// Directory for .ini and .sav files
+    int target_fps = 30;                  // Target framerate (30 for Undertale, 0 = room speed)
+    int start_room = -1;                  // -1 = natural boot, >= 0 = force room
+    bool verbose_logging = false;         // Enable/disable diagnostic sink
+};
+
+EngineConfig load_engine_config(const std::string& ini_path);
+
 class Runtime {
 public:
-    explicit Runtime(DataWin& dw);
+    explicit Runtime(DataWin& dw, const EngineConfig& cfg = EngineConfig{});
     ~Runtime();
 
     DataWin& dw;
+    EngineConfig cfg;
     std::unordered_map<std::string, const CodeEntry*> scripts;
     std::unordered_map<std::string, Value> globals;
     std::unordered_map<std::string, std::vector<Value>> global_arrays;
@@ -175,20 +197,22 @@ public:
     int view_x = 0, view_y = 0;
     int draw_color = 0xFFFFFF;
     double draw_alpha = 1.0;
+    int draw_blend_mode = 0; // 0 = bm_normal, 1 = bm_add, 2 = bm_max, 3 = bm_subtract
     int draw_font = -1;
     std::unordered_map<int, Image> page_cache;
+    std::vector<int> page_lru;
     const Image& page(int tex_index);
     bool tpag_image(int tpag_index, Image& out, int& tx, int& ty);
     void blit_screen(const Image& src, int dx, int dy, double alpha);
     void blit_sub_screen(const Image& src, int sx, int sy, int sw, int sh, int dx, int dy, double alpha);
     void blit_sub_screen_tint(const Image& src, int sx, int sy, int sw, int sh, int dx, int dy, double alpha, uint32_t color);
     // Scaled + tinted + optionally rotated blit. (dx,dy) is the top-left of the
-    // destination rect; out_w/out_h are the scaled size. angle is in degrees,
-    // applied about the rect centre. When angle==0 and out size==src size this
-    // is equivalent to blit_sub_screen_tint.
+    // destination rect; out_w/out_h are the scaled size. angle is in degrees.
+    // If use_pivot is true, rotates about (pivot_x, pivot_y); otherwise about rect center.
     void blit_sub_screen_scaled(const Image& src, int sx, int sy, int sw, int sh,
                                 int dx, int dy, int out_w, int out_h,
-                                double alpha, uint32_t color, double angle_deg = 0.0);
+                                double alpha, uint32_t color = 0xFFFFFF, double angle_deg = 0.0,
+                                double pivot_x = 0.0, double pivot_y = 0.0, bool use_pivot = false);
 
     using Builtin = std::function<Value(Runtime&, std::vector<Value>&)>;
     std::unordered_map<std::string, Builtin> builtins;
