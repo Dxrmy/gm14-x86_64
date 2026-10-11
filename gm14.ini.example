@@ -1,0 +1,17 @@
+[engine]
+; Texture cache limit in sheets (Old 3DS = 2, low-end PC/Pi = 6, 0 = unlimited)
+max_texture_pages = 6
+; Audio PCM cache budget in MB (Old 3DS = 8, low-end PC/Pi = 16)
+pcm_cache_budget_mb = 16
+; Bytecode loop execution watchdog budget
+instruction_budget = 2000000
+; Safety margin in pixels for tile frustum culling
+culling_margin = 32
+; Enable additive blend modes
+enable_blend_modes = 1
+; Target FPS (0 = default room_speed)
+fps = 30
+; Save directory
+save_directory = ./saves
+; Diagnostic sink logging
+verbose_logging = 0

@@ -14,6 +14,8 @@
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+#include "bunzip.hpp"
+#include "qoi.hpp"
 
 #ifdef __3DS__
 #include <3ds.h>
@@ -92,6 +94,7 @@ DataWin::DataWin(const std::string& path) : filepath(path) {
     log_status("[8/10] Parsing fonts & backgrounds...\n");
     parse_fonts();
     parse_bgnd();
+    parse_paths();
 
     log_status("[9/10] Parsing objects...\n");
     parse_objects();
@@ -299,11 +302,16 @@ void DataWin::parse_functions() {
 
 void DataWin::resolve_references() {
     auto find_ins = [&](uint32_t off) -> Instruction* {
-        auto it = std::lower_bound(all_instrs.begin(), all_instrs.end(), off,
-            [](const Instruction& a, uint32_t val) {
-                return a.file_off < val;
+        auto it = std::upper_bound(all_instrs.begin(), all_instrs.end(), off,
+            [](uint32_t val, const Instruction& a) {
+                return val < a.file_off;
             });
-        if (it != all_instrs.end() && it->file_off == off) return &(*it);
+        if (it != all_instrs.begin()) {
+            auto prev = std::prev(it);
+            if (off >= prev->file_off && off < prev->file_off + 4 * prev->size()) {
+                return &(*prev);
+            }
+        }
         return nullptr;
     };
     log_status(" - resolving var refs...\n");
@@ -346,7 +354,11 @@ void DataWin::parse_textures() {
     auto it = chunks.find("TXTR");
     if (it == chunks.end() || it->second.size == 0) return;
     for (uint32_t p : list_ptrs(*this, it->second.off)) {
-        tex_ptrs.push_back(u32(p + 4));   // pointer to the raw PNG blob
+        uint32_t ptr = u32(p + 4);
+        if (ptr == 0 && p + 24 < m_file_size && u32(p + 24) != 0) {
+            ptr = u32(p + 24);
+        }
+        tex_ptrs.push_back(ptr);
     }
 }
 
@@ -394,8 +406,15 @@ void DataWin::parse_sprites() {
         uint32_t frames_start = 0;
         if (tag == 0xFFFFFFFF) {
             // Modern GMS sprite format (bytecode 17+ / GMS2 / updated GMS 1.4)
-            fc = u32(p+84);
-            frames_start = p+88;
+            uint32_t sversion = u32(p+60);
+            if (sversion >= 3) {
+                fc = u32(p+84);
+                frames_start = p+88;
+            } else {
+                fc = u32(p+76);
+                frames_start = p+80;
+            }
+            if (fc > 10000) fc = 0;
         } else {
             // Classic GMS 1.4 sprite format
             fc = tag;
@@ -463,6 +482,42 @@ void DataWin::parse_bgnd() {
         auto f = tmap.find(u32(p+16));
         b.tpag = (f==tmap.end()) ? -1 : f->second;
         bgnds.push_back(std::move(b));
+    }
+}
+
+void DataWin::parse_paths() {
+    auto it_path = chunks.find("PATH");
+    if (it_path == chunks.end() || it_path->second.size == 0) return;
+    Chunk c = it_path->second;
+    for (uint32_t p : list_ptrs(*this, c.off)) {
+        Path path;
+        path.name = str_content(u32(p));
+        path.smooth = u32(p + 4) != 0;
+        path.closed = u32(p + 8) != 0;
+        path.precision = u32(p + 12);
+        uint32_t num_pts = u32(p + 16);
+        double cum_len = 0.0;
+        path.cumulative_lengths.push_back(0.0);
+        for (uint32_t j = 0; j < num_pts; ++j) {
+            PathPoint pt;
+            pt.x = f32(p + 20 + j * 12);
+            pt.y = f32(p + 24 + j * 12);
+            pt.speed = f32(p + 28 + j * 12);
+            if (j > 0) {
+                double dx = pt.x - path.points[j - 1].x;
+                double dy = pt.y - path.points[j - 1].y;
+                cum_len += std::hypot(dx, dy);
+                path.cumulative_lengths.push_back(cum_len);
+            }
+            path.points.push_back(pt);
+        }
+        if (path.closed && num_pts > 1) {
+            double dx = path.points[0].x - path.points.back().x;
+            double dy = path.points[0].y - path.points.back().y;
+            cum_len += std::hypot(dx, dy);
+        }
+        path.total_length = (cum_len > 0.001) ? cum_len : 1.0;
+        paths.push_back(std::move(path));
     }
 }
 
@@ -665,6 +720,30 @@ Image DataWin::load_texture(int index) const {
     uint32_t end = m_tex_end.count(start) ? m_tex_end.at(start) : (uint32_t)m_file_size;
     if (end <= start || end - start > 32u * 1024 * 1024) return img;
     std::vector<uint8_t> blob = bytes_at(start, end - start);
+    if (blob.size() >= 12) {
+        uint32_t magic = *(const uint32_t*)blob.data();
+        if (magic == 0x716f7a32) { // "2zoq" / QOZ2
+            uint32_t uncomp_len = *(const uint32_t*)(blob.data() + 8);
+            std::vector<uint8_t> qoi_bytes;
+            if (bz2_decompress(blob.data() + 12, blob.size() - 12, qoi_bytes, uncomp_len)) {
+                QoiDecoded dec;
+                if (decode_gm_qoi(qoi_bytes.data(), qoi_bytes.size(), dec)) {
+                    img.w = dec.width;
+                    img.h = dec.height;
+                    img.rgba = std::move(dec.rgba);
+                    return img;
+                }
+            }
+        } else if (magic == 0x716f6966) { // "fioq"
+            QoiDecoded dec;
+            if (decode_gm_qoi(blob.data(), blob.size(), dec)) {
+                img.w = dec.width;
+                img.h = dec.height;
+                img.rgba = std::move(dec.rgba);
+                return img;
+            }
+        }
+    }
     int w, h, comp;
     unsigned char* px = stbi_load_from_memory(blob.data(), (int)blob.size(), &w, &h, &comp, 4);
     if (!px) return img;

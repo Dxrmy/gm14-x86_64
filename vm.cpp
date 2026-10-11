@@ -17,6 +17,65 @@
 
 namespace gm14 {
 
+// Global execution context trackers for crash and OOM diagnostics
+const char* g_diag_code_name = nullptr;
+int g_diag_pc = -1;
+const char* g_diag_obj_name = nullptr;
+int g_diag_inst_id = -1;
+const char* g_diag_func_name = nullptr;
+
+EngineConfig load_engine_config(const std::string& ini_path) {
+    EngineConfig cfg;
+    FILE* fp = std::fopen(ini_path.c_str(), "r");
+    if (!fp) return cfg;
+    char line[512];
+    std::string cur_sec;
+    while (std::fgets(line, sizeof(line), fp)) {
+        std::string s(line);
+        size_t start = s.find_first_not_of(" \t\r\n");
+        if (start == std::string::npos) continue;
+        size_t end = s.find_last_not_of(" \t\r\n");
+        s = s.substr(start, end - start + 1);
+        if (s.empty() || s[0] == ';' || s[0] == '#') continue;
+        if (s.front() == '[' && s.back() == ']') {
+            cur_sec = s.substr(1, s.size() - 2);
+            continue;
+        }
+        size_t eq = s.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = s.substr(0, eq);
+        std::string v = s.substr(eq + 1);
+        size_t ke = k.find_last_not_of(" \t");
+        if (ke != std::string::npos) k = k.substr(0, ke + 1);
+        size_t vs = v.find_first_not_of(" \t");
+        if (vs != std::string::npos) v = v.substr(vs); else v = "";
+        size_t ve = v.find_last_not_of(" \t\r\n");
+        if (ve != std::string::npos) v = v.substr(0, ve + 1);
+
+        if (k == "texture_cache_limit" || k == "max_texture_pages") {
+            try { cfg.max_texture_pages = std::stoi(v); } catch (...) {}
+        } else if (k == "pcm_cache_budget_mb") {
+            try { cfg.audio_pcm_budget_bytes = (size_t)std::stoul(v) * 1024u * 1024u; } catch (...) {}
+        } else if (k == "instruction_budget") {
+            try { cfg.instruction_budget = std::stoll(v); } catch (...) {}
+        } else if (k == "culling_margin") {
+            try { cfg.culling_margin = std::stoi(v); } catch (...) {}
+        } else if (k == "enable_blend_modes") {
+            cfg.enable_blend_modes = (v == "1" || v == "true" || v == "yes");
+        } else if (k == "save_directory") {
+            cfg.save_directory = v;
+        } else if (k == "fps" || k == "target_fps") {
+            try { cfg.target_fps = std::stoi(v); } catch (...) {}
+        } else if (k == "start_room") {
+            try { cfg.start_room = std::stoi(v); } catch (...) {}
+        } else if (k == "verbose_logging") {
+            cfg.verbose_logging = (v == "1" || v == "true" || v == "yes");
+        }
+    }
+    std::fclose(fp);
+    return cfg;
+}
+
 // ---------------- value helpers ----------------
 double to_num(const Value& v) {
     if (v.type == Value::NUM) return v.num;
@@ -50,7 +109,13 @@ static int jump_offset(const Instruction& ins) {
 }
 
 // ---------------- construction ----------------
-Runtime::Runtime(DataWin& dw_) : dw(dw_) {
+Runtime::Runtime(DataWin& dw_, const EngineConfig& cfg_) : dw(dw_), cfg(cfg_) {
+    save_dir = cfg.save_directory;
+    for (const auto& sp : dw.scripts) {
+        if (sp.second >= 0 && sp.second < (int)dw.code.size()) {
+            scripts[sp.first] = &dw.code[sp.second];
+        }
+    }
     static const char* pre[] = {"gml_Script_", "gml_GlobalScript_"};
     for (auto& e : dw.code) {
         for (auto p : pre) {
@@ -60,7 +125,7 @@ Runtime::Runtime(DataWin& dw_) : dw(dw_) {
     }
     global_builtins["current_time"] = Value(0.0);
     global_builtins["delta_time"] = Value(16666.0);
-    global_builtins["room_speed"] = Value(30.0);
+    global_builtins["room_speed"] = Value((double)(cfg.target_fps > 0 ? cfg.target_fps : 30.0));
     register_builtins();
 }
 
@@ -90,13 +155,46 @@ void Runtime::ensure_audio() {
         audio->set_clip_loader([dwp](int asset) -> std::shared_ptr<AudioClip> {
             if (asset < 0 || asset >= (int)dwp->sounds.size()) return nullptr;
             const Sound& s = dwp->sounds[asset];
+
+            std::string base_dir = ".";
+            size_t last_slash = dwp->filepath.find_last_of("/\\");
+            if (last_slash != std::string::npos) base_dir = dwp->filepath.substr(0, last_slash);
+
+            std::vector<std::string> candidates = {
+                base_dir + "/" + s.name + ".ogg",
+                base_dir + "/mus/" + s.name + ".ogg",
+                base_dir + "/music/" + s.name + ".ogg",
+                base_dir + "/" + s.name + ".wav",
+                base_dir + "/" + s.name
+            };
+            for (const auto& path : candidates) {
+                FILE* fp = std::fopen(path.c_str(), "rb");
+                if (fp) {
+                    std::fseek(fp, 0, SEEK_END);
+                    long sz = std::ftell(fp);
+                    std::fseek(fp, 0, SEEK_SET);
+                    if (sz > 0) {
+                        std::vector<uint8_t> fbytes((size_t)sz);
+                        if (std::fread(fbytes.data(), 1, sz, fp) == (size_t)sz) {
+                            std::fclose(fp);
+                            std::shared_ptr<AudioClip> clip = std::make_shared<AudioClip>();
+                            if (decode_audio(fbytes.data(), fbytes.size(), *clip)) return clip;
+                        } else {
+                            std::fclose(fp);
+                        }
+                    } else {
+                        std::fclose(fp);
+                    }
+                }
+            }
+
             if (s.audo_id < 0 || s.audo_id >= (int)dwp->audio.size()) return nullptr;
             std::vector<uint8_t> bytes = dwp->audio_bytes(s.audo_id);
             if (bytes.empty()) return nullptr;
             std::shared_ptr<AudioClip> clip = std::make_shared<AudioClip>();
             if (!decode_audio(bytes.data(), bytes.size(), *clip)) return nullptr;
             return clip;
-        }, 6u * 1024u * 1024u);  // ~6 MB PCM budget
+        }, cfg.audio_pcm_budget_bytes);  // 64 MB PCM budget
     }
 }
 
@@ -139,6 +237,8 @@ Instance* Runtime::resolve_inst(int inst_type) {
     return cur;
 }
 
+static bool bbox_of(Runtime& rt, Instance* inst, double x, double y, double* bb);
+
 // ---------------- variables ----------------
 Value Runtime::get_var(Frame& fr, const Instruction& ins) {
     int inst_type = (int)(int16_t)ins.low16();
@@ -149,34 +249,94 @@ Value Runtime::get_var(Frame& fr, const Instruction& ins) {
     if (ins.var >= 0 && ins.var < (int)dw.variables.size()) name = dw.variables[ins.var].name;
     int varid = (ins.var >= 0) ? dw.variables[ins.var].varid : 0;
     if (inst_type == -5) {
+        auto ai = global_arrays.find(name);
+        if (ai != global_arrays.end() && !ai->second.empty()) {
+            Value v; v.type = Value::VARPTR; v.arrref = &ai->second; return v;
+        }
         auto it = globals.find(name); return it != globals.end() ? it->second : Value(0.0);
     }
     if (inst_type == -7) {
+        auto ai = fr.local_arrays.find(varid);
+        if (ai != fr.local_arrays.end() && !ai->second.empty()) {
+            Value v; v.type = Value::VARPTR; v.arrref = &ai->second; return v;
+        }
         return (varid >= 0 && varid < (int)fr.locals.size()) ? fr.locals[varid] : Value(0.0);
-    }
-    if (inst_type == -15) {
-        return (varid >= 0 && varid < (int)fr.args.size()) ? fr.args[varid] : Value(0.0);
     }
     if (name == "argument_count") {
         return Value((double)fr.args.size());
     }
-    // argument0..15 (varid -6, but only when the name is an argument)
+    // argument0..15 (varid -6 or -15; index is encoded in variable name, e.g. argument0)
     if (name.size() > 8 && name.compare(0, 8, "argument") == 0) {
         int idx = 0;
         std::string num = name.substr(8);
         if (!num.empty()) { try { idx = std::stoi(num); } catch (...) { idx = 0; } }
         return (idx >= 0 && idx < (int)fr.args.size()) ? fr.args[idx] : Value(0.0);
     }
+    if (inst_type == -15) {
+        return (varid >= 0 && varid < (int)fr.args.size()) ? fr.args[varid] : Value(0.0);
+    }
     Instance* inst = resolve_inst(inst_type);
     if (inst) {
-        auto it = inst->vars.find(name);
-        if (it != inst->vars.end()) return it->second;
-        // If this name has array contents (e.g. `charmap` built as an array),
-        // expose them so string/draw builtins can index via the value.
+        int si = inst->vars.count("sprite_index") ? (int)to_num(inst->vars["sprite_index"]) : -1;
+        double xs = inst->vars.count("image_xscale") ? to_num(inst->vars["image_xscale"]) : 1.0;
+        double ys = inst->vars.count("image_yscale") ? to_num(inst->vars["image_yscale"]) : 1.0;
+        if (name == "sprite_width") {
+            if (si >= 0 && si < (int)dw.sprites.size()) return Value(dw.sprites[si].width * xs);
+            return Value(0.0);
+        }
+        if (name == "sprite_height") {
+            if (si >= 0 && si < (int)dw.sprites.size()) return Value(dw.sprites[si].height * ys);
+            return Value(0.0);
+        }
+        if (name == "sprite_xoffset") {
+            if (si >= 0 && si < (int)dw.sprites.size()) return Value((double)dw.sprites[si].origin_x);
+            return Value(0.0);
+        }
+        if (name == "sprite_yoffset") {
+            if (si >= 0 && si < (int)dw.sprites.size()) return Value((double)dw.sprites[si].origin_y);
+            return Value(0.0);
+        }
+        if (name == "image_number") {
+            if (si >= 0 && si < (int)dw.sprites.size()) return Value((double)dw.sprites[si].frames.size());
+            return Value(0.0);
+        }
+        if (name == "id") return Value((double)inst->iid);
+        if (name == "object_index") return Value((double)inst->obj);
+        if (name == "path_index") return Value((double)inst->path_index);
+        if (name == "path_position") return Value(inst->path_position);
+        if (name == "path_speed") return Value(inst->path_speed);
+        if (name == "path_scale") return Value(inst->path_scale);
+        if (name == "path_orientation") return Value(inst->path_orientation);
+        if (name == "path_endaction") return Value((double)inst->path_endaction);
+
+        if (name == "bbox_left" || name == "bbox_top" || name == "bbox_right" || name == "bbox_bottom") {
+            double cur_x = inst->vars.count("x") ? to_num(inst->vars["x"]) : 0.0;
+            double cur_y = inst->vars.count("y") ? to_num(inst->vars["y"]) : 0.0;
+            double bb[4];
+            if (bbox_of(*this, inst, cur_x, cur_y, bb)) {
+                if (name == "bbox_left") return Value(bb[0]);
+                if (name == "bbox_top") return Value(bb[1]);
+                if (name == "bbox_right") return Value(bb[2]);
+                if (name == "bbox_bottom") return Value(bb[3]);
+            }
+            return Value((name == "bbox_left" || name == "bbox_right") ? cur_x : cur_y);
+        }
         auto ai = inst->arrays.find(name);
         if (ai != inst->arrays.end() && !ai->second.empty()) {
             Value v; v.type = Value::VARPTR; v.arrref = &ai->second; return v;
         }
+        auto it = inst->vars.find(name);
+        if (it != inst->vars.end()) return it->second;
+    }
+    // builtin mouse and keyboard variables
+    if (name == "mouse_x") return Value((double)mouse_x);
+    if (name == "mouse_y") return Value((double)mouse_y);
+    if (name == "keyboard_string") return globals.count("keyboard_string") ? globals["keyboard_string"] : Value(std::string());
+    if (name == "keyboard_lastkey") return globals.count("keyboard_lastkey") ? globals["keyboard_lastkey"] : Value(0.0);
+    if (name == "keyboard_lastchar") return globals.count("keyboard_lastchar") ? globals["keyboard_lastchar"] : Value(std::string());
+    if (name == "keyboard_key") {
+        if (!keys_held.empty()) return Value((double)*keys_held.rbegin());
+        return Value(0.0);
     }
     // builtin instance variables default
     static const std::unordered_map<std::string, double> defs = {
@@ -188,9 +348,14 @@ Value Runtime::get_var(Frame& fr, const Instruction& ins) {
         {"xprevious",0},{"yprevious",0},{"bbox_left",0},{"bbox_top",0},
         {"bbox_right",0},{"bbox_bottom",0},{"gravity",0},{"gravity_direction",270},
         {"friction",0},
+        {"path_index",-1},{"path_position",0},{"path_positionprevious",0},
+        {"path_speed",0},{"path_scale",1},{"path_orientation",0},{"path_endaction",0},
     };
     auto d = defs.find(name);
     if (d != defs.end()) return Value(d->second);
+    if (name == "room") return Value((double)room_index);
+    if (name == "room_first") return Value(dw.room_order.empty() ? 0.0 : (double)dw.room_order.front());
+    if (name == "room_last") return Value(dw.room_order.empty() ? 0.0 : (double)dw.room_order.back());
     if (name == "room_speed" || name == "current_time" || name == "fps" ||
         name == "score" || name == "lives" || name == "health" || name == "os_type")
         return global_builtins.count(name) ? global_builtins[name] : Value(0.0);
@@ -198,45 +363,157 @@ Value Runtime::get_var(Frame& fr, const Instruction& ins) {
     if (name == "view_enabled") return globals.count("view_enabled") ? globals["view_enabled"] : Value(1.0);
     if (name == "room_width") return globals.count("room_width") ? globals["room_width"] : Value(320.0);
     if (name == "room_height") return globals.count("room_height") ? globals["room_height"] : Value(240.0);
+    if (name == "room_persistent") return Value(current_room_persistent ? 1.0 : 0.0);
     if (name == "application_surface") return Value(0.0);
     return Value(0.0);
 }
 
-void Runtime::set_var(Frame& fr, const Instruction& ins, const Value& v) {
-    int inst_type = (int)(int16_t)ins.low16();
-    if (inst_type == -9 || ins.ref_type() == 0x80) {
-        if (!fr.stack.empty()) { inst_type = (int)to_num(fr.stack.back()); fr.stack.pop_back(); }
-    }
-    std::string name;
-    if (ins.var >= 0 && ins.var < (int)dw.variables.size()) name = dw.variables[ins.var].name;
-    int varid = (ins.var >= 0) ? dw.variables[ins.var].varid : 0;
-    if (name == "view_current" || name == "view_enabled" || name == "room_width" || name == "room_height") {
-        globals[name] = v;
+void Runtime::set_var_inst(Instance* inst, const std::string& name, const Value& v) {
+    if (!inst) return;
+    if (name == "room_persistent") {
+        current_room_persistent = to_bool(v);
+        globals["room_persistent"] = Value(current_room_persistent ? 1.0 : 0.0);
+        if (!current_room_persistent && room_index >= 0) persistent_rooms.erase(room_index);
         return;
     }
-    if (inst_type == -5) {
-        globals[name] = v;
-        if (v.is_arr()) {
-            global_arrays[name] = *v.arrref;
-            globals[name].arrref = &global_arrays[name];
+    if (name == "path_index") {
+        inst->path_index = (int)to_num(v);
+        inst->vars["path_index"] = Value((double)inst->path_index);
+        return;
+    }
+    if (name == "path_position") {
+        inst->path_position = std::max(0.0, std::min(1.0, to_num(v)));
+        inst->vars["path_position"] = Value(inst->path_position);
+        if (inst->path_index >= 0 && inst->path_index < (int)dw.paths.size()) {
+            double nx, ny, nspd;
+            get_path_point(dw.paths[inst->path_index], inst->path_position, nx, ny, nspd);
+            if (inst->path_absolute) {
+                inst->vars["x"] = Value(nx);
+                inst->vars["y"] = Value(ny);
+            } else {
+                inst->vars["x"] = Value(inst->path_start_x + nx);
+                inst->vars["y"] = Value(inst->path_start_y + ny);
+            }
         }
         return;
     }
-    if (inst_type == -7) { if (varid >= 0 && varid < (int)fr.locals.size()) fr.locals[varid] = v; return; }
-    if (inst_type == -15) { if (varid >= 0 && varid < (int)fr.args.size()) fr.args[varid] = v; return; }
+    if (name == "path_speed") {
+        inst->path_speed = to_num(v);
+        inst->vars["path_speed"] = Value(inst->path_speed);
+        return;
+    }
+    if (name == "path_endaction") {
+        inst->path_endaction = (int)to_num(v);
+        inst->vars["path_endaction"] = Value((double)inst->path_endaction);
+        return;
+    }
+    if (name == "path_scale") {
+        inst->path_scale = to_num(v);
+        inst->vars["path_scale"] = Value(inst->path_scale);
+        return;
+    }
+    if (name == "path_orientation") {
+        inst->path_orientation = to_num(v);
+        inst->vars["path_orientation"] = Value(inst->path_orientation);
+        return;
+    }
+    if (v.is_arr() && v.arrref) {
+        inst->arrays[name] = *v.arrref;
+        Value av; av.type = Value::VARPTR; av.arrref = &inst->arrays[name];
+        inst->vars[name] = av;
+    } else {
+        inst->arrays.erase(name);
+        inst->vars[name] = v;
+    }
+    if (name == "speed" || name == "direction") {
+        double spd = inst->vars.count("speed") ? to_num(inst->vars["speed"]) : 0.0;
+        double dir = inst->vars.count("direction") ? to_num(inst->vars["direction"]) : 0.0;
+        inst->vars["hspeed"] = Value(spd * std::cos(dir * 3.141592653589793 / 180.0));
+        inst->vars["vspeed"] = Value(-spd * std::sin(dir * 3.141592653589793 / 180.0));
+    } else if (name == "hspeed" || name == "vspeed") {
+        double hs = inst->vars.count("hspeed") ? to_num(inst->vars["hspeed"]) : 0.0;
+        double vs = inst->vars.count("vspeed") ? to_num(inst->vars["vspeed"]) : 0.0;
+        inst->vars["speed"] = Value(std::hypot(hs, vs));
+        double dir = std::atan2(-vs, hs) * 180.0 / 3.141592653589793;
+        if (dir < 0) dir += 360.0;
+        inst->vars["direction"] = Value(dir);
+    }
+}
+
+void Runtime::set_var(Frame& fr, const Instruction& ins, int inst_type, const Value& v) {
+    std::string name;
+    if (ins.var >= 0 && ins.var < (int)dw.variables.size()) name = dw.variables[ins.var].name;
+    int varid = (ins.var >= 0) ? dw.variables[ins.var].varid : 0;
+    if (name == "room") { pending_room = (int)to_num(v); return; }
+    if (name == "room_persistent") {
+        current_room_persistent = to_bool(v);
+        globals["room_persistent"] = Value(current_room_persistent ? 1.0 : 0.0);
+        if (!current_room_persistent && room_index >= 0) persistent_rooms.erase(room_index);
+        return;
+    }
+    if (name == "view_current" || name == "view_enabled" || name == "room_width" || name == "room_height" ||
+        name == "keyboard_string" || name == "keyboard_lastkey" || name == "keyboard_lastchar") {
+        globals[name] = v;
+        return;
+    }
+    if (name == "mouse_x") { mouse_x = (int)to_num(v); return; }
+    if (name == "mouse_y") { mouse_y = (int)to_num(v); return; }
+    if (inst_type == -5) {
+        if (v.is_arr() && v.arrref) {
+            global_arrays[name] = *v.arrref;
+            Value av; av.type = Value::VARPTR; av.arrref = &global_arrays[name];
+            globals[name] = av;
+        } else {
+            global_arrays.erase(name);
+            globals[name] = v;
+        }
+        return;
+    }
+    if (inst_type == -7) {
+        if (varid >= 0) {
+            if (varid >= (int)fr.locals.size()) fr.locals.resize(varid + 1, Value(0.0));
+            if (v.is_arr() && v.arrref) {
+                fr.local_arrays[varid] = *v.arrref;
+                Value av; av.type = Value::VARPTR; av.arrref = &fr.local_arrays[varid];
+                fr.locals[varid] = av;
+            } else {
+                fr.local_arrays.erase(varid);
+                fr.locals[varid] = v;
+            }
+        }
+        return;
+    }
+    if (inst_type == -15) {
+        if (varid >= 0) {
+            if (varid >= (int)fr.args.size()) fr.args.resize(varid + 1, Value(0.0));
+            fr.args[varid] = v;
+        }
+        return;
+    }
     if (name.size() > 8 && name.compare(0, 8, "argument") == 0) {
         int idx = 0; std::string num = name.substr(8);
         if (!num.empty()) { try { idx = std::stoi(num); } catch (...) {} }
-        if (idx >= 0 && idx < (int)fr.args.size()) fr.args[idx] = v;
+        if (idx >= 0) {
+            if (idx >= (int)fr.args.size()) fr.args.resize(idx + 1, Value(0.0));
+            fr.args[idx] = v;
+        }
+        return;
+    }
+    if (inst_type == -3) {
+        for (auto& i : instances) {
+            if (i->alive) set_var_inst(i.get(), name, v);
+        }
+        return;
+    }
+    if (inst_type >= 0 && inst_type < 100000) {
+        for (auto& i : instances) {
+            if (i->alive && is_obj(dw, i.get(), inst_type)) set_var_inst(i.get(), name, v);
+        }
         return;
     }
     Instance* inst = resolve_inst(inst_type);
     if (inst) {
-        inst->vars[name] = v;
-        if (v.is_arr()) {
-            inst->arrays[name] = *v.arrref;
-            inst->vars[name].arrref = &inst->arrays[name];
-        }
+        set_var_inst(inst, name, v);
     }
 }
 
@@ -248,34 +525,37 @@ Value Runtime::get_array(Frame& fr, const Instruction& ins, int inst_type, int i
     if (ins.var >= 0 && ins.var < (int)dw.variables.size()) name = dw.variables[ins.var].name;
     if (name.compare(0, 5, "view_") == 0) {
         auto it = global_arrays.find(name);
-        if (it != global_arrays.end() && index >= 0 && index < (int)it->second.size()) return it->second[index];
-        if (name == "view_wview") return Value(320.0);
-        if (name == "view_hview") return Value(240.0);
-        return Value(0.0);
+        Value ret(0.0);
+        if (it != global_arrays.end() && index >= 0 && index < (int)it->second.size()) ret = it->second[index];
+        else if (name == "view_xview" && index == 0) ret = Value((double)view_x);
+        else if (name == "view_yview" && index == 0) ret = Value((double)view_y);
+        else if (name == "view_wview") ret = Value(320.0);
+        else if (name == "view_hview") ret = Value(240.0);
+        return ret;
     }
     if (name == "argument") {
         if (index >= 0 && index < (int)fr.args.size()) return fr.args[index];
         return Value(0.0);
     }
     if (name == "alarm") {
-        Instance* inst = (inst_type > 0) ? resolve_inst(inst_type) : cur;
+        Instance* inst = resolve_inst(inst_type);
         if (inst && index >= 0 && index < 12) return Value(inst->alarms[index] < 0 ? -1.0 : (double)inst->alarms[index]);
         return Value(-1.0);
     }
     if (inst_type == -5) {
         auto it = global_arrays.find(name);
         if (it != global_arrays.end() && index >= 0 && index < (int)it->second.size()) return it->second[index];
-        auto git = globals.find(name);
-        if (git != globals.end() && git->second.is_arr()) {
-            const auto& arr = *git->second.arrref;
-            if (index >= 0 && index < (int)arr.size()) return arr[index];
-        }
+        auto vit = globals.find(name);
+        if (vit != globals.end() && vit->second.is_arr() && vit->second.arrref &&
+            index >= 0 && index < (int)vit->second.arrref->size()) return (*vit->second.arrref)[index];
         return Value(0.0);
     }
     if (inst_type == -7) {
         int varid = (ins.var >= 0) ? dw.variables[ins.var].varid : 0;
         auto it = fr.local_arrays.find(varid);
         if (it != fr.local_arrays.end() && index >= 0 && index < (int)it->second.size()) return it->second[index];
+        if (varid >= 0 && varid < (int)fr.locals.size() && fr.locals[varid].is_arr() && fr.locals[varid].arrref &&
+            index >= 0 && index < (int)fr.locals[varid].arrref->size()) return (*fr.locals[varid].arrref)[index];
         return Value(0.0);
     }
     Instance* inst = resolve_inst(inst_type);
@@ -283,10 +563,8 @@ Value Runtime::get_array(Frame& fr, const Instruction& ins, int inst_type, int i
         auto it = inst->arrays.find(name);
         if (it != inst->arrays.end() && index >= 0 && index < (int)it->second.size()) return it->second[index];
         auto vit = inst->vars.find(name);
-        if (vit != inst->vars.end() && vit->second.is_arr()) {
-            const auto& arr = *vit->second.arrref;
-            if (index >= 0 && index < (int)arr.size()) return arr[index];
-        }
+        if (vit != inst->vars.end() && vit->second.is_arr() && vit->second.arrref &&
+            index >= 0 && index < (int)vit->second.arrref->size()) return (*vit->second.arrref)[index];
     }
     return Value(0.0);
 }
@@ -298,10 +576,32 @@ void Runtime::set_array(Frame& fr, const Instruction& ins, int inst_type, int in
     std::string name;
     if (ins.var >= 0 && ins.var < (int)dw.variables.size()) name = dw.variables[ins.var].name;
     if (name.compare(0, 5, "view_") == 0) {
+        int r_w = globals.count("room_width") ? (int)to_num(globals["room_width"]) : (int)dw.rooms[room_index].width;
+        int r_h = globals.count("room_height") ? (int)to_num(globals["room_height"]) : (int)dw.rooms[room_index].height;
+        int v_w = (global_arrays.count("view_wview") && !global_arrays["view_wview"].empty()) ? (int)to_num(global_arrays["view_wview"][0]) : 320;
+        int v_h = (global_arrays.count("view_hview") && !global_arrays["view_hview"].empty()) ? (int)to_num(global_arrays["view_hview"][0]) : 240;
+        if (v_w <= 0) v_w = 320;
+        if (v_h <= 0) v_h = 240;
+
+        Value clamped_v = v;
+        if (index == 0) {
+            if (name == "view_xview") {
+                int max_x = std::max(0, r_w - v_w);
+                int cx = std::clamp((int)std::lround(to_num(v)), 0, max_x);
+                clamped_v = Value((double)cx);
+                view_x = cx;
+            } else if (name == "view_yview") {
+                int max_y = std::max(0, r_h - v_h);
+                int cy = std::clamp((int)std::lround(to_num(v)), 0, max_y);
+                clamped_v = Value((double)cy);
+                view_y = cy;
+            }
+        }
+
         auto& arr = global_arrays[name];
         if (index >= 0) {
             if (index >= (int)arr.size()) arr.resize(index + 1, Value(0.0));
-            arr[index] = v;
+            arr[index] = clamped_v;
         }
         return;
     }
@@ -313,38 +613,70 @@ void Runtime::set_array(Frame& fr, const Instruction& ins, int inst_type, int in
         return;
     }
     if (name == "alarm") {
-        Instance* inst = (inst_type > 0) ? resolve_inst(inst_type) : cur;
-        if (inst && index >= 0 && index < 12) inst->alarms[index] = (to_num(v) < 0) ? -1 : (int)to_num(v);
+        auto set_alarm_on_inst = [&](Instance* inst) {
+            if (inst && index >= 0 && index < 12) inst->alarms[index] = (to_num(v) < 0) ? -1 : (int)to_num(v);
+        };
+        if (inst_type == -3) {
+            for (auto& i : instances) if (i->alive) set_alarm_on_inst(i.get());
+        } else if (inst_type >= 0 && inst_type < 100000) {
+            for (auto& i : instances) if (i->alive && is_obj(dw, i.get(), inst_type)) set_alarm_on_inst(i.get());
+        } else {
+            set_alarm_on_inst(resolve_inst(inst_type));
+        }
         return;
     }
-    std::vector<Value>* arr = nullptr;
-    if (inst_type == -5) arr = &global_arrays[name];
-    else if (inst_type == -7) {
-        int varid = (ins.var >= 0) ? dw.variables[ins.var].varid : 0;
-        arr = &fr.local_arrays[varid];
-    } else {
-        Instance* inst = resolve_inst(inst_type);
-        if (!inst) return;
-        arr = &inst->arrays[name];
-        if (arr->empty()) {
-            auto vit = inst->vars.find(name);
-            if (vit != inst->vars.end() && vit->second.is_arr()) {
-                *arr = *vit->second.arrref;
-                vit->second.arrref = arr;
-            }
+    if (inst_type == -5) {
+        if (!global_arrays.count(name) && globals.count(name) && globals[name].is_arr() && globals[name].arrref) {
+            global_arrays[name] = *globals[name].arrref;
         }
+        auto& arr = global_arrays[name];
+        Value av; av.type = Value::VARPTR; av.arrref = &arr;
+        globals[name] = av;
+        if (index >= 0) {
+            if (index >= (int)arr.size()) arr.resize(index + 1, Value(0.0));
+            arr[index] = v;
+        }
+        return;
     }
-    if (index < 0) return;
-    if (index >= (int)arr->size()) arr->resize(index + 1, Value(0.0));
-    (*arr)[index] = v;
-}
+    if (inst_type == -7) {
+        int varid = (ins.var >= 0) ? dw.variables[ins.var].varid : 0;
+        if (varid >= 0 && varid < (int)fr.locals.size() && !fr.local_arrays.count(varid) && fr.locals[varid].is_arr() && fr.locals[varid].arrref) {
+            fr.local_arrays[varid] = *fr.locals[varid].arrref;
+        }
+        auto& arr = fr.local_arrays[varid];
+        Value av; av.type = Value::VARPTR; av.arrref = &arr;
+        if (varid >= 0) {
+            if (varid >= (int)fr.locals.size()) fr.locals.resize(varid + 1, Value(0.0));
+            fr.locals[varid] = av;
+        }
+        if (index >= 0) {
+            if (index >= (int)arr.size()) arr.resize(index + 1, Value(0.0));
+            arr[index] = v;
+        }
+        return;
+    }
 
-// Global execution context trackers for crash and OOM diagnostics
-const char* g_diag_code_name = nullptr;
-int g_diag_pc = -1;
-const char* g_diag_obj_name = nullptr;
-int g_diag_inst_id = -1;
-const char* g_diag_func_name = nullptr;
+    auto set_inst_arr = [&](Instance* inst) {
+        if (!inst) return;
+        if (!inst->arrays.count(name) && inst->vars.count(name) && inst->vars[name].is_arr() && inst->vars[name].arrref) {
+            inst->arrays[name] = *inst->vars[name].arrref;
+        }
+        auto& arr = inst->arrays[name];
+        Value av; av.type = Value::VARPTR; av.arrref = &arr;
+        inst->vars[name] = av;
+        if (index >= 0) {
+            if (index >= (int)arr.size()) arr.resize(index + 1, Value(0.0));
+            arr[index] = v;
+        }
+    };
+    if (inst_type == -3) {
+        for (auto& i : instances) if (i->alive) set_inst_arr(i.get());
+    } else if (inst_type >= 0 && inst_type < 100000) {
+        for (auto& i : instances) if (i->alive && is_obj(dw, i.get(), inst_type)) set_inst_arr(i.get());
+    } else {
+        set_inst_arr(resolve_inst(inst_type));
+    }
+}
 
 // ---------------- execution ----------------
 Value Runtime::call(const std::string& name, std::vector<Value>& args) {
@@ -390,6 +722,15 @@ Value Runtime::call(const std::string& name, std::vector<Value>& args) {
 }
 
 Value Runtime::run_entry(const CodeEntry* entry, std::vector<Value>& args, Instance* self, Instance* other_) {
+    const char* prev_code = g_diag_code_name;
+    g_diag_code_name = entry ? entry->name.c_str() : nullptr;
+    const char* prev_obj = g_diag_obj_name;
+    int prev_id = g_diag_inst_id;
+    if (self) {
+        g_diag_obj_name = (self->obj >= 0 && self->obj < (int)dw.objects.size()) ? dw.objects[self->obj].name.c_str() : "unknown";
+        g_diag_inst_id = self->iid;
+    }
+
     Frame fr;
     fr.entry = entry;
     fr.base = dw.all_instrs.data() + entry->instr_start;
@@ -407,44 +748,42 @@ Value Runtime::run_entry(const CodeEntry* entry, std::vector<Value>& args, Insta
         fr.local_arrays[0] = a0;
     }
     fr.self = self; fr.other = other_;
+    if (fr.n > 1 && fr.base[0].kind() == OP_B &&
+        (entry->name.rfind("gml_Script_", 0) == 0 || entry->name.rfind("gml_GlobalScript_", 0) == 0)) {
+        fr.pc = 1;
+    }
     Instance* oc = cur; Instance* oo = other;
     cur = self; other = other_;
-
-    const char* prev_code = g_diag_code_name;
-    int prev_pc = g_diag_pc;
-    const char* prev_obj = g_diag_obj_name;
-    int prev_inst = g_diag_inst_id;
-
-    g_diag_code_name = entry ? entry->name.c_str() : nullptr;
-    g_diag_pc = 0;
-    g_diag_obj_name = (self && self->obj >= 0 && self->obj < (int)dw.objects.size()) ? dw.objects[self->obj].name.c_str() : nullptr;
-    g_diag_inst_id = self ? self->iid : -1;
-
     try { exec(fr); }
     catch (...) {
+        cur = oc; other = oo;
         g_diag_code_name = prev_code;
-        g_diag_pc = prev_pc;
         g_diag_obj_name = prev_obj;
-        g_diag_inst_id = prev_inst;
-        cur = oc; other = oo; throw;
+        g_diag_inst_id = prev_id;
+        throw;
     }
-    g_diag_code_name = prev_code;
-    g_diag_pc = prev_pc;
-    g_diag_obj_name = prev_obj;
-    g_diag_inst_id = prev_inst;
     cur = oc; other = oo;
+    g_diag_code_name = prev_code;
+    g_diag_obj_name = prev_obj;
+    g_diag_inst_id = prev_id;
     return fr.value;
 }
 
 void Runtime::exec(Frame& fr) {
     const Instruction* ins_list = fr.base;
     int n = fr.n;
-    long long budget = 20000000;
+    long long budget = cfg.instruction_budget > 0 ? cfg.instruction_budget : 20000000;
     long long steps = 0;
     while (fr.pc < n) {
         if (++steps > budget) throw std::runtime_error("instruction budget exceeded in " + fr.entry->name);
+        g_diag_pc = fr.pc;
         const Instruction& ins = ins_list[fr.pc];
         uint8_t k = ins.kind(), t1 = ins.type1();
+        if (diag_sink && fr.entry && fr.entry->name == "gml_Object_obj_overworldcontroller_Draw_0" && fr.pc >= 2345 && fr.pc <= 2385) {
+            std::string l = "OWC_PC=" + std::to_string(fr.pc) + " k=0x" + std::to_string((int)k) + " stk=" + std::to_string(fr.stack.size());
+            if (!fr.stack.empty()) l += " top=" + std::to_string(to_num(fr.stack.back()));
+            diag_sink(l.c_str());
+        }
         // Safe stack pop: GML bytecode occasionally under-flows on unusual paths
         // (malformed branch targets, missing event setup). Popping an empty stack
         // is undefined behaviour and manifests as a segfault or bad_alloc, so we
@@ -475,15 +814,28 @@ void Runtime::exec(Frame& fr) {
                 Value v = stk_pop();
                 set_array(fr, ins, it, idx, v);
             } else {
+                int inst_type = (int)(int16_t)ins.low16();
+                if (inst_type == -9 || ins.ref_type() == 0x80) {
+                    inst_type = (int)to_num(stk_pop());
+                }
                 Value v = stk_pop();
-                set_var(fr, ins, v);
+                set_var(fr, ins, inst_type, v);
             }
             fr.pc++;
         } else if (k == OP_POPZ) {
             if (!fr.stack.empty()) fr.stack.pop_back();
             fr.pc++;
         } else if (k == OP_DUP) {
-            if (!fr.stack.empty()) fr.stack.push_back(fr.stack.back());
+            int count = (int)ins.low16() + 1;
+            if (count <= 1) {
+                if (!fr.stack.empty()) fr.stack.push_back(fr.stack.back());
+            } else {
+                int sz = (int)fr.stack.size();
+                int start = std::max(0, sz - count);
+                for (int i = start; i < sz; ++i) {
+                    fr.stack.push_back(fr.stack[i]);
+                }
+            }
             fr.pc++;
         } else if (k == OP_CONV) {
             Value v = stk_pop();
@@ -637,13 +989,16 @@ const Image& Runtime::page(int tex_index) {
         page_lru.push_back(tex_index);
         return it->second;
     }
-    while (page_cache.size() >= 2 && !page_lru.empty()) {
-        int evict_idx = page_lru.front();
-        page_lru.erase(page_lru.begin());
-        page_cache.erase(evict_idx);
-#if defined(_3DS) || defined(__arm__)
-        malloc_trim(0);
+    size_t limit = cfg.max_texture_pages > 0 ? (size_t)cfg.max_texture_pages : 0;
+    if (limit > 0) {
+        while (page_cache.size() >= limit && !page_lru.empty()) {
+            int evict_idx = page_lru.front();
+            page_lru.erase(page_lru.begin());
+            page_cache.erase(evict_idx);
+#if (defined(_3DS) || defined(__arm__) || defined(__linux__)) && !defined(_WIN32)
+            malloc_trim(0);
 #endif
+        }
     }
     page_lru.push_back(tex_index);
     it = page_cache.emplace(tex_index, dw.load_texture(tex_index)).first;
@@ -691,6 +1046,7 @@ void Runtime::blit_screen(const Image& src, int dx, int dy, double alpha) {
     dx -= view_x;
     dy -= view_y;
     int a = (int)(std::max(0.0, std::min(1.0, alpha)) * 255);
+    int mode = cfg.enable_blend_modes ? draw_blend_mode : 0;
     for (int y = 0; y < src.h; ++y) {
         int ty = dy + y; if (ty < 0 || ty >= screen->h) continue;
         for (int x = 0; x < src.w; ++x) {
@@ -699,7 +1055,7 @@ void Runtime::blit_screen(const Image& src, int dx, int dy, double alpha) {
             uint8_t* d = &screen->rgba[((size_t)ty * screen->w + tx) * 4];
             double sa = (s[3] / 255.0) * (a / 255.0);
             if (sa <= 0) continue;
-            blend_pixel(d, s[0], s[1], s[2], sa, draw_blend_mode);
+            blend_pixel(d, s[0], s[1], s[2], sa, mode);
         }
     }
 }
@@ -708,6 +1064,7 @@ void Runtime::blit_sub_screen(const Image& src, int sx, int sy, int sw, int sh, 
     if (!screen || sw <= 0 || sh <= 0 || src.w <= 0 || src.h <= 0) return;
     int a = (int)(std::max(0.0, std::min(1.0, alpha)) * 255);
     if (a <= 0) return;
+    int mode = cfg.enable_blend_modes ? draw_blend_mode : 0;
     for (int y = 0; y < sh; ++y) {
         int ty = dy + y; if (ty < 0 || ty >= screen->h) continue;
         int sy_pos = sy + y; if (sy_pos < 0 || sy_pos >= src.h) continue;
@@ -717,11 +1074,11 @@ void Runtime::blit_sub_screen(const Image& src, int sx, int sy, int sw, int sh, 
             const uint8_t* s = &src.rgba[((size_t)sy_pos * src.w + sx_pos) * 4];
             uint8_t* d = &screen->rgba[((size_t)ty * screen->w + tx) * 4];
             if (s[3] == 0) continue;
-            if (s[3] == 255 && a == 255 && draw_blend_mode == 0) {
+            if (s[3] == 255 && a == 255 && mode == 0) {
                 d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = 255;
             } else {
                 double sa = (s[3] / 255.0) * (a / 255.0);
-                blend_pixel(d, s[0], s[1], s[2], sa, draw_blend_mode);
+                blend_pixel(d, s[0], s[1], s[2], sa, mode);
             }
         }
     }
@@ -729,52 +1086,102 @@ void Runtime::blit_sub_screen(const Image& src, int sx, int sy, int sw, int sh, 
 
 void Runtime::blit_sub_screen_scaled(const Image& src, int sx, int sy, int sw, int sh,
                                      int dx, int dy, int out_w, int out_h,
-                                     double alpha, uint32_t color, double angle_deg) {
+                                     double alpha, uint32_t color, double angle_deg,
+                                     double pivot_x, double pivot_y, bool use_pivot) {
     if (!screen || sw <= 0 || sh <= 0 || src.w <= 0 || src.h <= 0) return;
-    if (out_w <= 0 || out_h <= 0) return;
+    if (out_w == 0 || out_h == 0) return;
+    bool flip_x = false;
+    if (out_w < 0) { flip_x = true; dx += out_w; out_w = -out_w; }
+    bool flip_y = false;
+    if (out_h < 0) { flip_y = true; dy += out_h; out_h = -out_h; }
     int a255 = (int)(std::max(0.0, std::min(1.0, alpha)) * 255);
     if (a255 <= 0) return;
     uint8_t tr = (uint8_t)(color & 0xFF);
     uint8_t tg = (uint8_t)((color >> 8) & 0xFF);
     uint8_t tb = (uint8_t)((color >> 16) & 0xFF);
-    double ang = angle_deg * 3.14159265358979 / 180.0;
+    int mode = cfg.enable_blend_modes ? draw_blend_mode : 0;
+
+    if (std::abs(angle_deg) < 1e-4) {
+        for (int py = 0; py < out_h; ++py) {
+            int ty = dy + py; if (ty < 0 || ty >= screen->h) continue;
+            int ssy = sy + (flip_y ? (out_h - 1 - py) * sh / out_h : py * sh / out_h);
+            if (ssy < 0 || ssy >= src.h) continue;
+            for (int px = 0; px < out_w; ++px) {
+                int tx = dx + px; if (tx < 0 || tx >= screen->w) continue;
+                int ssx = sx + (flip_x ? (out_w - 1 - px) * sw / out_w : px * sw / out_w);
+                if (ssx < 0 || ssx >= src.w) continue;
+                const uint8_t* s = &src.rgba[((size_t)ssy * src.w + ssx) * 4];
+                if (s[3] == 0) continue;
+                uint8_t* d = &screen->rgba[((size_t)ty * screen->w + tx) * 4];
+                uint8_t sr = (uint8_t)((s[0] * tr) / 255);
+                uint8_t sg = (uint8_t)((s[1] * tg) / 255);
+                uint8_t sb = (uint8_t)((s[2] * tb) / 255);
+                if (s[3] == 255 && a255 == 255 && mode == 0) {
+                    d[0] = sr; d[1] = sg; d[2] = sb; d[3] = 255;
+                } else {
+                    double sfa = (s[3] / 255.0) * (a255 / 255.0);
+                    blend_pixel(d, sr, sg, sb, sfa, mode);
+                }
+            }
+        }
+        return;
+    }
+
+    if (!use_pivot) {
+        pivot_x = dx + out_w * 0.5;
+        pivot_y = dy + out_h * 0.5;
+    }
+    double r_left = dx - pivot_x;
+    double r_top = dy - pivot_y;
+    double r_right = r_left + out_w;
+    double r_bottom = r_top + out_h;
+
+    double ang = angle_deg * 3.14159265358979323846 / 180.0;
     double ca = std::cos(ang), sa = std::sin(ang);
-    // Centre of the destination rect (rotation pivot).
-    double cx = dx + out_w * 0.5;
-    double cy = dy + out_h * 0.5;
-    // Bounding box of the rotated rect so we know which dest pixels to visit.
-    double hw = out_w * 0.5, hh = out_h * 0.5;
-    int bb_w = (int)std::ceil(std::abs(out_w * ca) + std::abs(out_h * sa)) + 2;
-    int bb_h = (int)std::ceil(std::abs(out_w * sa) + std::abs(out_h * ca)) + 2;
-    int bb_x = (int)(cx - bb_w * 0.5);
-    int bb_y = (int)(cy - bb_h * 0.5);
-    for (int py = 0; py < bb_h; ++py) {
-        int ty = bb_y + py; if (ty < 0 || ty >= screen->h) continue;
-        for (int px = 0; px < bb_w; ++px) {
-            int tx = bb_x + px; if (tx < 0 || tx >= screen->w) continue;
-            // Inverse-rotate the dest point into the unrotated dest rect space.
-            double rx = (tx + 0.5) - cx;
-            double ry = (ty + 0.5) - cy;
-            double ux = rx * ca + ry * sa;   // -hw..hw
-            double uy = -rx * sa + ry * ca;  // -hh..hh
-            if (ux < -hw || ux >= hw || uy < -hh || uy >= hh) continue;
-            // Map into source sub-rect.
-            double fx = (ux + hw) / (double)out_w;   // 0..1
-            double fy = (uy + hh) / (double)out_h;   // 0..1
+
+    double c0x = r_left * ca + r_top * sa,     c0y = -r_left * sa + r_top * ca;
+    double c1x = r_right * ca + r_top * sa,    c1y = -r_right * sa + r_top * ca;
+    double c2x = r_left * ca + r_bottom * sa,  c2y = -r_left * sa + r_bottom * ca;
+    double c3x = r_right * ca + r_bottom * sa, c3y = -r_right * sa + r_bottom * ca;
+
+    double min_rx = std::min({c0x, c1x, c2x, c3x});
+    double max_rx = std::max({c0x, c1x, c2x, c3x});
+    double min_ry = std::min({c0y, c1y, c2y, c3y});
+    double max_ry = std::max({c0y, c1y, c2y, c3y});
+
+    int bb_x0 = std::max(0, (int)std::floor(pivot_x + min_rx));
+    int bb_x1 = std::min(screen->w - 1, (int)std::ceil(pivot_x + max_rx));
+    int bb_y0 = std::max(0, (int)std::floor(pivot_y + min_ry));
+    int bb_y1 = std::min(screen->h - 1, (int)std::ceil(pivot_y + max_ry));
+
+    for (int ty = bb_y0; ty <= bb_y1; ++ty) {
+        for (int tx = bb_x0; tx <= bb_x1; ++tx) {
+            double rx = (tx + 0.5) - pivot_x;
+            double ry = (ty + 0.5) - pivot_y;
+            double ux = rx * ca - ry * sa;
+            double uy = rx * sa + ry * ca;
+            if (ux < r_left || ux >= r_right || uy < r_top || uy >= r_bottom) continue;
+
+            double fx = (ux - r_left) / (double)out_w;
+            double fy = (uy - r_top) / (double)out_h;
+            if (flip_x) fx = 1.0 - fx;
+            if (flip_y) fy = 1.0 - fy;
+
             int ssx = sx + (int)(fx * sw);
             int ssy = sy + (int)(fy * sh);
             if (ssx < 0 || ssx >= src.w || ssy < 0 || ssy >= src.h) continue;
+
             const uint8_t* s = &src.rgba[((size_t)ssy * src.w + ssx) * 4];
             if (s[3] == 0) continue;
             uint8_t* d = &screen->rgba[((size_t)ty * screen->w + tx) * 4];
             uint8_t sr = (uint8_t)((s[0] * tr) / 255);
             uint8_t sg = (uint8_t)((s[1] * tg) / 255);
             uint8_t sb = (uint8_t)((s[2] * tb) / 255);
-            if (s[3] == 255 && a255 == 255 && draw_blend_mode == 0) {
+            if (s[3] == 255 && a255 == 255 && mode == 0) {
                 d[0] = sr; d[1] = sg; d[2] = sb; d[3] = 255;
             } else {
                 double sfa = (s[3] / 255.0) * (a255 / 255.0);
-                blend_pixel(d, sr, sg, sb, sfa, draw_blend_mode);
+                blend_pixel(d, sr, sg, sb, sfa, mode);
             }
         }
     }
@@ -788,6 +1195,7 @@ void Runtime::blit_sub_screen_tint(const Image& src, int sx, int sy, int sw, int
     uint8_t tr = (uint8_t)(color & 0xFF);
     uint8_t tg = (uint8_t)((color >> 8) & 0xFF);
     uint8_t tb = (uint8_t)((color >> 16) & 0xFF);
+    int mode = cfg.enable_blend_modes ? draw_blend_mode : 0;
 
     for (int y = 0; y < sh; ++y) {
         int ty = dy + y; if (ty < 0 || ty >= screen->h) continue;
@@ -803,11 +1211,11 @@ void Runtime::blit_sub_screen_tint(const Image& src, int sx, int sy, int sw, int
             uint8_t sg = (uint8_t)((s[1] * tg) / 255);
             uint8_t sb = (uint8_t)((s[2] * tb) / 255);
 
-            if (s[3] == 255 && a == 255 && draw_blend_mode == 0) {
+            if (s[3] == 255 && a == 255 && mode == 0) {
                 d[0] = sr; d[1] = sg; d[2] = sb; d[3] = 255;
             } else {
                 double sa = (s[3] / 255.0) * (a / 255.0);
-                blend_pixel(d, sr, sg, sb, sa, draw_blend_mode);
+                blend_pixel(d, sr, sg, sb, sa, mode);
             }
         }
     }
@@ -879,7 +1287,15 @@ static void draw_line_on_image(Image* img, int x0, int y0, int x1, int y1, uint3
 }
 
 static void draw_sprite_impl(Runtime& rt, double sprite, double subimg, double x, double y,
-                             double xs, double ys, double alpha) {
+                             double xs, double ys, double alpha, double angle = 0.0, uint32_t color = 0xFFFFFF) {
+    if (rt.gui_drawing && rt.gui_width > 0 && rt.gui_height > 0 && rt.screen) {
+        double gui_sx = (double)rt.screen->w / rt.gui_width;
+        double gui_sy = (double)rt.screen->h / rt.gui_height;
+        x *= gui_sx;
+        y *= gui_sy;
+        xs *= gui_sx;
+        ys *= gui_sy;
+    }
     int si = (int)sprite;
     if (si < 0 || si >= (int)rt.dw.sprites.size()) return;
     const Sprite& sp = rt.dw.sprites[si];
@@ -893,20 +1309,37 @@ static void draw_sprite_impl(Runtime& rt, double sprite, double subimg, double x
     const Image& pg = rt.page(t.tex);
     if (pg.w <= 0 || t.sx + t.sw > pg.w || t.sy + t.sh > pg.h) return;
     // Destination top-left in screen space (origin-relative).
-    int dx = (int)std::lround(x - sp.origin_x * xs) + t.tx - rt.view_x;
-    int dy = (int)std::lround(y - sp.origin_y * ys) + t.ty - rt.view_y;
+    int dx = (int)std::lround(x + (t.tx - sp.origin_x) * xs) - rt.view_x;
+    int dy = (int)std::lround(y + (t.ty - sp.origin_y) * ys) - rt.view_y;
     int out_w = (int)std::lround(t.sw * xs);
     int out_h = (int)std::lround(t.sh * ys);
-    if (out_w == t.sw && out_h == t.sh) {
-        rt.blit_sub_screen(pg, t.sx, t.sy, t.sw, t.sh, dx, dy, alpha);
+    double pivot_x = x - rt.view_x;
+    double pivot_y = y - rt.view_y;
+
+    if (std::abs(angle) < 1e-4) {
+        if (out_w == t.sw && out_h == t.sh && color == 0xFFFFFF) {
+            rt.blit_sub_screen(pg, t.sx, t.sy, t.sw, t.sh, dx, dy, alpha);
+        } else if (out_w == t.sw && out_h == t.sh) {
+            rt.blit_sub_screen_tint(pg, t.sx, t.sy, t.sw, t.sh, dx, dy, alpha, color);
+        } else {
+            rt.blit_sub_screen_scaled(pg, t.sx, t.sy, t.sw, t.sh, dx, dy, out_w, out_h, alpha, color, 0.0);
+        }
     } else {
-        rt.blit_sub_screen_scaled(pg, t.sx, t.sy, t.sw, t.sh, dx, dy, out_w, out_h, alpha, 0xFFFFFF, 0.0);
+        rt.blit_sub_screen_scaled(pg, t.sx, t.sy, t.sw, t.sh, dx, dy, out_w, out_h, alpha, color, angle, pivot_x, pivot_y, true);
     }
 }
 
 // Draw a sprite stretched to exactly (w,h) with top-left at (x,y).
 static void draw_sprite_stretched_impl(Runtime& rt, double sprite, double subimg,
                                        double x, double y, double w, double h, double alpha) {
+    if (rt.gui_drawing && rt.gui_width > 0 && rt.gui_height > 0 && rt.screen) {
+        double gui_sx = (double)rt.screen->w / rt.gui_width;
+        double gui_sy = (double)rt.screen->h / rt.gui_height;
+        x *= gui_sx;
+        y *= gui_sy;
+        w *= gui_sx;
+        h *= gui_sy;
+    }
     int si = (int)sprite;
     if (si < 0 || si >= (int)rt.dw.sprites.size()) return;
     const Sprite& sp = rt.dw.sprites[si];
@@ -955,6 +1388,12 @@ static bool bbox_of(Runtime& rt, Instance* inst, double x, double y, double* bb)
 static bool overlap(const double* a, const double* b) {
     return !(a[2] < b[0] || a[0] > b[2] || a[3] < b[1] || a[1] > b[3]);
 }
+static bool match_target(const DataWin& dw, Instance* inst, int target) {
+    if (!inst) return false;
+    if (target == -1) return true; // all
+    if (target >= 100000) return (int)inst->iid == target;
+    return is_obj(dw, inst, target);
+}
 static double collision_rect(Runtime& rt, double x1, double y1, double x2, double y2, int target, bool notme) {
     if (x1 > x2) std::swap(x1, x2);
     if (y1 > y2) std::swap(y1, y2);
@@ -962,7 +1401,7 @@ static double collision_rect(Runtime& rt, double x1, double y1, double x2, doubl
     for (auto& ip : rt.instances) {
         if (!ip->alive) continue;
         if (notme && rt.cur && ip->iid == rt.cur->iid) continue;
-        if (!is_obj(rt.dw, ip.get(), target)) continue;
+        if (!match_target(rt.dw, ip.get(), target)) continue;
         double bb[4];
         if (bbox_of(rt, ip.get(), to_num(ip->vars.count("x")?ip->vars["x"]:Value(0.0)),
                     to_num(ip->vars.count("y")?ip->vars["y"]:Value(0.0)), bb) && overlap(rect, bb))
@@ -970,13 +1409,18 @@ static double collision_rect(Runtime& rt, double x1, double y1, double x2, doubl
     }
     return -4.0;
 }
-static double instance_place_impl(Runtime& rt, double x, double y, int target) {
+static double instance_place_impl(Runtime& rt, double x, double y, int target, bool solid_only = false) {
     if (!rt.cur) return -4.0;
     double me[4];
     if (!bbox_of(rt, rt.cur, x, y, me)) return -4.0;
     for (auto& ip : rt.instances) {
         if (!ip->alive || ip->iid == rt.cur->iid) continue;
-        if (!is_obj(rt.dw, ip.get(), target)) continue;
+        if (solid_only) {
+            bool is_solid = (ip->vars.count("solid") && to_num(ip->vars["solid"]) != 0) ||
+                            (ip->obj >= 0 && ip->obj < (int)rt.dw.objects.size() && rt.dw.objects[ip->obj].solid);
+            if (!is_solid) continue;
+        }
+        if (target != -1 && !match_target(rt.dw, ip.get(), target)) continue;
         double bb[4];
         if (bbox_of(rt, ip.get(), to_num(ip->vars.count("x")?ip->vars["x"]:Value(0.0)),
                     to_num(ip->vars.count("y")?ip->vars["y"]:Value(0.0)), bb) && overlap(me, bb))
@@ -985,12 +1429,28 @@ static double instance_place_impl(Runtime& rt, double x, double y, int target) {
     return -4.0;
 }
 
+std::string Runtime::resolve_path(const std::string& fn) const {
+    if (save_dir.empty() || fn.empty()) return fn;
+    if (fn.size() > 2 && (fn[1] == ':' || fn[0] == '/' || fn[0] == '\\')) return fn;
+    return save_dir + "/" + fn;
+}
+
 void Runtime::register_builtins() {
     builtins["draw_sprite"] = [](Runtime& rt, std::vector<Value>& a){
-        draw_sprite_impl(rt, narg(a,0), narg(a,1), narg(a,2), narg(a,3), 1, 1, 1); return vnum(0); };
+        draw_sprite_impl(rt, narg(a,0), narg(a,1), narg(a,2), narg(a,3), 1, 1, 1, 0.0, 0xFFFFFF); return vnum(0); };
     builtins["draw_sprite_ext"] = [](Runtime& rt, std::vector<Value>& a){
-        draw_sprite_impl(rt, narg(a,0), narg(a,1), narg(a,2), narg(a,3), narg(a,4), narg(a,5),
-                         a.size()>7?narg(a,7):1); return vnum(0); };
+        double spr = narg(a, 0);
+        double sub = narg(a, 1);
+        double x = narg(a, 2);
+        double y = narg(a, 3);
+        double xs = a.size() > 4 ? narg(a, 4) : 1.0;
+        double ys = a.size() > 5 ? narg(a, 5) : 1.0;
+        double rot = a.size() > 6 ? narg(a, 6) : 0.0;
+        uint32_t col = a.size() > 7 ? (uint32_t)narg(a, 7) : 0xFFFFFF;
+        double alpha = a.size() > 8 ? narg(a, 8) : 1.0;
+        draw_sprite_impl(rt, spr, sub, x, y, xs, ys, alpha, rot, col);
+        return vnum(0);
+    };
     builtins["draw_sprite_stretched"] = [](Runtime& rt, std::vector<Value>& a){
         draw_sprite_stretched_impl(rt, narg(a,0), narg(a,1), narg(a,2), narg(a,3), narg(a,4), narg(a,5), 1.0);
         return vnum(0); };
@@ -1006,7 +1466,9 @@ void Runtime::register_builtins() {
                          v.count("x")?to_num(v["x"]):0, v.count("y")?to_num(v["y"]):0,
                          v.count("image_xscale")?to_num(v["image_xscale"]):1,
                          v.count("image_yscale")?to_num(v["image_yscale"]):1,
-                         v.count("image_alpha")?to_num(v["image_alpha"]):1);
+                         v.count("image_alpha")?to_num(v["image_alpha"]):1,
+                         v.count("image_angle")?to_num(v["image_angle"]):0.0,
+                         v.count("image_blend")?(uint32_t)to_num(v["image_blend"]):0xFFFFFF);
         return vnum(0); };
     builtins["draw_set_color"] = [](Runtime& rt, std::vector<Value>& a){ rt.draw_color=(int)narg(a,0); return vnum(0); };
     builtins["draw_set_colour"] = builtins["draw_set_color"];
@@ -1032,6 +1494,15 @@ void Runtime::register_builtins() {
         if (xscale == 0.0) xscale = 1.0;
         if (yscale == 0.0) yscale = 1.0;
 
+        if (rt.gui_drawing && rt.gui_width > 0 && rt.gui_height > 0 && rt.screen) {
+            double gui_sx = (double)rt.screen->w / rt.gui_width;
+            double gui_sy = (double)rt.screen->h / rt.gui_height;
+            x0 *= gui_sx;
+            y0 *= gui_sy;
+            xscale *= gui_sx;
+            yscale *= gui_sy;
+        }
+
         int fi = rt.draw_font;
         if (fi < 0 && rt.dw.fonts.size() > 1) fi = 1;
         else if (fi < 0 && !rt.dw.fonts.empty()) fi = 0;
@@ -1051,9 +1522,17 @@ void Runtime::register_builtins() {
                         const Glyph& gl = g->second;
                         int g_sx = t.sx + gl.sx;
                         int g_sy = t.sy + gl.sy;
+                        auto subpixel_round = [](double val) -> int {
+                            double f = std::floor(val);
+                            double frac = val - f;
+                            if (frac <= 0.001) return (int)f;
+                            if (frac >= 0.999) return (int)f + 1;
+                            double prob = (frac <= 0.5) ? (frac * 1.55) : frac;
+                            return (int)f + (((double)std::rand() / RAND_MAX < prob) ? 1 : 0);
+                        };
                         if (gl.sw > 0 && gl.sh > 0 && g_sx + gl.sw <= pg.w && g_sy + gl.sh <= pg.h) {
-                            int base_dx = (int)std::lround(x + gl.offset * xscale) - rt.view_x;
-                            int base_dy = (int)std::lround(y) - rt.view_y;
+                            int base_dx = subpixel_round(x + gl.offset * xscale) - rt.view_x;
+                            int base_dy = subpixel_round(y) - rt.view_y;
                             if (!transformed) {
                                 rt.blit_sub_screen_tint(pg, g_sx, g_sy, gl.sw, gl.sh, base_dx, base_dy, alp, col);
                             } else {
@@ -1064,8 +1543,8 @@ void Runtime::register_builtins() {
                                 double ang = angle * 3.14159265358979 / 180.0;
                                 double rx = (base_dx + rt.view_x) - x0;
                                 double ry = (base_dy + rt.view_y) - y0;
-                                int gx = (int)std::lround(x0 + rx * std::cos(ang) - ry * std::sin(ang)) - rt.view_x;
-                                int gy = (int)std::lround(y0 + rx * std::sin(ang) + ry * std::cos(ang)) - rt.view_y;
+                                int gx = subpixel_round(x0 + rx * std::cos(ang) - ry * std::sin(ang)) - rt.view_x;
+                                int gy = subpixel_round(y0 + rx * std::sin(ang) + ry * std::cos(ang)) - rt.view_y;
                                 rt.blit_sub_screen_scaled(pg, g_sx, g_sy, gl.sw, gl.sh, gx, gy, ow, oh, alp, col, angle);
                             }
                         }
@@ -1139,6 +1618,19 @@ void Runtime::register_builtins() {
         auto& o = rt.dw.room_order; int pos=(int)(std::find(o.begin(),o.end(),rt.room_index)-o.begin());
         rt.pending_room = (pos>0) ? (int)o[pos-1] : -1; return vnum(0); };
     builtins["room_restart"] = [](Runtime& rt, std::vector<Value>&){ rt.pending_room=rt.room_index; return vnum(0); };
+    builtins["room_set_persistent"] = [](Runtime& rt, std::vector<Value>& a){
+        int ind = (int)narg(a, 0);
+        bool val = to_bool(narg(a, 1));
+        if (ind >= 0 && ind < (int)rt.dw.rooms.size()) {
+            rt.dw.rooms[ind].persistent = val;
+        }
+        if (ind == rt.room_index) {
+            rt.current_room_persistent = val;
+            rt.globals["room_persistent"] = Value(val ? 1.0 : 0.0);
+            if (!val) rt.persistent_rooms.erase(ind);
+        }
+        return vnum(0);
+    };
     builtins["game_end"] = [](Runtime& rt, std::vector<Value>&){ rt.running=false; return vnum(0); };
     builtins["game_restart"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
 
@@ -1289,7 +1781,90 @@ void Runtime::register_builtins() {
     builtins["io_clear"] = [](Runtime& rt, std::vector<Value>&){
         rt.keys_held.clear();
         rt.keys_pressed.clear();
+        rt.keys_released.clear();
+        rt.mouse_buttons_held.clear();
+        rt.mouse_buttons_pressed.clear();
+        rt.mouse_buttons_released.clear();
         return vnum(0);
+    };
+    // Mouse functions
+    builtins["mouse_check_button"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.empty()) return vnum(0);
+        int btn = (int)narg(a, 0);
+        if (btn == -1) return vnum(!rt.mouse_buttons_held.empty() ? 1.0 : 0.0);
+        if (btn == 0) return vnum(rt.mouse_buttons_held.empty() ? 1.0 : 0.0);
+        return vnum(rt.mouse_buttons_held.count(btn) ? 1.0 : 0.0);
+    };
+    builtins["mouse_check_button_pressed"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.empty()) return vnum(0);
+        int btn = (int)narg(a, 0);
+        if (btn == -1) return vnum(!rt.mouse_buttons_pressed.empty() ? 1.0 : 0.0);
+        if (btn == 0) return vnum(0.0);
+        return vnum(rt.mouse_buttons_pressed.count(btn) ? 1.0 : 0.0);
+    };
+    builtins["mouse_check_button_released"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.empty()) return vnum(0);
+        int btn = (int)narg(a, 0);
+        if (btn == -1) return vnum(!rt.mouse_buttons_released.empty() ? 1.0 : 0.0);
+        if (btn == 0) return vnum(0.0);
+        return vnum(rt.mouse_buttons_released.count(btn) ? 1.0 : 0.0);
+    };
+    builtins["mouse_clear"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.empty()) {
+            rt.mouse_buttons_held.clear();
+            rt.mouse_buttons_pressed.clear();
+            rt.mouse_buttons_released.clear();
+        } else {
+            int btn = (int)narg(a, 0);
+            rt.mouse_buttons_held.erase(btn);
+            rt.mouse_buttons_pressed.erase(btn);
+            rt.mouse_buttons_released.erase(btn);
+        }
+        return vnum(0);
+    };
+    builtins["mouse_wheel_up"] = [](Runtime& rt, std::vector<Value>&) -> Value {
+        return vnum(rt.mouse_wheel_delta > 0 ? 1.0 : 0.0);
+    };
+    builtins["mouse_wheel_down"] = [](Runtime& rt, std::vector<Value>&) -> Value {
+        return vnum(rt.mouse_wheel_delta < 0 ? 1.0 : 0.0);
+    };
+    builtins["window_mouse_get_x"] = [](Runtime& rt, std::vector<Value>&) -> Value {
+        return vnum(rt.mouse_x - rt.view_x);
+    };
+    builtins["window_mouse_get_y"] = [](Runtime& rt, std::vector<Value>&) -> Value {
+        return vnum(rt.mouse_y - rt.view_y);
+    };
+    builtins["window_mouse_set"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.size() >= 2) {
+            rt.mouse_x = (int)narg(a, 0) + rt.view_x;
+            rt.mouse_y = (int)narg(a, 1) + rt.view_y;
+        }
+        return vnum(0);
+    };
+    builtins["device_mouse_x"] = [](Runtime& rt, std::vector<Value>&) -> Value {
+        return vnum(rt.mouse_x);
+    };
+    builtins["device_mouse_y"] = [](Runtime& rt, std::vector<Value>&) -> Value {
+        return vnum(rt.mouse_y);
+    };
+    builtins["device_mouse_raw_x"] = builtins["window_mouse_get_x"];
+    builtins["device_mouse_raw_y"] = builtins["window_mouse_get_y"];
+    builtins["device_mouse_x_to_gui"] = builtins["window_mouse_get_x"];
+    builtins["device_mouse_y_to_gui"] = builtins["window_mouse_get_y"];
+    builtins["device_mouse_check_button"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.size() < 2) return vnum(0);
+        int btn = (int)narg(a, 1);
+        return vnum(rt.mouse_buttons_held.count(btn) ? 1.0 : 0.0);
+    };
+    builtins["device_mouse_check_button_pressed"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.size() < 2) return vnum(0);
+        int btn = (int)narg(a, 1);
+        return vnum(rt.mouse_buttons_pressed.count(btn) ? 1.0 : 0.0);
+    };
+    builtins["device_mouse_check_button_released"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.size() < 2) return vnum(0);
+        int btn = (int)narg(a, 1);
+        return vnum(rt.mouse_buttons_released.count(btn) ? 1.0 : 0.0);
     };
     builtins["keyboard_key_press"] = [](Runtime& rt, std::vector<Value>& a){
         if (!a.empty()) {
@@ -1427,8 +2002,57 @@ void Runtime::register_builtins() {
     builtins["is_bool"] = [](Runtime&, std::vector<Value>& a){
         if (a.empty()) return vnum(0);
         return vnum((a[0].is_num() && (a[0].num == 0.0 || a[0].num == 1.0)) ? 1.0 : 0.0); };
-    builtins["is_array"] = [](Runtime&, std::vector<Value>&){ return vnum(0.0); };
+    builtins["is_array"] = [](Runtime&, std::vector<Value>& a) -> Value {
+        if (a.empty()) return vnum(0.0);
+        return vnum((a[0].is_arr() && a[0].arrref) ? 1.0 : 0.0);
+    };
+    builtins["array_length_1d"] = [](Runtime&, std::vector<Value>& a) -> Value {
+        if (a.empty()) return vnum(0.0);
+        if (a[0].is_arr() && a[0].arrref) return vnum((double)a[0].arrref->size());
+        return vnum(0.0);
+    };
+    builtins["array_length"] = builtins["array_length_1d"];
+    builtins["array_height_2d"] = [](Runtime&, std::vector<Value>& a) -> Value {
+        if (a.empty()) return vnum(0.0);
+        if (a[0].is_arr() && a[0].arrref) {
+            size_t sz = a[0].arrref->size();
+            if (sz == 0) return vnum(0.0);
+            return vnum((double)((sz - 1) / 32000 + 1));
+        }
+        return vnum(0.0);
+    };
+    builtins["array_length_2d"] = [](Runtime&, std::vector<Value>& a) -> Value {
+        if (a.size() < 2) return vnum(0.0);
+        if (a[0].is_arr() && a[0].arrref) {
+            int row = (int)narg(a, 1);
+            if (row < 0) return vnum(0.0);
+            size_t start = (size_t)row * 32000;
+            size_t sz = a[0].arrref->size();
+            if (start >= sz) return vnum(0.0);
+            size_t end = std::min(start + 32000, sz);
+            return vnum((double)(end - start));
+        }
+        return vnum(0.0);
+    };
+    builtins["string_hash_to_newline"] = [](Runtime&, std::vector<Value>& a) -> Value {
+        if (a.empty()) return Value(std::string());
+        std::string s = to_str(a[0]);
+        std::string out;
+        out.reserve(s.size());
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == '\\' && i + 1 < s.size() && s[i + 1] == '#') {
+                out.push_back('#');
+                ++i;
+            } else if (s[i] == '#') {
+                out.push_back('\n');
+            } else {
+                out.push_back(s[i]);
+            }
+        }
+        return Value(out);
+    };
     builtins["is_method"] = [](Runtime&, std::vector<Value>&){ return vnum(0.0); };
+    builtins["method"] = [](Runtime&, std::vector<Value>& a) -> Value { return a.size() > 1 ? a[1] : (a.empty() ? vnum(0) : a[0]); };
 
     builtins["abs"] = [](Runtime&, std::vector<Value>& a){ return vnum(std::fabs(narg(a,0))); };
     builtins["sign"] = [](Runtime&, std::vector<Value>& a){ double v=narg(a,0); return vnum(v>0?1:(v<0?-1:0)); };
@@ -1471,13 +2095,17 @@ void Runtime::register_builtins() {
     builtins["collision_circle"] = [](Runtime& rt, std::vector<Value>& a){
         double r=narg(a,2); return vnum(collision_rect(rt,narg(a,0)-r,narg(a,1)-r,narg(a,0)+r,narg(a,1)+r,(int)narg(a,4),false)); };
     builtins["collision_line"] = [](Runtime& rt, std::vector<Value>& a){
-        return vnum(collision_rect(rt,narg(a,0),narg(a,1),narg(a,2),narg(a,3),(int)narg(a,4),false)); };
+        return vnum(collision_rect(rt, narg(a,0), narg(a,1), narg(a,2), narg(a,3), (int)narg(a,4), a.size()>6 ? (narg(a,6)!=0.0) : false)); };
     builtins["instance_place"] = [](Runtime& rt, std::vector<Value>& a){
         return vnum(instance_place_impl(rt,narg(a,0),narg(a,1),(int)narg(a,2))); };
     builtins["place_meeting"] = [](Runtime& rt, std::vector<Value>& a){
         return vnum(instance_place_impl(rt,narg(a,0),narg(a,1),(int)narg(a,2)) != -4.0 ? 1.0 : 0.0); };
     builtins["place_free"] = [](Runtime& rt, std::vector<Value>& a){
-        return vnum(instance_place_impl(rt,narg(a,0),narg(a,1),(int)narg(a,2)) != -4.0 ? 0.0 : 1.0); };
+        if (a.size() < 2) return vnum(1.0);
+        return vnum(instance_place_impl(rt, to_num(a[0]), to_num(a[1]), -1, true) != -4.0 ? 0.0 : 1.0); };
+    builtins["place_empty"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.size() < 2) return vnum(1.0);
+        return vnum(instance_place_impl(rt, to_num(a[0]), to_num(a[1]), -1, false) != -4.0 ? 0.0 : 1.0); };
     builtins["position_meeting"] = [](Runtime& rt, std::vector<Value>& a){
         int notme = rt.cur ? rt.cur->iid : -1;
         return vnum(collision_rect(rt,narg(a,0),narg(a,1),narg(a,0),narg(a,1),(int)narg(a,2),notme) != -4.0 ? 1.0 : 0.0); };
@@ -1989,8 +2617,52 @@ void Runtime::register_builtins() {
         }
         rt.current_ini_filename = fname;
         auto it = rt.ini_files.find(fname);
-        if (it != rt.ini_files.end()) rt.current_ini = it->second;
-        else rt.current_ini = IniFile{};
+        if (it != rt.ini_files.end()) {
+            rt.current_ini = it->second;
+        } else {
+            rt.current_ini = IniFile{};
+            std::string p = rt.resolve_path(fname);
+            FILE* fp = std::fopen(p.c_str(), "rb");
+            if (!fp && rt.save_dir.empty()) fp = std::fopen(fname.c_str(), "rb");
+            if (fp) {
+                std::fseek(fp, 0, SEEK_END);
+                long sz = std::ftell(fp);
+                std::fseek(fp, 0, SEEK_SET);
+                if (sz > 0) {
+                    std::string content(sz, '\0');
+                    size_t r = std::fread(&content[0], 1, sz, fp);
+                    content.resize(r);
+                    std::string current_sec = "";
+                    size_t pos = 0;
+                    while (pos < content.size()) {
+                        size_t next = content.find_first_of("\r\n", pos);
+                        std::string line = (next == std::string::npos) ? content.substr(pos) : content.substr(pos, next - pos);
+                        pos = (next == std::string::npos) ? content.size() : next + 1;
+                        if (pos < content.size() && content[pos-1] == '\r' && content[pos] == '\n') pos++;
+                        size_t first = line.find_first_not_of(" \t");
+                        if (first == std::string::npos) continue;
+                        size_t last = line.find_last_not_of(" \t");
+                        line = line.substr(first, last - first + 1);
+                        if (line.empty() || line[0] == ';' || line[0] == '#') continue;
+                        if (line.front() == '[' && line.back() == ']') {
+                            current_sec = line.substr(1, line.size() - 2);
+                        } else {
+                            size_t eq = line.find('=');
+                            if (eq != std::string::npos) {
+                                std::string key = line.substr(0, eq);
+                                std::string val = line.substr(eq + 1);
+                                size_t klast = key.find_last_not_of(" \t");
+                                if (klast != std::string::npos) key = key.substr(0, klast + 1);
+                                if (val.size() >= 2 && ((val.front() == '"' && val.back() == '"') || (val.front() == '\'' && val.back() == '\'')))
+                                    val = val.substr(1, val.size() - 2);
+                                rt.current_ini.sections[current_sec][key] = val;
+                            }
+                        }
+                    }
+                }
+                std::fclose(fp);
+            }
+        }
         rt.ini_is_open = true;
         return vnum(0);
     };
@@ -2041,6 +2713,12 @@ void Runtime::register_builtins() {
         }
         if (!rt.current_ini_filename.empty()) {
             rt.ini_files[rt.current_ini_filename] = rt.current_ini;
+            std::string p = rt.resolve_path(rt.current_ini_filename);
+            FILE* fp = std::fopen(p.c_str(), "wb");
+            if (fp) {
+                std::fwrite(out.data(), 1, out.size(), fp);
+                std::fclose(fp);
+            }
         }
         rt.current_ini = IniFile{};
         rt.current_ini_filename = "";
@@ -2137,26 +2815,31 @@ void Runtime::register_builtins() {
     };
 
     // ---- File I/O builtins ----
-    builtins["file_exists"] = [](Runtime&, std::vector<Value>& a){
+    builtins["file_exists"] = [](Runtime& rt, std::vector<Value>& a){
         if (a.empty()) return vnum(0);
         std::string fn = to_str(a[0]);
-        FILE* fp = std::fopen(fn.c_str(), "rb");
+        std::string p = rt.resolve_path(fn);
+        FILE* fp = std::fopen(p.c_str(), "rb");
+        if (!fp && rt.save_dir.empty()) fp = std::fopen(fn.c_str(), "rb");
         if (fp) {
             std::fclose(fp);
             return vnum(1.0);
         }
         return vnum(0.0);
     };
-    builtins["file_delete"] = [](Runtime&, std::vector<Value>& a){
+    builtins["file_delete"] = [](Runtime& rt, std::vector<Value>& a){
         if (a.empty()) return vnum(0);
         std::string fn = to_str(a[0]);
-        int rc = std::remove(fn.c_str());
+        int rc = std::remove(rt.resolve_path(fn).c_str());
+        if (rc != 0 && rt.save_dir.empty()) rc = std::remove(fn.c_str());
         return vnum(rc == 0 ? 1.0 : 0.0);
     };
     builtins["file_text_open_read"] = [](Runtime& rt, std::vector<Value>& a){
         if (a.empty()) return vnum(-1.0);
         std::string fn = to_str(a[0]);
-        FILE* fp = std::fopen(fn.c_str(), "rb");
+        std::string p = rt.resolve_path(fn);
+        FILE* fp = std::fopen(p.c_str(), "rb");
+        if (!fp && rt.save_dir.empty()) fp = std::fopen(fn.c_str(), "rb");
         if (!fp) return vnum(-1.0);
         std::fseek(fp, 0, SEEK_END);
         long sz = std::ftell(fp);
@@ -2177,7 +2860,9 @@ void Runtime::register_builtins() {
     builtins["file_text_open_write"] = [](Runtime& rt, std::vector<Value>& a){
         if (a.empty()) return vnum(-1.0);
         std::string fn = to_str(a[0]);
-        FILE* fp = std::fopen(fn.c_str(), "wb");
+        std::string p = rt.resolve_path(fn);
+        FILE* fp = std::fopen(p.c_str(), "wb");
+        if (!fp && rt.save_dir.empty()) fp = std::fopen(fn.c_str(), "wb");
         if (!fp) return vnum(-1.0);
         TextFile tf;
         tf.mode = TextFile::WRITE;
@@ -2189,7 +2874,9 @@ void Runtime::register_builtins() {
     builtins["file_text_open_append"] = [](Runtime& rt, std::vector<Value>& a){
         if (a.empty()) return vnum(-1.0);
         std::string fn = to_str(a[0]);
-        FILE* fp = std::fopen(fn.c_str(), "ab");
+        std::string p = rt.resolve_path(fn);
+        FILE* fp = std::fopen(p.c_str(), "ab");
+        if (!fp && rt.save_dir.empty()) fp = std::fopen(fn.c_str(), "ab");
         if (!fp) return vnum(-1.0);
         TextFile tf;
         tf.mode = TextFile::APPEND;
@@ -2351,8 +3038,15 @@ void Runtime::register_builtins() {
     };
     builtins["action_move_to"] = [](Runtime& rt, std::vector<Value>& a){
         if (rt.cur && a.size() >= 2) {
-            rt.cur->vars["x"] = a[0];
-            rt.cur->vars["y"] = a[1];
+            double dx = to_num(a[0]);
+            double dy = to_num(a[1]);
+            if (rt.action_relative) {
+                rt.cur->vars["x"] = vnum(to_num(rt.cur->vars["x"]) + dx);
+                rt.cur->vars["y"] = vnum(to_num(rt.cur->vars["y"]) + dy);
+            } else {
+                rt.cur->vars["x"] = vnum(dx);
+                rt.cur->vars["y"] = vnum(dy);
+            }
         }
         return vnum(0);
     };
@@ -2360,6 +3054,10 @@ void Runtime::register_builtins() {
         if (a.size() >= 3) {
             int obj = (int)to_num(a[0]);
             double x = to_num(a[1]), y = to_num(a[2]);
+            if (rt.action_relative && rt.cur) {
+                x += to_num(rt.cur->vars["x"]);
+                y += to_num(rt.cur->vars["y"]);
+            }
             std::vector<Value> ca = { vnum(x), vnum(y), vnum(obj) };
             return rt.call("instance_create", ca);
         }
@@ -2386,8 +3084,28 @@ void Runtime::register_builtins() {
     };
     builtins["action_move"] = [](Runtime& rt, std::vector<Value>& a){
         if (rt.cur && a.size() >= 2) {
-            rt.cur->vars["direction"] = a[0];
-            rt.cur->vars["speed"] = a[1];
+            double spd = to_num(a[1]);
+            double dir = 0.0;
+            std::string s = to_str(a[0]);
+            if (s.size() == 9) {
+                static const double dirs[9] = { 225.0, 270.0, 315.0, 180.0, -1.0, 0.0, 135.0, 90.0, 45.0 };
+                std::vector<int> valid;
+                for (int i = 0; i < 9; ++i) if (s[i] == '1') valid.push_back(i);
+                if (!valid.empty()) {
+                    int pick = valid[std::rand() % valid.size()];
+                    if (pick == 4) {
+                        spd = 0.0;
+                    } else {
+                        dir = dirs[pick];
+                    }
+                }
+            } else {
+                dir = to_num(a[0]);
+            }
+            rt.cur->vars["direction"] = Value(dir);
+            rt.cur->vars["speed"] = Value(spd);
+            rt.cur->vars["hspeed"] = Value(spd * std::cos(dir * 3.141592653589793 / 180.0));
+            rt.cur->vars["vspeed"] = Value(-spd * std::sin(dir * 3.141592653589793 / 180.0));
         }
         return vnum(0);
     };
@@ -2395,7 +3113,10 @@ void Runtime::register_builtins() {
         if (rt.cur && !a.empty()) rt.cur->vars["friction"] = a[0];
         return vnum(0);
     };
-    builtins["action_set_relative"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["action_set_relative"] = [](Runtime& rt, std::vector<Value>& a){
+        if (!a.empty()) rt.action_relative = to_bool(a[0]);
+        return vnum(0);
+    };
     builtins["action_move_point"] = [](Runtime& rt, std::vector<Value>& a){
         if (rt.cur && a.size() >= 3) {
             double tx = to_num(a[0]), ty = to_num(a[1]), spd = to_num(a[2]);
@@ -2417,16 +3138,184 @@ void Runtime::register_builtins() {
     builtins["action_previous_room"] = [](Runtime& rt, std::vector<Value>& a){
         return rt.call("room_goto_previous", a);
     };
+    builtins["action_another_room"] = [](Runtime& rt, std::vector<Value>& a){
+        return rt.call("room_goto", a);
+    };
+    builtins["action_sound"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.empty()) return vnum(0);
+        int sound_id = (int)narg(a, 0);
+        bool loop = a.size() > 1 ? to_bool(a[1]) : false;
+        rt.audio_register_clips();
+        rt.audio->play(sound_id, loop, 1.0, 0.0, 1.0, 1.0);
+        return vnum(0);
+    };
+    builtins["action_end_sound"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (!a.empty() && rt.audio) {
+            int sound_id = (int)narg(a, 0);
+            rt.audio->stop_asset(sound_id);
+            rt.audio->stop_handle(sound_id);
+        }
+        return vnum(0);
+    };
+    builtins["action_inherited"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        return rt.call("event_inherited", a);
+    };
+    builtins["action_next_room"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        return rt.call("room_goto_next", a);
+    };
+    builtins["action_restart_game"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        return rt.call("game_restart", a);
+    };
+    builtins["instance_change"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (!rt.cur || a.empty()) return vnum(0);
+        int new_obj = (int)narg(a, 0);
+        bool perf = a.size() > 1 ? to_bool(a[1]) : true;
+        if (new_obj < 0 || new_obj >= (int)rt.dw.objects.size()) return vnum(0);
+        if (perf) rt.run_event(rt.cur, 1, 0);
+        rt.cur->obj = new_obj;
+        rt.cur->vars["object_index"] = vnum(new_obj);
+        const auto& od = rt.dw.objects[new_obj];
+        if (od.sprite >= 0) rt.cur->vars["sprite_index"] = vnum(od.sprite);
+        if (od.mask >= 0) rt.cur->vars["mask_index"] = vnum(od.mask);
+        rt.cur->vars["solid"] = vnum(od.solid ? 1.0 : 0.0);
+        rt.cur->vars["visible"] = vnum(od.visible ? 1.0 : 0.0);
+        rt.cur->vars["persistent"] = vnum(od.persistent ? 1.0 : 0.0);
+        rt.cur->vars["depth"] = vnum(od.depth);
+        if (perf) rt.run_event(rt.cur, 0, 0);
+        return vnum(0);
+    };
+    builtins["action_change_object"] = [](Runtime& rt, std::vector<Value>& a) {
+        return rt.call("instance_change", a);
+    };
+    builtins["action_if_sound"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.empty() || !rt.audio) return vnum(0.0);
+        int snd = (int)narg(a, 0);
+        return vnum(rt.audio->is_playing(snd) ? 1.0 : 0.0);
+    };
+    builtins["action_if_variable"] = [](Runtime&, std::vector<Value>& a) -> Value {
+        if (a.size() < 3) return vnum(0.0);
+        int op = (int)to_num(a[2]);
+        bool res = false;
+        if (a[0].is_str() || a[1].is_str()) {
+            std::string s1 = to_str(a[0]), s2 = to_str(a[1]);
+            switch (op) {
+                case 0: res = (s1 == s2); break;
+                case 1: res = (s1 < s2); break;
+                case 2: res = (s1 > s2); break;
+                case 3: res = (s1 <= s2); break;
+                case 4: res = (s1 >= s2); break;
+                case 5: res = (s1 != s2); break;
+                default: res = (s1 == s2); break;
+            }
+        } else {
+            double v1 = to_num(a[0]), v2 = to_num(a[1]);
+            switch (op) {
+                case 0: res = (v1 == v2); break;
+                case 1: res = (v1 < v2); break;
+                case 2: res = (v1 > v2); break;
+                case 3: res = (v1 <= v2); break;
+                case 4: res = (v1 >= v2); break;
+                case 5: res = (v1 != v2); break;
+                default: res = (v1 == v2); break;
+            }
+        }
+        return vnum(res ? 1.0 : 0.0);
+    };
+    builtins["action_end_game"] = [](Runtime& rt, std::vector<Value>&){
+        rt.running = false;
+        return vnum(0);
+    };
+    builtins["action_current_room"] = [](Runtime& rt, std::vector<Value>&){
+        rt.pending_room = rt.room_index;
+        return vnum(0);
+    };
+    builtins["action_sprite_set"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (!rt.cur || a.empty()) return vnum(0);
+        rt.cur->vars["sprite_index"] = a[0];
+        if (a.size() > 1 && to_num(a[1]) >= 0) rt.cur->vars["image_index"] = a[1];
+        if (a.size() > 2) rt.cur->vars["image_speed"] = a[2];
+        return vnum(0);
+    };
+    builtins["action_move_start"] = [](Runtime& rt, std::vector<Value>& a){
+        return rt.call("action_set_motion", a);
+    };
+    builtins["action_if_object"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (!rt.cur || a.size() < 3) return vnum(0);
+        int obj = (int)to_num(a[0]);
+        double x = to_num(a[1]);
+        double y = to_num(a[2]);
+        double cur_x = to_num(rt.cur->vars["x"]);
+        double cur_y = to_num(rt.cur->vars["y"]);
+        double check_x = rt.action_relative ? (cur_x + x) : x;
+        double check_y = rt.action_relative ? (cur_y + y) : y;
+        std::vector<Value> pa = { vnum(check_x), vnum(check_y), vnum(obj) };
+        return rt.call("place_meeting", pa);
+    };
+    builtins["action_if_collision"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (!rt.cur || a.size() < 2) return vnum(0);
+        double x = to_num(a[0]);
+        double y = to_num(a[1]);
+        int solid_only = a.size() > 2 ? (int)to_num(a[2]) : 0;
+        double cur_x = to_num(rt.cur->vars["x"]);
+        double cur_y = to_num(rt.cur->vars["y"]);
+        double check_x = rt.action_relative ? (cur_x + x) : x;
+        double check_y = rt.action_relative ? (cur_y + y) : y;
+        std::vector<Value> pa = { vnum(check_x), vnum(check_y) };
+        Value free_res = (solid_only != 0) ? rt.call("place_free", pa) : rt.call("place_empty", pa);
+        return vnum(to_bool(free_res) ? 0.0 : 1.0);
+    };
+    builtins["action_if_empty"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (!rt.cur || a.size() < 2) return vnum(1.0);
+        double x = to_num(a[0]);
+        double y = to_num(a[1]);
+        int solid_only = a.size() > 2 ? (int)to_num(a[2]) : 0;
+        double cur_x = to_num(rt.cur->vars["x"]);
+        double cur_y = to_num(rt.cur->vars["y"]);
+        double check_x = rt.action_relative ? (cur_x + x) : x;
+        double check_y = rt.action_relative ? (cur_y + y) : y;
+        std::vector<Value> pa = { vnum(check_x), vnum(check_y) };
+        Value free_res = (solid_only != 0) ? rt.call("place_free", pa) : rt.call("place_empty", pa);
+        return free_res;
+    };
+    builtins["action_set_health"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (!a.empty()) rt.global_builtins["health"] = a[0];
+        return vnum(0);
+    };
+    builtins["action_if_health"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.size() < 2) return vnum(0.0);
+        double h = to_num(rt.global_builtins.count("health") ? rt.global_builtins["health"] : Value(100.0));
+        std::vector<Value> va = { vnum(h), a[0], a[1] };
+        return rt.call("action_if_variable", va);
+    };
 
     for (const char* n : {"ossafe_ini_open","ossafe_ini_close","randomize",
                           "application_surface_enable",
-                          "application_surface_draw_enable","display_set_gui_size","window_set_fullscreen",
+                          "application_surface_draw_enable","window_set_fullscreen",
                           "window_set_caption","texture_set_interpolation","draw_enable_alphablend",
                           "show_debug_message","show_message","screen_refresh","set_automatic_draw",
                           "instance_deactivate_all","instance_activate_all",
                           "file_rename","steam_initialised","steam_file_exists",
-                          "steam_file_delete","trophy_init"})
+                          "steam_file_delete","steam_get_achievement","steam_set_achievement",
+                          "steam_clear_achievement","trophy_init"})
         if (!builtins.count(n)) builtins[n] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+
+    builtins["display_set_gui_size"] = [](Runtime& rt, std::vector<Value>& a) {
+        if (a.size() >= 2) {
+            rt.gui_width = (int)to_num(a[0]);
+            rt.gui_height = (int)to_num(a[1]);
+        }
+        return vnum(0);
+    };
+    builtins["display_get_gui_width"] = [](Runtime& rt, std::vector<Value>&) {
+        if (rt.gui_width > 0) return vnum(rt.gui_width);
+        if (rt.screen) return vnum(rt.screen->w);
+        return vnum(320.0);
+    };
+    builtins["display_get_gui_height"] = [](Runtime& rt, std::vector<Value>&) {
+        if (rt.gui_height > 0) return vnum(rt.gui_height);
+        if (rt.screen) return vnum(rt.screen->h);
+        return vnum(240.0);
+    };
     builtins["surface_get_width"] = [](Runtime& rt, std::vector<Value>&){
         auto it = rt.global_arrays.find("view_wview");
         if (it != rt.global_arrays.end() && !it->second.empty() && to_num(it->second[0]) > 0)
@@ -2565,9 +3454,21 @@ void Runtime::register_builtins() {
 
     // ---- rooms / instances / ds ----
     builtins["room_next"] = [](Runtime& rt, std::vector<Value>& a){
-        int r = (int)narg(a,0) + 1; return vnum(r < (int)rt.dw.rooms.size() ? r : -1); };
-    builtins["room_previous"] = [](Runtime&, std::vector<Value>& a){
-        int r = (int)narg(a,0) - 1; return vnum(r >= 0 ? r : -1); };
+        if (a.empty()) return vnum(-1);
+        uint32_t r = (uint32_t)narg(a, 0);
+        const auto& o = rt.dw.room_order;
+        auto it = std::find(o.begin(), o.end(), r);
+        if (it != o.end() && it + 1 != o.end()) return vnum(*(it + 1));
+        return vnum(-1);
+    };
+    builtins["room_previous"] = [](Runtime& rt, std::vector<Value>& a){
+        if (a.empty()) return vnum(-1);
+        uint32_t r = (uint32_t)narg(a, 0);
+        const auto& o = rt.dw.room_order;
+        auto it = std::find(o.begin(), o.end(), r);
+        if (it != o.end() && it != o.begin()) return vnum(*(it - 1));
+        return vnum(-1);
+    };
     builtins["room_get_name"] = [](Runtime& rt, std::vector<Value>& a){
         int r = (int)narg(a,0); return Value(r >= 0 && r < (int)rt.dw.rooms.size() ? rt.dw.rooms[r].name : std::string("")); };
     builtins["sprite_exists"] = [](Runtime& rt, std::vector<Value>& a){
@@ -2587,6 +3488,84 @@ void Runtime::register_builtins() {
         return vnum(0); };
     builtins["window_get_width"] = [](Runtime&, std::vector<Value>&){ return vnum(320); };
     builtins["window_get_height"] = [](Runtime&, std::vector<Value>&){ return vnum(240); };
+    builtins["window_set_size"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["window_has_focus"] = [](Runtime&, std::vector<Value>&){ return vnum(1.0); };
+    builtins["window_set_colour"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["window_set_color"] = builtins["window_set_colour"];
+    builtins["gpu_set_ztestenable"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["gpu_set_zwriteenable"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["shader_get_uniform"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["shader_set"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["shader_reset"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["shader_set_uniform_f"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["shader_set_uniform_i"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["gamepad_set_colour"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["gamepad_set_color"] = builtins["gamepad_set_colour"];
+    builtins["http_get"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["xboxone_is_constrained"] = [](Runtime&, std::vector<Value>&){ return vnum(0.0); };
+
+    // Camera builtins (GMS2 / Minit)
+    builtins["view_get_camera"] = [](Runtime&, std::vector<Value>& a) -> Value {
+        return a.empty() ? vnum(0) : a[0];
+    };
+    builtins["view_set_camera"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["camera_create"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["camera_create_view"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["camera_get_view_x"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        int cam = a.empty() ? 0 : (int)narg(a, 0);
+        auto it = rt.global_arrays.find("view_xview");
+        if (it != rt.global_arrays.end() && cam >= 0 && cam < (int)it->second.size()) return it->second[cam];
+        return vnum(rt.view_x);
+    };
+    builtins["camera_get_view_y"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        int cam = a.empty() ? 0 : (int)narg(a, 0);
+        auto it = rt.global_arrays.find("view_yview");
+        if (it != rt.global_arrays.end() && cam >= 0 && cam < (int)it->second.size()) return it->second[cam];
+        return vnum(rt.view_y);
+    };
+    builtins["camera_get_view_width"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        int cam = a.empty() ? 0 : (int)narg(a, 0);
+        auto it = rt.global_arrays.find("view_wview");
+        if (it != rt.global_arrays.end() && cam >= 0 && cam < (int)it->second.size() && to_num(it->second[cam]) > 0)
+            return it->second[cam];
+        return vnum(320.0);
+    };
+    builtins["camera_get_view_height"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        int cam = a.empty() ? 0 : (int)narg(a, 0);
+        auto it = rt.global_arrays.find("view_hview");
+        if (it != rt.global_arrays.end() && cam >= 0 && cam < (int)it->second.size() && to_num(it->second[cam]) > 0)
+            return it->second[cam];
+        return vnum(240.0);
+    };
+    builtins["camera_set_view_pos"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.size() >= 3) {
+            int cam = (int)narg(a, 0);
+            double x = narg(a, 1), y = narg(a, 2);
+            auto& vx = rt.global_arrays["view_xview"];
+            auto& vy = rt.global_arrays["view_yview"];
+            if (cam >= 0) {
+                if (cam >= (int)vx.size()) vx.resize(cam + 1, Value(0.0));
+                if (cam >= (int)vy.size()) vy.resize(cam + 1, Value(0.0));
+                vx[cam] = vnum(x); vy[cam] = vnum(y);
+            }
+            if (cam == 0) { rt.view_x = (int)x; rt.view_y = (int)y; }
+        }
+        return vnum(0);
+    };
+    builtins["camera_set_view_size"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.size() >= 3) {
+            int cam = (int)narg(a, 0);
+            double w = narg(a, 1), h = narg(a, 2);
+            auto& vw = rt.global_arrays["view_wview"];
+            auto& vh = rt.global_arrays["view_hview"];
+            if (cam >= 0) {
+                if (cam >= (int)vw.size()) vw.resize(cam + 1, Value(0.0));
+                if (cam >= (int)vh.size()) vh.resize(cam + 1, Value(0.0));
+                vw[cam] = vnum(w); vh[cam] = vnum(h);
+            }
+        }
+        return vnum(0);
+    };
 
     // ---- drawing ----
     builtins["draw_background"] = [](Runtime& rt, std::vector<Value>& a){
@@ -2598,6 +3577,40 @@ void Runtime::register_builtins() {
         const Image& pg = rt.page(t.tex);
         if (pg.w <= 0 || t.sx + t.sw > pg.w || t.sy + t.sh > pg.h) return vnum(0);
         rt.blit_sub_screen(pg, t.sx, t.sy, t.sw, t.sh, (int)narg(a,1) + t.tx - rt.view_x, (int)narg(a,2) + t.ty - rt.view_y, rt.draw_alpha);
+        return vnum(0);
+    };
+    builtins["draw_background_part"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.size() < 7) return vnum(0);
+        int b = (int)narg(a, 0);
+        if (b < 0 || b >= (int)rt.dw.bgnds.size()) return vnum(0);
+        int tp = rt.dw.bgnds[b].tpag; if (tp < 0 || tp >= (int)rt.dw.tpags.size()) return vnum(0);
+        const Tpag& t = rt.dw.tpags[tp];
+        if (t.tex < 0 || t.tex >= (int)rt.dw.tex_ptrs.size()) return vnum(0);
+        const Image& pg = rt.page(t.tex);
+        if (pg.w <= 0) return vnum(0);
+        int l = (int)narg(a, 1), tt = (int)narg(a, 2), w = (int)narg(a, 3), h = (int)narg(a, 4);
+        int dx = (int)narg(a, 5), dy = (int)narg(a, 6);
+        rt.blit_sub_screen(pg, t.sx + l, t.sy + tt, w, h, dx - rt.view_x, dy - rt.view_y, rt.draw_alpha);
+        return vnum(0);
+    };
+    builtins["draw_background_part_ext"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.size() < 7) return vnum(0);
+        int b = (int)narg(a, 0);
+        if (b < 0 || b >= (int)rt.dw.bgnds.size()) return vnum(0);
+        int tp = rt.dw.bgnds[b].tpag; if (tp < 0 || tp >= (int)rt.dw.tpags.size()) return vnum(0);
+        const Tpag& t = rt.dw.tpags[tp];
+        if (t.tex < 0 || t.tex >= (int)rt.dw.tex_ptrs.size()) return vnum(0);
+        const Image& pg = rt.page(t.tex);
+        if (pg.w <= 0) return vnum(0);
+        int l = (int)narg(a, 1), tt = (int)narg(a, 2), w = (int)narg(a, 3), h = (int)narg(a, 4);
+        int dx = (int)narg(a, 5), dy = (int)narg(a, 6);
+        double xs = a.size() > 7 ? narg(a, 7) : 1.0;
+        double ys = a.size() > 8 ? narg(a, 8) : 1.0;
+        uint32_t col = a.size() > 9 ? (uint32_t)narg(a, 9) : 0xFFFFFF;
+        double alpha = a.size() > 10 ? narg(a, 10) * rt.draw_alpha : rt.draw_alpha;
+        int out_w = (int)std::lround(w * xs);
+        int out_h = (int)std::lround(h * ys);
+        rt.blit_sub_screen_scaled(pg, t.sx + l, t.sy + tt, w, h, dx - rt.view_x, dy - rt.view_y, out_w, out_h, alpha, col, 0.0);
         return vnum(0);
     };
     builtins["draw_sprite_part"] = [](Runtime& rt, std::vector<Value>& a){
@@ -2612,7 +3625,25 @@ void Runtime::register_builtins() {
         rt.blit_sub_screen(pg, t.sx + l, t.sy + tt, w, h, (int)narg(a,6) - rt.view_x, (int)narg(a,7) - rt.view_y, rt.draw_alpha);
         return vnum(0);
     };
-    builtins["draw_sprite_part_ext"] = builtins["draw_sprite_part"];
+    builtins["draw_sprite_part_ext"] = [](Runtime& rt, std::vector<Value>& a){
+        int si = (int)narg(a,0); if (si < 0 || si >= (int)rt.dw.sprites.size()) return vnum(0);
+        const Sprite& sp = rt.dw.sprites[si]; if (sp.frames.empty()) return vnum(0);
+        int n = (int)sp.frames.size(); int fi = (((int)narg(a,1)) % n + n) % n;
+        int tp = sp.frames[fi]; if (tp < 0 || tp >= (int)rt.dw.tpags.size()) return vnum(0);
+        const Tpag& t = rt.dw.tpags[tp];
+        if (t.tex < 0 || t.tex >= (int)rt.dw.tex_ptrs.size()) return vnum(0);
+        const Image& pg = rt.page(t.tex); if (pg.w <= 0) return vnum(0);
+        int l = (int)narg(a,2), tt = (int)narg(a,3), w = (int)narg(a,4), h = (int)narg(a,5);
+        int dx = (int)narg(a,6), dy = (int)narg(a,7);
+        double xs = a.size() > 8 ? narg(a,8) : 1.0;
+        double ys = a.size() > 9 ? narg(a,9) : 1.0;
+        uint32_t col = a.size() > 10 ? (uint32_t)narg(a,10) : 0xFFFFFF;
+        double alpha = a.size() > 11 ? narg(a,11) * rt.draw_alpha : rt.draw_alpha;
+        int out_w = (int)std::lround(w * xs);
+        int out_h = (int)std::lround(h * ys);
+        rt.blit_sub_screen_scaled(pg, t.sx + l, t.sy + tt, w, h, dx - rt.view_x, dy - rt.view_y, out_w, out_h, alpha, col, 0.0);
+        return vnum(0);
+    };
 
     // ================= AUDIO =================
     // Semantics: GameMaker Studio HTML5 runtime (Function_Sound.js +
@@ -2642,19 +3673,22 @@ void Runtime::register_builtins() {
     };
     builtins["audio_stop_sound"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
         rt.ensure_audio(); int id = (int)narg(a,0);
-        if (id >= kHandleBase) rt.audio->stop_handle(id); else rt.audio->stop_asset(id);
+        rt.audio->stop_handle(id);
+        rt.audio->stop_asset(id);
         return vnum(0);
     };
     builtins["audio_stop_all"] = [](Runtime& rt, std::vector<Value>&) -> Value {
         rt.ensure_audio(); rt.audio->stop_all(); return vnum(0); };
     builtins["audio_pause_sound"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
         rt.ensure_audio(); int id = (int)narg(a,0);
-        if (id >= kHandleBase) rt.audio->pause_handle(id); else rt.audio->pause_asset(id);
+        rt.audio->pause_handle(id);
+        rt.audio->pause_asset(id);
         return vnum(0);
     };
     builtins["audio_resume_sound"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
         rt.ensure_audio(); int id = (int)narg(a,0);
-        if (id >= kHandleBase) rt.audio->resume_handle(id); else rt.audio->resume_asset(id);
+        rt.audio->resume_handle(id);
+        rt.audio->resume_asset(id);
         return vnum(0);
     };
     builtins["audio_pause_all"] = [](Runtime& rt, std::vector<Value>&) -> Value {
@@ -2744,12 +3778,6 @@ void Runtime::register_builtins() {
         auto it = rt.caster_path_to_id.find(raw_name);
         if (it != rt.caster_path_to_id.end()) return vnum(it->second);
 
-        int s_idx = rt.dw.sound_index_by_name(raw_name);
-        if (s_idx >= 0) {
-            rt.caster_path_to_id[raw_name] = s_idx;
-            return vnum(s_idx);
-        }
-
         std::string base_dir = ".";
         size_t last_slash = rt.dw.filepath.find_last_of("/\\");
         if (last_slash != std::string::npos) {
@@ -2802,7 +3830,14 @@ void Runtime::register_builtins() {
             }
         }
 
-        if (file_bytes.empty()) return vnum(-1);
+        if (file_bytes.empty()) {
+            int s_idx = rt.dw.sound_index_by_name(raw_name);
+            if (s_idx >= 0) {
+                rt.caster_path_to_id[raw_name] = s_idx;
+                return vnum(s_idx);
+            }
+            return vnum(-1);
+        }
 
         AudioClip clip;
         if (!decode_audio(file_bytes.data(), file_bytes.size(), clip)) return vnum(-1);
@@ -2833,32 +3868,33 @@ void Runtime::register_builtins() {
         rt.ensure_audio();
         if (a.empty()) return vnum(0);
         int id = (int)narg(a, 0);
-        if (id >= kHandleBase) rt.audio->stop_handle(id);
-        else rt.audio->stop_asset(id);
+        rt.audio->stop_handle(id);
+        rt.audio->stop_asset(id);
         return vnum(0);
     };
     builtins["caster_pause"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
         rt.ensure_audio();
         if (a.empty()) return vnum(0);
         int id = (int)narg(a, 0);
-        if (id >= kHandleBase) rt.audio->pause_handle(id);
-        else rt.audio->pause_asset(id);
+        rt.audio->pause_handle(id);
+        rt.audio->pause_asset(id);
         return vnum(0);
     };
     builtins["caster_resume"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
         rt.ensure_audio();
         if (a.empty()) return vnum(0);
         int id = (int)narg(a, 0);
-        if (id >= kHandleBase) rt.audio->resume_handle(id);
-        else rt.audio->resume_asset(id);
+        rt.audio->resume_handle(id);
+        rt.audio->resume_asset(id);
         return vnum(0);
     };
     builtins["caster_free"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
         rt.ensure_audio();
         if (!a.empty()) {
             int id = (int)narg(a, 0);
-            if (id >= kHandleBase) rt.audio->stop_handle(id);
-            else rt.audio->stop_asset(id);
+            rt.audio->stop_handle(id);
+            rt.audio->stop_asset(id);
+            rt.audio->set_clip(id, nullptr);
         }
         return vnum(0);
     };
@@ -2867,8 +3903,8 @@ void Runtime::register_builtins() {
         if (a.size() >= 2) {
             int id = (int)narg(a, 0);
             double v = narg(a, 1);
-            if (id >= kHandleBase) rt.audio->set_gain_handle(id, v);
-            else rt.audio->set_gain_asset(id, v);
+            rt.audio->set_gain_handle(id, v);
+            rt.audio->set_gain_asset(id, v);
         }
         return vnum(0);
     };
@@ -2876,15 +3912,17 @@ void Runtime::register_builtins() {
         rt.ensure_audio();
         if (a.empty()) return vnum(0);
         int id = (int)narg(a, 0);
-        return vnum(id >= kHandleBase ? rt.audio->get_gain_handle(id) : rt.audio->get_gain_asset(id));
+        double g = rt.audio->get_gain_handle(id);
+        if (g == 0.0) g = rt.audio->get_gain_asset(id);
+        return vnum(g);
     };
     builtins["caster_set_pitch"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
         rt.ensure_audio();
         if (a.size() >= 2) {
             int id = (int)narg(a, 0);
             double p = narg(a, 1);
-            if (id >= kHandleBase) rt.audio->set_pitch_handle(id, p);
-            else rt.audio->set_pitch_asset(id, p);
+            rt.audio->set_pitch_handle(id, p);
+            rt.audio->set_pitch_asset(id, p);
         }
         return vnum(0);
     };
@@ -2892,7 +3930,9 @@ void Runtime::register_builtins() {
         rt.ensure_audio();
         if (a.empty()) return vnum(1);
         int id = (int)narg(a, 0);
-        return vnum(id >= kHandleBase ? rt.audio->get_pitch_handle(id) : rt.audio->get_pitch_asset(id));
+        double p = rt.audio->get_pitch_handle(id);
+        if (p <= 0.0) p = rt.audio->get_pitch_asset(id);
+        return vnum(p > 0.0 ? p : 1.0);
     };
     builtins["caster_set_panning"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
     builtins["caster_is_playing"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
@@ -3012,6 +4052,54 @@ void Runtime::register_builtins() {
         }
         return vnum(0);
     };
+    builtins["draw_surface_stretched"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.size() >= 5) {
+            int id = (int)narg(a, 0);
+            int dx = (int)narg(a, 1);
+            int dy = (int)narg(a, 2);
+            int dw = (int)narg(a, 3);
+            int dh = (int)narg(a, 4);
+            auto it = rt.surfaces.find(id);
+            if (it != rt.surfaces.end() && it->second.img.w > 0 && it->second.img.h > 0) {
+                rt.blit_sub_screen_scaled(it->second.img, 0, 0, it->second.img.w, it->second.img.h,
+                                          dx - rt.view_x, dy - rt.view_y, dw, dh,
+                                          rt.draw_alpha, 0xFFFFFF, 0.0);
+            }
+        }
+        return vnum(0);
+    };
+    builtins["draw_surface_stretched_ext"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.size() >= 5) {
+            int id = (int)narg(a, 0);
+            int dx = (int)narg(a, 1);
+            int dy = (int)narg(a, 2);
+            int dw = (int)narg(a, 3);
+            int dh = (int)narg(a, 4);
+            uint32_t col = a.size() > 5 ? (uint32_t)narg(a, 5) : 0xFFFFFF;
+            double alpha = a.size() > 6 ? narg(a, 6) : 1.0;
+            auto it = rt.surfaces.find(id);
+            if (it != rt.surfaces.end() && it->second.img.w > 0 && it->second.img.h > 0) {
+                rt.blit_sub_screen_scaled(it->second.img, 0, 0, it->second.img.w, it->second.img.h,
+                                          dx - rt.view_x, dy - rt.view_y, dw, dh,
+                                          alpha, col, 0.0);
+            }
+        }
+        return vnum(0);
+    };
+    builtins["surface_resize"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.size() >= 3) {
+            int id = (int)narg(a, 0);
+            int w = (int)narg(a, 1);
+            int h = (int)narg(a, 2);
+            if (w > 0 && h > 0) {
+                auto& s = rt.surfaces[id];
+                s.img.w = w;
+                s.img.h = h;
+                s.img.rgba.assign((size_t)w * h * 4, 0);
+            }
+        }
+        return vnum(0);
+    };
     builtins["draw_clear"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
         if (rt.screen && !a.empty()) {
             uint32_t col = (uint32_t)narg(a, 0);
@@ -3040,8 +4128,15 @@ void Runtime::register_builtins() {
     builtins["draw_rectangle"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
         if (a.size() >= 4) {
             bool outline = a.size() > 4 ? to_bool(a[4]) : false;
-            draw_rect_on_image(rt.screen, (int)narg(a, 0) - rt.view_x, (int)narg(a, 1) - rt.view_y,
-                               (int)narg(a, 2) - rt.view_x, (int)narg(a, 3) - rt.view_y,
+            double x1 = to_num(a[0]), y1 = to_num(a[1]);
+            double x2 = to_num(a[2]), y2 = to_num(a[3]);
+            if (rt.gui_drawing && rt.gui_width > 0 && rt.gui_height > 0 && rt.screen) {
+                double gui_sx = (double)rt.screen->w / rt.gui_width;
+                double gui_sy = (double)rt.screen->h / rt.gui_height;
+                x1 *= gui_sx; y1 *= gui_sy; x2 *= gui_sx; y2 *= gui_sy;
+            }
+            draw_rect_on_image(rt.screen, (int)std::lround(x1) - rt.view_x, (int)std::lround(y1) - rt.view_y,
+                               (int)std::lround(x2) - rt.view_x, (int)std::lround(y2) - rt.view_y,
                                (uint32_t)rt.draw_color, rt.draw_alpha, outline);
         }
         return vnum(0);
@@ -3050,8 +4145,15 @@ void Runtime::register_builtins() {
         if (a.size() >= 4) {
             uint32_t c1 = a.size() > 4 ? (uint32_t)narg(a, 4) : (uint32_t)rt.draw_color;
             bool outline = a.size() > 8 ? to_bool(a[8]) : false;
-            draw_rect_on_image(rt.screen, (int)narg(a, 0) - rt.view_x, (int)narg(a, 1) - rt.view_y,
-                               (int)narg(a, 2) - rt.view_x, (int)narg(a, 3) - rt.view_y,
+            double x1 = to_num(a[0]), y1 = to_num(a[1]);
+            double x2 = to_num(a[2]), y2 = to_num(a[3]);
+            if (rt.gui_drawing && rt.gui_width > 0 && rt.gui_height > 0 && rt.screen) {
+                double gui_sx = (double)rt.screen->w / rt.gui_width;
+                double gui_sy = (double)rt.screen->h / rt.gui_height;
+                x1 *= gui_sx; y1 *= gui_sy; x2 *= gui_sx; y2 *= gui_sy;
+            }
+            draw_rect_on_image(rt.screen, (int)std::lround(x1) - rt.view_x, (int)std::lround(y1) - rt.view_y,
+                               (int)std::lround(x2) - rt.view_x, (int)std::lround(y2) - rt.view_y,
                                c1, rt.draw_alpha, outline);
         }
         return vnum(0);
@@ -3059,8 +4161,15 @@ void Runtime::register_builtins() {
     builtins["draw_rectangle_color"] = builtins["draw_rectangle_colour"];
     builtins["draw_line"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
         if (a.size() >= 4) {
-            draw_line_on_image(rt.screen, (int)narg(a, 0) - rt.view_x, (int)narg(a, 1) - rt.view_y,
-                               (int)narg(a, 2) - rt.view_x, (int)narg(a, 3) - rt.view_y,
+            double x1 = to_num(a[0]), y1 = to_num(a[1]);
+            double x2 = to_num(a[2]), y2 = to_num(a[3]);
+            if (rt.gui_drawing && rt.gui_width > 0 && rt.gui_height > 0 && rt.screen) {
+                double gui_sx = (double)rt.screen->w / rt.gui_width;
+                double gui_sy = (double)rt.screen->h / rt.gui_height;
+                x1 *= gui_sx; y1 *= gui_sy; x2 *= gui_sx; y2 *= gui_sy;
+            }
+            draw_line_on_image(rt.screen, (int)std::lround(x1) - rt.view_x, (int)std::lround(y1) - rt.view_y,
+                               (int)std::lround(x2) - rt.view_x, (int)std::lround(y2) - rt.view_y,
                                (uint32_t)rt.draw_color, rt.draw_alpha);
         }
         return vnum(0);
@@ -3076,16 +4185,119 @@ void Runtime::register_builtins() {
     builtins["draw_set_blend_mode_ext"] = builtins["draw_set_blend_mode"];
     builtins["draw_get_blend_mode"] = [](Runtime& rt, std::vector<Value>&){ return vnum(rt.draw_blend_mode); };
 
+    // Path builtins
+    builtins["path_start"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        Instance* inst = rt.cur;
+        if (!inst || a.empty()) return vnum(0);
+        int path_idx = (int)narg(a, 0);
+        double spd = (a.size() > 1) ? narg(a, 1) : 1.0;
+        int endaction = (a.size() > 2) ? (int)narg(a, 2) : 0;
+        bool absolute = (a.size() > 3) ? to_bool(a[3]) : true;
+
+        if (path_idx < 0 || path_idx >= (int)rt.dw.paths.size()) {
+            inst->path_index = -1;
+            inst->vars["path_index"] = vnum(-1);
+            return vnum(0);
+        }
+
+        const auto& path = rt.dw.paths[path_idx];
+        inst->path_index = path_idx;
+        inst->path_speed = spd;
+        inst->path_endaction = endaction;
+        inst->path_absolute = absolute;
+        inst->path_position = (spd >= 0.0) ? 0.0 : 1.0;
+        inst->path_scale = 1.0;
+        inst->path_orientation = 0.0;
+
+        double cur_x = inst->vars.count("x") ? to_num(inst->vars["x"]) : 0.0;
+        double cur_y = inst->vars.count("y") ? to_num(inst->vars["y"]) : 0.0;
+
+        if (!path.points.empty()) {
+            if (absolute) {
+                inst->path_start_x = 0.0;
+                inst->path_start_y = 0.0;
+            } else {
+                inst->path_start_x = cur_x - path.points[0].x;
+                inst->path_start_y = cur_y - path.points[0].y;
+            }
+            double nx, ny, nspd;
+            rt.get_path_point(path, inst->path_position, nx, ny, nspd);
+            if (absolute) {
+                inst->vars["x"] = vnum(nx);
+                inst->vars["y"] = vnum(ny);
+            } else {
+                inst->vars["x"] = vnum(inst->path_start_x + nx);
+                inst->vars["y"] = vnum(inst->path_start_y + ny);
+            }
+        }
+        inst->vars["path_index"] = vnum(path_idx);
+        inst->vars["path_speed"] = vnum(spd);
+        inst->vars["path_position"] = vnum(inst->path_position);
+        inst->vars["path_endaction"] = vnum(endaction);
+        inst->vars["path_scale"] = vnum(1.0);
+        inst->vars["path_orientation"] = vnum(0.0);
+        return vnum(0);
+    };
+
+    builtins["path_end"] = [](Runtime& rt, std::vector<Value>&) -> Value {
+        Instance* inst = rt.cur;
+        if (!inst) return vnum(0);
+        inst->path_index = -1;
+        inst->path_speed = 0.0;
+        inst->vars["path_index"] = vnum(-1);
+        inst->vars["path_speed"] = vnum(0.0);
+        return vnum(0);
+    };
+
+    builtins["path_get_length"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        int idx = (int)narg(a, 0);
+        if (idx >= 0 && idx < (int)rt.dw.paths.size()) return vnum(rt.dw.paths[idx].total_length);
+        return vnum(0);
+    };
+    builtins["path_get_point_x"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        int idx = (int)narg(a, 0); int pt = (int)narg(a, 1);
+        if (idx >= 0 && idx < (int)rt.dw.paths.size() && pt >= 0 && pt < (int)rt.dw.paths[idx].points.size())
+            return vnum(rt.dw.paths[idx].points[pt].x);
+        return vnum(0);
+    };
+    builtins["path_get_point_y"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        int idx = (int)narg(a, 0); int pt = (int)narg(a, 1);
+        if (idx >= 0 && idx < (int)rt.dw.paths.size() && pt >= 0 && pt < (int)rt.dw.paths[idx].points.size())
+            return vnum(rt.dw.paths[idx].points[pt].y);
+        return vnum(0);
+    };
+    builtins["path_get_point_speed"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        int idx = (int)narg(a, 0); int pt = (int)narg(a, 1);
+        if (idx >= 0 && idx < (int)rt.dw.paths.size() && pt >= 0 && pt < (int)rt.dw.paths[idx].points.size())
+            return vnum(rt.dw.paths[idx].points[pt].speed);
+        return vnum(100);
+    };
+    builtins["path_get_number"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        int idx = (int)narg(a, 0);
+        if (idx >= 0 && idx < (int)rt.dw.paths.size()) return vnum(rt.dw.paths[idx].points.size());
+        return vnum(0);
+    };
+    builtins["path_get_closed"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        int idx = (int)narg(a, 0);
+        if (idx >= 0 && idx < (int)rt.dw.paths.size()) return vnum(rt.dw.paths[idx].closed ? 1 : 0);
+        return vnum(0);
+    };
+    builtins["path_get_name"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        int idx = (int)narg(a, 0);
+        if (idx >= 0 && idx < (int)rt.dw.paths.size()) return Value(rt.dw.paths[idx].name);
+        return Value(std::string(""));
+    };
+
     // ---- harmless stubs (no 3DS equivalent / not needed yet) ----
     for (const char* n : {"ini_write_real","ini_write_string","ini_open_from_string","sprite_replace","sprite_delete",
-        "sprite_create_from_surface","sprite_collision_mask","path_start","path_end","tile_layer_shift","tile_layer_hide",
+        "sprite_create_from_surface","sprite_collision_mask","tile_layer_shift","tile_layer_hide",
         "tile_layer_show","move_snap","draw_line_width","draw_line_width_color","draw_line_color","draw_set_circle_precision",
         "draw_ellipse_color","draw_triangle","draw_triangle_color","draw_roundrect","draw_point_color","draw_clear_alpha",
         "draw_background_part_ext","draw_background_stretched","draw_surface","draw_surface_ext",
         "window_set_position","window_center","steam_file_write_file",
         "surface_set_target","surface_reset_target","surface_free",
         "buffer_async_group_option","buffer_async_group_begin","buffer_async_group_end","buffer_write","buffer_save_async",
-        "buffer_load_async","buffer_delete","instance_change","instance_activate_object","room_set_persistent",
+        "buffer_load_async","buffer_delete","instance_activate_object",
         "get_string_async",
         "joystick_check_button","joystick_has_pov","gamepad_axis_value","extension_stubfunc_real","ds_map_set_post"})
         if (!builtins.count(n)) builtins[n] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
@@ -3176,31 +4388,51 @@ void Runtime::start_room(int index, std::vector<std::unique_ptr<Instance>> keep)
         vv[0] = vnum(1.0);
     }
 
-    for (const auto& ri : room.instances) {
-        if (ri.obj < 0 || ri.obj >= (int)dw.objects.size()) continue;
-        auto inst = std::make_unique<Instance>(ri.iid, ri.obj);
-        inst->vars["x"] = vnum(ri.x); inst->vars["y"] = vnum(ri.y);
-        inst->vars["xstart"] = vnum(ri.x); inst->vars["ystart"] = vnum(ri.y);
-        inst->vars["image_xscale"] = vnum(ri.scale_x);
-        inst->vars["image_yscale"] = vnum(ri.scale_y);
-        inst->vars["image_angle"] = vnum(-ri.rotation);
-        inst->vars["sprite_index"] = vnum(dw.objects[ri.obj].sprite);
-        inst->vars["depth"] = vnum(dw.objects[ri.obj].depth);
-        inst->vars["visible"] = vnum(dw.objects[ri.obj].visible ? 1 : 0);
-        inst->vars["solid"] = vnum(dw.objects[ri.obj].solid ? 1 : 0);
-        inst->vars["persistent"] = vnum(dw.objects[ri.obj].persistent ? 1 : 0);
-        inst->vars["object_index"] = vnum(ri.obj);
-        inst->vars["id"] = vnum(ri.iid);
-        instances.push_back(std::move(inst));
-        Instance* ip = instances.back().get();
-        if (ri.creation_code >= 0 && ri.creation_code < (int)dw.code.size()) {
-            std::vector<Value> noargs; run_entry(&dw.code[ri.creation_code], noargs, ip, ip);
+    auto it_pers = persistent_rooms.find(index);
+    if (it_pers != persistent_rooms.end()) {
+        current_room_persistent = true;
+        for (auto& inst : it_pers->second) {
+            if (inst && inst->alive) instances.push_back(std::move(inst));
         }
-        run_event(ip, 0, 0);
-    }
-    if (room.creation_code >= 0 && room.creation_code < (int)dw.code.size() && !instances.empty()) {
-        std::vector<Value> noargs;
-        run_entry(&dw.code[room.creation_code], noargs, instances[0].get(), instances[0].get());
+        persistent_rooms.erase(it_pers);
+    } else {
+        current_room_persistent = room.persistent;
+        std::vector<std::pair<Instance*, int>> initial_new;
+        for (const auto& ri : room.instances) {
+            if (ri.obj < 0 || ri.obj >= (int)dw.objects.size()) continue;
+            auto inst = std::make_unique<Instance>(ri.iid, ri.obj);
+            inst->vars["x"] = vnum(ri.x); inst->vars["y"] = vnum(ri.y);
+            inst->vars["xstart"] = vnum(ri.x); inst->vars["ystart"] = vnum(ri.y);
+            inst->vars["image_xscale"] = vnum(ri.scale_x);
+            inst->vars["image_yscale"] = vnum(ri.scale_y);
+            inst->vars["image_angle"] = vnum(-ri.rotation);
+            inst->vars["sprite_index"] = vnum(dw.objects[ri.obj].sprite);
+            inst->vars["depth"] = vnum(dw.objects[ri.obj].depth);
+            inst->vars["visible"] = vnum(dw.objects[ri.obj].visible ? 1 : 0);
+            inst->vars["solid"] = vnum(dw.objects[ri.obj].solid ? 1 : 0);
+            inst->vars["persistent"] = vnum(dw.objects[ri.obj].persistent ? 1 : 0);
+            inst->vars["object_index"] = vnum(ri.obj);
+            inst->vars["id"] = vnum(ri.iid);
+            if ((int)ri.iid >= next_iid) next_iid = (int)ri.iid + 1;
+            Instance* ip = inst.get();
+            instances.push_back(std::move(inst));
+            initial_new.push_back({ip, ri.creation_code});
+        }
+        for (auto& item : initial_new) {
+            Instance* ip = item.first;
+            int cc = item.second;
+            if (ip && ip->alive) {
+                run_event(ip, 0, 0);
+                if (cc >= 0 && cc < (int)dw.code.size() && ip->alive) {
+                    std::vector<Value> noargs;
+                    run_entry(&dw.code[cc], noargs, ip, ip);
+                }
+            }
+        }
+        if (room.creation_code >= 0 && room.creation_code < (int)dw.code.size() && !instances.empty()) {
+            std::vector<Value> noargs;
+            run_entry(&dw.code[room.creation_code], noargs, instances[0].get(), instances[0].get());
+        }
     }
     static bool booted = false;
     if (!booted) {
@@ -3215,25 +4447,35 @@ void Runtime::start_room(int index, std::vector<std::unique_ptr<Instance>> keep)
     for (size_t i = 0; i < instances.size(); ++i)
         if (instances[i]->alive) run_event(instances[i].get(), 7, 4);
     globals["room"] = vnum(index);
+    globals["room_persistent"] = vnum(current_room_persistent ? 1.0 : 0.0);
     global_builtins["current_time"] = globals.count("__t") ? globals["__t"] : Value(0.0);
+    update_camera();
 }
 
 void Runtime::change_room(int index) {
     page_cache.clear();
     page_lru.clear();
-#if defined(_3DS) || defined(__arm__)
+#if (defined(_3DS) || defined(__arm__) || defined(__linux__)) && !defined(_WIN32)
     malloc_trim(0);
 #endif
     for (size_t i = 0; i < instances.size(); ++i)
         if (instances[i]->alive) run_event(instances[i].get(), 7, 5);
     if (index < 0 || index >= (int)dw.rooms.size()) { running = false; return; }
     std::vector<std::unique_ptr<Instance>> keep;
+    std::vector<std::unique_ptr<Instance>> room_saved;
     for (auto& i : instances) {
         if (!i || !i->alive) continue;
         bool pers = dw.objects[i->obj].persistent;
         if (i->vars.count("persistent")) pers = to_bool(i->vars["persistent"]);
         if (pers) keep.push_back(std::move(i));
+        else if (current_room_persistent) room_saved.push_back(std::move(i));
     }
+    if (current_room_persistent && room_index >= 0) {
+        persistent_rooms[room_index] = std::move(room_saved);
+    } else if (room_index >= 0) {
+        persistent_rooms.erase(room_index);
+    }
+    instances.clear();
     start_room(index, std::move(keep));
 }
 
@@ -3241,6 +4483,16 @@ void Runtime::step() {
     frame_count++;
     double ms = frame_count * (1000.0 / std::max(1, (int)(dw.rooms[room_index].speed ? dw.rooms[room_index].speed : 60)));
     global_builtins["current_time"] = vnum(ms);
+
+    // Record xprevious / yprevious at the beginning of the frame BEFORE step events
+    for (size_t j = 0; j < instances.size(); ++j) {
+        Instance* inst = instances[j].get();
+        if (!inst || !inst->alive) continue;
+        auto& v = inst->vars;
+        v["xprevious"] = v.count("x") ? v["x"] : Value(0.0);
+        v["yprevious"] = v.count("y") ? v["y"] : Value(0.0);
+    }
+
     // alarms
     for (size_t j = 0; j < instances.size(); ++j) {
         Instance* inst = instances[j].get();
@@ -3256,11 +4508,85 @@ void Runtime::step() {
             }
         }
     }
-    for (int sub : {1, 0}) {
+    // Begin step (subtype 1)
+    {
         size_t n = instances.size();
         for (size_t j = 0; j < n && j < instances.size(); ++j) {
             Instance* inst = instances[j].get();
-            if (inst && inst->alive) run_event(inst, 3, sub);
+            if (inst && inst->alive) run_event(inst, 3, 1);
+        }
+    }
+
+    // Keyboard & Mouse events
+    for (size_t j = 0; j < instances.size(); ++j) {
+        Instance* inst = instances[j].get();
+        if (!inst || !inst->alive) continue;
+        const ObjDef& obj = dw.objects[inst->obj];
+
+        if (obj.events.count(9)) {
+            for (int k : keys_pressed) run_event(inst, 9, k);
+        }
+        if (obj.events.count(5)) {
+            for (int k : keys_held) run_event(inst, 5, k);
+        }
+        if (obj.events.count(10)) {
+            for (int k : keys_released) run_event(inst, 10, k);
+        }
+
+        auto m_it = obj.events.find(6);
+        if (m_it != obj.events.end() && !m_it->second.empty()) {
+            double bb[4];
+            bool inside = bbox_of(*this, inst, to_num(inst->vars.count("x")?inst->vars["x"]:Value(0.0)),
+                                  to_num(inst->vars.count("y")?inst->vars["y"]:Value(0.0)), bb)
+                          && (mouse_x >= bb[0] && mouse_x <= bb[2] && mouse_y >= bb[1] && mouse_y <= bb[3]);
+
+            if (mouse_buttons_pressed.count(1)) {
+                if (inside) run_event(inst, 6, 4);
+                run_event(inst, 6, 53);
+            }
+            if (mouse_buttons_held.count(1)) {
+                if (inside) run_event(inst, 6, 0);
+                run_event(inst, 6, 50);
+            }
+            if (mouse_buttons_released.count(1)) {
+                if (inside) run_event(inst, 6, 7);
+                run_event(inst, 6, 56);
+            }
+            if (mouse_buttons_pressed.count(2)) {
+                if (inside) run_event(inst, 6, 5);
+                run_event(inst, 6, 54);
+            }
+            if (mouse_buttons_held.count(2)) {
+                if (inside) run_event(inst, 6, 1);
+                run_event(inst, 6, 51);
+            }
+            if (mouse_buttons_released.count(2)) {
+                if (inside) run_event(inst, 6, 8);
+                run_event(inst, 6, 57);
+            }
+            if (mouse_buttons_pressed.count(3)) {
+                if (inside) run_event(inst, 6, 6);
+                run_event(inst, 6, 55);
+            }
+            if (mouse_buttons_held.count(3)) {
+                if (inside) run_event(inst, 6, 2);
+                run_event(inst, 6, 52);
+            }
+            if (mouse_buttons_released.count(3)) {
+                if (inside) run_event(inst, 6, 9);
+                run_event(inst, 6, 58);
+            }
+            if (mouse_wheel_delta > 0) run_event(inst, 6, 60);
+            else if (mouse_wheel_delta < 0) run_event(inst, 6, 61);
+        }
+    }
+
+    // Step (subtype 0)
+    {
+        size_t n = instances.size();
+        for (size_t j = 0; j < n && j < instances.size(); ++j) {
+            Instance* inst = instances[j].get();
+            if (inst && inst->alive) run_event(inst, 3, 0);
         }
     }
 
@@ -3271,18 +4597,140 @@ void Runtime::step() {
         auto& v = inst->vars;
         double cur_x = v.count("x") ? to_num(v["x"]) : 0.0;
         double cur_y = v.count("y") ? to_num(v["y"]) : 0.0;
-        v["xprevious"] = Value(cur_x);
-        v["yprevious"] = Value(cur_y);
+
+        // Path motion integration
+        if (inst->path_index >= 0 && inst->path_index < (int)dw.paths.size() && inst->path_speed != 0.0) {
+            const auto& path = dw.paths[inst->path_index];
+            v["path_positionprevious"] = vnum(inst->path_position);
+            double cur_px, cur_py, cur_spd;
+            get_path_point(path, inst->path_position, cur_px, cur_py, cur_spd);
+            double step_dist = inst->path_speed * (cur_spd / 100.0);
+            double delta = (path.total_length > 0.0001) ? (step_dist / path.total_length) : 0.0;
+            inst->path_position += delta;
+
+            bool path_finished = false;
+            if (inst->path_speed > 0.0 && inst->path_position >= 1.0) {
+                path_finished = true;
+                if (inst->path_endaction == 0) { // stop
+                    inst->path_position = 1.0;
+                    inst->path_speed = 0.0;
+                } else if (inst->path_endaction == 1) { // restart
+                    inst->path_position = std::fmod(inst->path_position, 1.0);
+                } else if (inst->path_endaction == 2) { // continue
+                    inst->path_position = std::fmod(inst->path_position, 1.0);
+                } else if (inst->path_endaction == 3) { // reverse
+                    inst->path_position = 1.0 - (inst->path_position - 1.0);
+                    inst->path_speed = -inst->path_speed;
+                }
+            } else if (inst->path_speed < 0.0 && inst->path_position <= 0.0) {
+                path_finished = true;
+                if (inst->path_endaction == 0) { // stop
+                    inst->path_position = 0.0;
+                    inst->path_speed = 0.0;
+                } else if (inst->path_endaction == 1) { // restart
+                    inst->path_position = 1.0 + std::fmod(inst->path_position, 1.0);
+                } else if (inst->path_endaction == 2) { // continue
+                    inst->path_position = 1.0 + std::fmod(inst->path_position, 1.0);
+                } else if (inst->path_endaction == 3) { // reverse
+                    inst->path_position = -inst->path_position;
+                    inst->path_speed = -inst->path_speed;
+                }
+            }
+
+            double nx, ny, nspd;
+            get_path_point(path, inst->path_position, nx, ny, nspd);
+            if (inst->path_absolute) {
+                cur_x = nx;
+                cur_y = ny;
+            } else {
+                cur_x = inst->path_start_x + nx;
+                cur_y = inst->path_start_y + ny;
+            }
+            v["x"] = vnum(cur_x);
+            v["y"] = vnum(cur_y);
+            v["path_position"] = vnum(inst->path_position);
+            v["path_speed"] = vnum(inst->path_speed);
+
+            if (path_finished) {
+                run_event(inst, 7, 8); // Other 8: End of Path
+                if (!inst->alive) continue;
+            }
+        }
 
         double hs = v.count("hspeed") ? to_num(v["hspeed"]) : 0.0;
         double vs = v.count("vspeed") ? to_num(v["vspeed"]) : 0.0;
-        if (hs != 0.0) v["x"] = Value(cur_x + hs);
-        if (vs != 0.0) v["y"] = Value(cur_y + vs);
+        double dir = v.count("direction") ? to_num(v["direction"]) : 0.0;
+        double spd = v.count("speed") ? to_num(v["speed"]) : std::hypot(hs, vs);
+
+        if (hs == 0.0 && vs == 0.0 && spd != 0.0) {
+            hs = spd * std::cos(dir * 3.141592653589793 / 180.0);
+            vs = -spd * std::sin(dir * 3.141592653589793 / 180.0);
+        }
+
+        double grav = v.count("gravity") ? to_num(v["gravity"]) : 0.0;
+        if (grav != 0.0) {
+            double gdir = v.count("gravity_direction") ? to_num(v["gravity_direction"]) : 270.0;
+            hs += grav * std::cos(gdir * 3.141592653589793 / 180.0);
+            vs -= grav * std::sin(gdir * 3.141592653589793 / 180.0);
+            spd = std::hypot(hs, vs);
+            dir = std::atan2(-vs, hs) * 180.0 / 3.141592653589793;
+            if (dir < 0) dir += 360.0;
+        }
+
+        double fric = v.count("friction") ? to_num(v["friction"]) : 0.0;
+        if (fric != 0.0) {
+            if (spd > 0.0) {
+                if (fric > 0.0 && spd <= fric) {
+                    spd = 0.0;
+                    hs = 0.0;
+                    vs = 0.0;
+                } else {
+                    spd -= fric;
+                    hs = spd * std::cos(dir * 3.141592653589793 / 180.0);
+                    vs = -spd * std::sin(dir * 3.141592653589793 / 180.0);
+                }
+            } else if (fric < 0.0) {
+                spd -= fric;
+                hs = spd * std::cos(dir * 3.141592653589793 / 180.0);
+                vs = -spd * std::sin(dir * 3.141592653589793 / 180.0);
+            }
+        }
+
+        v["hspeed"] = Value(hs);
+        v["vspeed"] = Value(vs);
+        v["speed"] = Value(spd);
+        v["direction"] = Value(dir);
+
+        if (hs != 0.0) { cur_x += hs; v["x"] = Value(cur_x); }
+        if (vs != 0.0) { cur_y += vs; v["y"] = Value(cur_y); }
+
+        double rw = (double)dw.rooms[room_index].width;
+        double rh = (double)dw.rooms[room_index].height;
+        double bb[4];
+        bool outside = false;
+        if (bbox_of(*this, inst, cur_x, cur_y, bb)) {
+            if (bb[2] < 0 || bb[0] > rw || bb[3] < 0 || bb[1] > rh) outside = true;
+        } else {
+            if (cur_x < 0 || cur_x > rw || cur_y < 0 || cur_y > rh) outside = true;
+        }
+        if (outside) {
+            run_event(inst, 7, 0); // Other 0: Outside Room
+            if (!inst->alive) continue;
+        }
 
         double img_spd = v.count("image_speed") ? to_num(v["image_speed"]) : 1.0;
         double img_idx = v.count("image_index") ? to_num(v["image_index"]) : 0.0;
+        int spr = v.count("sprite_index") ? (int)to_num(v["sprite_index"]) : -1;
+        int frame_count = (spr >= 0 && spr < (int)dw.sprites.size()) ? (int)dw.sprites[spr].frames.size() : 1;
+        if (frame_count <= 0) frame_count = 1;
+        bool anim_ended = false;
+        if (img_spd > 0 && img_idx + img_spd >= frame_count) anim_ended = true;
+        else if (img_spd < 0 && img_idx + img_spd < 0) anim_ended = true;
         v["image_index"] = Value(img_idx + img_spd);
+        if (anim_ended) run_event(inst, 7, 7); // Other 7: Animation End
     }
+
+    update_view_follow();
 
     // End step (subtype 2)
     {
@@ -3316,9 +4764,14 @@ void Runtime::step() {
 
             for (const auto& ev_pair : e4_it->second) {
                 int target_obj = (int)ev_pair.first;
-                if (is_obj(dw, b, target_obj)) {
+                if (match_target(dw, b, target_obj)) {
                     double bb_b[4];
                     if (bbox_of(*this, b, bx, by, bb_b) && overlap(bb_a, bb_b)) {
+                        bool b_solid = (b->vars.count("solid") && to_num(b->vars["solid"]) != 0) || dw.objects[b->obj].solid;
+                        if (b_solid) {
+                            a->vars["x"] = a->vars.count("xprevious") ? a->vars["xprevious"] : Value(ax);
+                            a->vars["y"] = a->vars.count("yprevious") ? a->vars["yprevious"] : Value(ay);
+                        }
                         for (int ci : ev_pair.second) {
                             if (ci >= 0 && ci < (int)dw.code.size()) {
                                 std::vector<Value> noargs;
@@ -3343,53 +4796,162 @@ void Runtime::step() {
         int frames = (int)((double)audio->sample_rate() / (double)speed);
         if (frames > 0) audio->render(frames);
     }
+    update_camera();
+}
+
+void Runtime::get_path_point(const Path& path, double pos, double& out_x, double& out_y, double& out_spd) {
+    if (path.points.empty()) {
+        out_x = 0.0; out_y = 0.0; out_spd = 100.0;
+        return;
+    }
+    if (path.points.size() == 1 || path.total_length <= 0.0001) {
+        out_x = path.points[0].x;
+        out_y = path.points[0].y;
+        out_spd = path.points[0].speed;
+        return;
+    }
+    pos = std::max(0.0, std::min(1.0, pos));
+    double target_d = pos * path.total_length;
+    size_t n = path.points.size();
+
+    if (target_d <= 0.0) {
+        out_x = path.points[0].x;
+        out_y = path.points[0].y;
+        out_spd = path.points[0].speed;
+        return;
+    }
+    if (!path.closed && target_d >= path.cumulative_lengths.back()) {
+        out_x = path.points.back().x;
+        out_y = path.points.back().y;
+        out_spd = path.points.back().speed;
+        return;
+    }
+
+    for (size_t i = 0; i + 1 < n; ++i) {
+        double d0 = path.cumulative_lengths[i];
+        double d1 = path.cumulative_lengths[i + 1];
+        if (target_d >= d0 && target_d <= d1) {
+            double seg_len = d1 - d0;
+            double t = (seg_len > 1e-6) ? (target_d - d0) / seg_len : 0.0;
+            out_x = path.points[i].x + t * (path.points[i + 1].x - path.points[i].x);
+            out_y = path.points[i].y + t * (path.points[i + 1].y - path.points[i].y);
+            out_spd = path.points[i].speed + t * (path.points[i + 1].speed - path.points[i].speed);
+            return;
+        }
+    }
+
+    if (path.closed) {
+        double d0 = path.cumulative_lengths.back();
+        double d1 = path.total_length;
+        if (target_d >= d0 && target_d <= d1) {
+            double seg_len = d1 - d0;
+            double t = (seg_len > 1e-6) ? (target_d - d0) / seg_len : 0.0;
+            out_x = path.points.back().x + t * (path.points[0].x - path.points.back().x);
+            out_y = path.points.back().y + t * (path.points[0].y - path.points.back().y);
+            out_spd = path.points.back().speed + t * (path.points[0].speed - path.points.back().speed);
+            return;
+        }
+    }
+
+    out_x = path.points.back().x;
+    out_y = path.points.back().y;
+    out_spd = path.points.back().speed;
+}
+
+void Runtime::update_view_follow() {
+    if (room_index < 0 || room_index >= (int)dw.rooms.size()) return;
+    const Room& room = dw.rooms[room_index];
+    int cw = 320, ch = 240;
+    bool views_on = (globals.count("view_enabled") && to_bool(globals["view_enabled"]));
+    if (views_on && global_arrays.count("view_wview") && !global_arrays["view_wview"].empty()) {
+        int vw = (int)to_num(global_arrays["view_wview"][0]);
+        int vh = (int)to_num(global_arrays["view_hview"][0]);
+        if (vw > 0 && vh > 0) { cw = vw; ch = vh; }
+    } else if (room.width > 0 && room.height > 0) {
+        cw = (int)room.width;
+        ch = (int)room.height;
+    }
+
+    int follow_obj = -1;
+    auto it_vo = global_arrays.find("view_object");
+    if (it_vo != global_arrays.end() && !it_vo->second.empty()) follow_obj = (int)to_num(it_vo->second[0]);
+
+    if (follow_obj >= 0 && (room.width > (uint32_t)cw || room.height > (uint32_t)ch)) {
+        for (auto& inst : instances) {
+            if (inst->alive && is_obj(dw, inst.get(), follow_obj)) {
+                double px = to_num(inst->vars.count("x") ? inst->vars["x"] : Value(0.0));
+                double py = to_num(inst->vars.count("y") ? inst->vars["y"] : Value(0.0));
+                int cam_x = (int)px - cw / 2;
+                int cam_y = (int)py - ch / 2;
+                cam_x = std::clamp(cam_x, 0, std::max(0, (int)room.width - cw));
+                cam_y = std::clamp(cam_y, 0, std::max(0, (int)room.height - ch));
+                if (!global_arrays.count("view_xview") || global_arrays["view_xview"].empty())
+                    global_arrays["view_xview"].resize(1, Value(0.0));
+                global_arrays["view_xview"][0] = Value((double)cam_x);
+
+                if (!global_arrays.count("view_yview") || global_arrays["view_yview"].empty())
+                    global_arrays["view_yview"].resize(1, Value(0.0));
+                global_arrays["view_yview"][0] = Value((double)cam_y);
+                break;
+            }
+        }
+    }
+}
+
+void Runtime::update_camera() {
+    if (room_index < 0 || room_index >= (int)dw.rooms.size()) return;
+    const Room& room = dw.rooms[room_index];
+    int cw = 320, ch = 240;
+    bool views_on = (globals.count("view_enabled") && to_bool(globals["view_enabled"]));
+    if (views_on && global_arrays.count("view_wview") && !global_arrays["view_wview"].empty()) {
+        int vw = (int)to_num(global_arrays["view_wview"][0]);
+        int vh = (int)to_num(global_arrays["view_hview"][0]);
+        if (vw > 0 && vh > 0) { cw = vw; ch = vh; }
+    } else if (room.width > 0 && room.height > 0) {
+        cw = (int)room.width;
+        ch = (int)room.height;
+    }
+
+    int cam_x = 0, cam_y = 0;
+    auto it_vx = global_arrays.find("view_xview");
+    auto it_vy = global_arrays.find("view_yview");
+    if (it_vx != global_arrays.end() && !it_vx->second.empty()) cam_x = (int)to_num(it_vx->second[0]);
+    if (it_vy != global_arrays.end() && !it_vy->second.empty()) cam_y = (int)to_num(it_vy->second[0]);
+
+    cam_x = std::clamp(cam_x, 0, std::max(0, (int)room.width - cw));
+    cam_y = std::clamp(cam_y, 0, std::max(0, (int)room.height - ch));
+
+    view_x = cam_x;
+    view_y = cam_y;
+    if (!global_arrays.count("view_xview") || global_arrays["view_xview"].empty())
+        global_arrays["view_xview"].resize(1, Value(0.0));
+    global_arrays["view_xview"][0] = Value((double)cam_x);
+
+    if (!global_arrays.count("view_yview") || global_arrays["view_yview"].empty())
+        global_arrays["view_yview"].resize(1, Value(0.0));
+    global_arrays["view_yview"][0] = Value((double)cam_y);
 }
 
 Image Runtime::draw() {
+    update_camera();
     const Room& room = dw.rooms[room_index];
+    int cw = 320, ch = 240;
+    bool views_on = (globals.count("view_enabled") && to_bool(globals["view_enabled"]));
+    if (views_on && global_arrays.count("view_wview") && !global_arrays["view_wview"].empty()) {
+        int vw = (int)to_num(global_arrays["view_wview"][0]);
+        int vh = (int)to_num(global_arrays["view_hview"][0]);
+        if (vw > 0 && vh > 0) { cw = vw; ch = vh; }
+    } else if (room.width > 0 && room.height > 0) {
+        cw = (int)room.width;
+        ch = (int)room.height;
+    }
     Image canvas;
-    canvas.w = 320; canvas.h = 240;
+    canvas.w = cw; canvas.h = ch;
     canvas.rgba.assign((size_t)canvas.w * canvas.h * 4, 0);
     uint8_t bg[4] = { (uint8_t)(room.bg_color & 0xFF), (uint8_t)((room.bg_color >> 8) & 0xFF),
                       (uint8_t)((room.bg_color >> 16) & 0xFF), 255 };
     for (size_t i = 0; i < canvas.rgba.size(); i += 4) std::memcpy(&canvas.rgba[i], bg, 4);
     screen = &canvas;
-
-    // Viewport camera calculation
-    // Viewport camera calculation
-    int cam_x = 0, cam_y = 0;
-    int follow_obj = -1;
-    auto it_vo = global_arrays.find("view_object");
-    if (it_vo != global_arrays.end() && !it_vo->second.empty()) follow_obj = (int)to_num(it_vo->second[0]);
-
-    bool following = false;
-    if (room.width > 320 || room.height > 240) {
-        for (auto& inst : instances) {
-            if (inst->alive && (inst->obj == follow_obj || dw.objects[inst->obj].name == "obj_mainchara")) {
-                double px = to_num(inst->vars.count("x") ? inst->vars["x"] : Value(0.0));
-                double py = to_num(inst->vars.count("y") ? inst->vars["y"] : Value(0.0));
-                cam_x = (int)px - 160;
-                cam_y = (int)py - 120;
-                following = true;
-                break;
-            }
-        }
-    }
-    if (!following) {
-        auto it_vx = global_arrays.find("view_xview");
-        auto it_vy = global_arrays.find("view_yview");
-        if (it_vx != global_arrays.end() && !it_vx->second.empty()) cam_x = (int)to_num(it_vx->second[0]);
-        if (it_vy != global_arrays.end() && !it_vy->second.empty()) cam_y = (int)to_num(it_vy->second[0]);
-    }
-    cam_x = std::clamp(cam_x, 0, std::max(0, (int)room.width - 320));
-    cam_y = std::clamp(cam_y, 0, std::max(0, (int)room.height - 240));
-
-    view_x = cam_x;
-    view_y = cam_y;
-    if (global_arrays.count("view_xview") && !global_arrays["view_xview"].empty())
-        global_arrays["view_xview"][0] = Value((double)cam_x);
-    if (global_arrays.count("view_yview") && !global_arrays["view_yview"].empty())
-        global_arrays["view_yview"][0] = Value((double)cam_y);
 
     // Draw room backgrounds
     for (const auto& rb : room.backgrounds) {
@@ -3420,9 +4982,10 @@ Image Runtime::draw() {
 
     // Tiles (with frustum culling and zero-copy blitting)
     std::vector<const Tile*> ts;
+    const int margin = cfg.culling_margin;
     for (auto& t : room.tiles) {
-        if (t.x + t.w <= view_x || t.x >= view_x + canvas.w ||
-            t.y + t.h <= view_y || t.y >= view_y + canvas.h) continue;
+        if (t.x + t.w < view_x - margin || t.x > view_x + canvas.w + margin ||
+            t.y + t.h < view_y - margin || t.y > view_y + canvas.h + margin) continue;
         ts.push_back(&t);
     }
     std::sort(ts.begin(), ts.end(), [](const Tile* a, const Tile* b){ return a->depth > b->depth; });
@@ -3433,8 +4996,10 @@ Image Runtime::draw() {
         const Tpag& t = dw.tpags[tp];
         if (t.tex < 0 || t.tex >= (int)dw.tex_ptrs.size()) continue;
         const Image& pg = page(t.tex);
-        if (tl->srcx < 0 || tl->srcy < 0 || tl->srcx + tl->w > pg.w || tl->srcy + tl->h > pg.h) continue;
-        blit_sub_screen(pg, tl->srcx, tl->srcy, tl->w, tl->h, tl->x - view_x, tl->y - view_y, 1.0);
+        int sx = t.sx + tl->srcx;
+        int sy = t.sy + tl->srcy;
+        if (sx < 0 || sy < 0 || sx + tl->w > pg.w || sy + tl->h > pg.h) continue;
+        blit_sub_screen(pg, sx, sy, tl->w, tl->h, tl->x - view_x, tl->y - view_y, 1.0);
     }
 
     // instances by depth
@@ -3443,27 +5008,56 @@ Image Runtime::draw() {
     std::sort(order.begin(), order.end(), [](Instance* a, Instance* b){
         return to_num(a->vars.count("depth")?a->vars["depth"]:Value(0.0)) >
                to_num(b->vars.count("depth")?b->vars["depth"]:Value(0.0)); });
-    for (Instance* inst : order) {
-        bool has_draw = false;
-        int cur_obj = inst->obj;
-        for (int p = 0; p < 16 && cur_obj >= 0 && cur_obj < (int)dw.objects.size(); ++p) {
-            auto it = dw.objects[cur_obj].events.find(8);
-            if (it != dw.objects[cur_obj].events.end() && it->second.count(0)) {
-                has_draw = true;
-                break;
+
+    auto dispatch_draw = [&](int sub) {
+        for (Instance* inst : order) {
+            if (!inst->alive) continue;
+            if (to_num(inst->vars.count("visible") ? inst->vars["visible"] : Value(1.0)) == 0.0) continue;
+            bool found = false;
+            int cur_obj = inst->obj;
+            for (int p = 0; p < 16 && cur_obj >= 0 && cur_obj < (int)dw.objects.size(); ++p) {
+                auto it = dw.objects[cur_obj].events.find(8);
+                if (it != dw.objects[cur_obj].events.end() && it->second.count(sub)) {
+                    found = true;
+                    break;
+                }
+                cur_obj = dw.objects[cur_obj].parent;
             }
-            cur_obj = dw.objects[cur_obj].parent;
+            if (found) {
+                run_event(inst, 8, sub);
+            } else if (sub == 0) {
+                draw_sprite_impl(*this, to_num(inst->vars.count("sprite_index")?inst->vars["sprite_index"]:Value(-1.0)),
+                                 to_num(inst->vars.count("image_index")?inst->vars["image_index"]:Value(0.0)),
+                                 to_num(inst->vars.count("x")?inst->vars["x"]:Value(0.0)),
+                                 to_num(inst->vars.count("y")?inst->vars["y"]:Value(0.0)),
+                                 to_num(inst->vars.count("image_xscale")?inst->vars["image_xscale"]:Value(1.0)),
+                                 to_num(inst->vars.count("image_yscale")?inst->vars["image_yscale"]:Value(1.0)),
+                                 to_num(inst->vars.count("image_alpha")?inst->vars["image_alpha"]:Value(1.0)),
+                                 to_num(inst->vars.count("image_angle")?inst->vars["image_angle"]:Value(0.0)),
+                                 (uint32_t)to_num(inst->vars.count("image_blend")?inst->vars["image_blend"]:Value((double)0xFFFFFF)));
+            }
         }
-        if (has_draw) run_event(inst, 8, 0);
-        else if (to_num(inst->vars.count("visible")?inst->vars["visible"]:Value(1.0)) != 0)
-            draw_sprite_impl(*this, to_num(inst->vars.count("sprite_index")?inst->vars["sprite_index"]:Value(-1.0)),
-                             to_num(inst->vars.count("image_index")?inst->vars["image_index"]:Value(0.0)),
-                             to_num(inst->vars.count("x")?inst->vars["x"]:Value(0.0)),
-                             to_num(inst->vars.count("y")?inst->vars["y"]:Value(0.0)),
-                             to_num(inst->vars.count("image_xscale")?inst->vars["image_xscale"]:Value(1.0)),
-                             to_num(inst->vars.count("image_yscale")?inst->vars["image_yscale"]:Value(1.0)),
-                             to_num(inst->vars.count("image_alpha")?inst->vars["image_alpha"]:Value(1.0)));
-    }
+    };
+
+    // Pre-Draw (76), Draw Begin (72), Draw (0), Draw End (73), Post-Draw (77)
+    dispatch_draw(76);
+    dispatch_draw(72);
+    dispatch_draw(0);
+    dispatch_draw(73);
+    dispatch_draw(77);
+
+    // Draw GUI Begin (65), Draw GUI (64), Draw GUI End (74)
+    int saved_vx = view_x, saved_vy = view_y;
+    view_x = 0;
+    view_y = 0;
+    gui_drawing = true;
+    dispatch_draw(65);
+    dispatch_draw(64);
+    dispatch_draw(74);
+    gui_drawing = false;
+    view_x = saved_vx;
+    view_y = saved_vy;
+
     screen = nullptr;
     return canvas;
 }

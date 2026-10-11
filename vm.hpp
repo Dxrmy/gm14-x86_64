@@ -42,6 +42,16 @@ struct Instance {
     std::unordered_map<std::string, Value> vars;
     std::unordered_map<std::string, std::vector<Value>> arrays;
     std::vector<int> alarms;   // -1 == unset
+    // Path tracking
+    int path_index = -1;
+    double path_speed = 0.0;
+    double path_position = 0.0;
+    int path_endaction = 0;
+    bool path_absolute = true;
+    double path_scale = 1.0;
+    double path_orientation = 0.0;
+    double path_start_x = 0.0;
+    double path_start_y = 0.0;
     Instance(int iid_, int obj_) : iid(iid_), obj(obj_), alarms(12, -1) {}
 };
 
@@ -75,13 +85,6 @@ struct EnvFrame {
     size_t inst_idx = 0;
     int loop_pc = 0;
 };
-
-// Global execution context trackers for crash and OOM diagnostics
-extern const char* g_diag_code_name;
-extern int g_diag_pc;
-extern const char* g_diag_obj_name;
-extern int g_diag_inst_id;
-extern const char* g_diag_func_name;
 
 struct DsGrid {
     int width = 0;
@@ -135,12 +138,34 @@ struct Surface {
     Image img;
 };
 
+// Global execution context trackers for crash and OOM diagnostics
+extern const char* g_diag_code_name;
+extern int g_diag_pc;
+extern const char* g_diag_obj_name;
+extern int g_diag_inst_id;
+extern const char* g_diag_func_name;
+
+struct EngineConfig {
+    int max_texture_pages = 6;            // Max texture sheets kept in RAM (2 on 3DS, 6 on low-spec/PC, 0 = unlimited)
+    size_t audio_pcm_budget_bytes = 16 * 1024 * 1024; // Bounded PCM sound cache (8MB on 3DS, 16MB on low-spec/PC)
+    long long instruction_budget = 2000000;// Bytecode loop watchdog (250k on 3DS, 2M on PC)
+    int culling_margin = 32;              // Safety margin for tile culling
+    bool enable_blend_modes = true;       // Enable bm_add additive blending
+    std::string save_directory = "./saves";// Directory for .ini and .sav files
+    int target_fps = 30;                  // Target framerate (30 for Undertale, 0 = room speed)
+    int start_room = -1;                  // -1 = natural boot, >= 0 = force room
+    bool verbose_logging = false;         // Enable/disable diagnostic sink
+};
+
+EngineConfig load_engine_config(const std::string& ini_path);
+
 class Runtime {
 public:
-    explicit Runtime(DataWin& dw);
+    explicit Runtime(DataWin& dw, const EngineConfig& cfg = EngineConfig{});
     ~Runtime();
 
     DataWin& dw;
+    EngineConfig cfg;
     std::unordered_map<std::string, const CodeEntry*> scripts;
     std::unordered_map<std::string, Value> globals;
     std::unordered_map<std::string, std::vector<Value>> global_arrays;
@@ -163,6 +188,9 @@ public:
 
     // input
     std::set<int> keys_held, keys_pressed, keys_released;
+    int mouse_x = 0, mouse_y = 0;
+    std::set<int> mouse_buttons_held, mouse_buttons_pressed, mouse_buttons_released;
+    int mouse_wheel_delta = 0;
 
     // drawing
     Image* screen = nullptr;
@@ -179,12 +207,12 @@ public:
     void blit_sub_screen(const Image& src, int sx, int sy, int sw, int sh, int dx, int dy, double alpha);
     void blit_sub_screen_tint(const Image& src, int sx, int sy, int sw, int sh, int dx, int dy, double alpha, uint32_t color);
     // Scaled + tinted + optionally rotated blit. (dx,dy) is the top-left of the
-    // destination rect; out_w/out_h are the scaled size. angle is in degrees,
-    // applied about the rect centre. When angle==0 and out size==src size this
-    // is equivalent to blit_sub_screen_tint.
+    // destination rect; out_w/out_h are the scaled size. angle is in degrees.
+    // If use_pivot is true, rotates about (pivot_x, pivot_y); otherwise about rect center.
     void blit_sub_screen_scaled(const Image& src, int sx, int sy, int sw, int sh,
                                 int dx, int dy, int out_w, int out_h,
-                                double alpha, uint32_t color, double angle_deg = 0.0);
+                                double alpha, uint32_t color = 0xFFFFFF, double angle_deg = 0.0,
+                                double pivot_x = 0.0, double pivot_y = 0.0, bool use_pivot = false);
 
     using Builtin = std::function<Value(Runtime&, std::vector<Value>&)>;
     std::unordered_map<std::string, Builtin> builtins;
@@ -201,6 +229,8 @@ public:
     std::string current_ini_filename;
     IniFile current_ini;
     bool ini_is_open = false;
+    std::string save_dir;
+    std::string resolve_path(const std::string& fn) const;
 
     // surfaces
     std::unordered_map<int, Surface> surfaces;
@@ -209,7 +239,7 @@ public:
 
     // caster audio
     std::unordered_map<std::string, int> caster_path_to_id;
-    int next_caster_id = 500000;
+    int next_caster_id = 10000;
 
     // audio
     std::unique_ptr<AudioEngine> audio;
@@ -221,6 +251,16 @@ public:
     void start_room(int index, std::vector<std::unique_ptr<Instance>> keep = {});
     void change_room(int index);
     void run_event(Instance* inst, int etype, int subtype);
+    bool action_relative = false;
+    bool gui_drawing = false;
+    int gui_width = -1;
+    int gui_height = -1;
+    bool current_room_persistent = false;
+    std::unordered_map<int, std::vector<std::unique_ptr<Instance>>> persistent_rooms;
+    void update_camera();
+    void update_view_follow();
+    void get_path_point(const Path& path, double pos, double& out_x, double& out_y, double& out_spd);
+
     void step();
     Image draw();
 
@@ -230,7 +270,8 @@ public:
 
     void exec(Frame& fr);
     Value get_var(Frame& fr, const Instruction& ins);
-    void set_var(Frame& fr, const Instruction& ins, const Value& v);
+    void set_var(Frame& fr, const Instruction& ins, int inst_type, const Value& v);
+    void set_var_inst(Instance* inst, const std::string& name, const Value& v);
     Value get_array(Frame& fr, const Instruction& ins, int inst_type, int index);
     void set_array(Frame& fr, const Instruction& ins, int inst_type, int index, const Value& v);
     Instance* resolve_inst(int inst_type);
