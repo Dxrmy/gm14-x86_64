@@ -292,12 +292,19 @@ Value Runtime::get_var(Frame& fr, const Instruction& ins) {
     if (name == "view_enabled") return globals.count("view_enabled") ? globals["view_enabled"] : Value(1.0);
     if (name == "room_width") return globals.count("room_width") ? globals["room_width"] : Value(320.0);
     if (name == "room_height") return globals.count("room_height") ? globals["room_height"] : Value(240.0);
+    if (name == "room_persistent") return Value(current_room_persistent ? 1.0 : 0.0);
     if (name == "application_surface") return Value(0.0);
     return Value(0.0);
 }
 
 void Runtime::set_var_inst(Instance* inst, const std::string& name, const Value& v) {
     if (!inst) return;
+    if (name == "room_persistent") {
+        current_room_persistent = to_bool(v);
+        globals["room_persistent"] = Value(current_room_persistent ? 1.0 : 0.0);
+        if (!current_room_persistent && room_index >= 0) persistent_rooms.erase(room_index);
+        return;
+    }
     if (v.is_arr() && v.arrref) {
         inst->arrays[name] = *v.arrref;
         Value av; av.type = Value::VARPTR; av.arrref = &inst->arrays[name];
@@ -326,6 +333,12 @@ void Runtime::set_var(Frame& fr, const Instruction& ins, int inst_type, const Va
     if (ins.var >= 0 && ins.var < (int)dw.variables.size()) name = dw.variables[ins.var].name;
     int varid = (ins.var >= 0) ? dw.variables[ins.var].varid : 0;
     if (name == "room") { pending_room = (int)to_num(v); return; }
+    if (name == "room_persistent") {
+        current_room_persistent = to_bool(v);
+        globals["room_persistent"] = Value(current_room_persistent ? 1.0 : 0.0);
+        if (!current_room_persistent && room_index >= 0) persistent_rooms.erase(room_index);
+        return;
+    }
     if (name == "view_current" || name == "view_enabled" || name == "room_width" || name == "room_height" ||
         name == "keyboard_string" || name == "keyboard_lastkey" || name == "keyboard_lastchar") {
         globals[name] = v;
@@ -1369,6 +1382,19 @@ void Runtime::register_builtins() {
         auto& o = rt.dw.room_order; int pos=(int)(std::find(o.begin(),o.end(),rt.room_index)-o.begin());
         rt.pending_room = (pos>0) ? (int)o[pos-1] : -1; return vnum(0); };
     builtins["room_restart"] = [](Runtime& rt, std::vector<Value>&){ rt.pending_room=rt.room_index; return vnum(0); };
+    builtins["room_set_persistent"] = [](Runtime& rt, std::vector<Value>& a){
+        int ind = (int)narg(a, 0);
+        bool val = to_bool(narg(a, 1));
+        if (ind >= 0 && ind < (int)rt.dw.rooms.size()) {
+            rt.dw.rooms[ind].persistent = val;
+        }
+        if (ind == rt.room_index) {
+            rt.current_room_persistent = val;
+            rt.globals["room_persistent"] = Value(val ? 1.0 : 0.0);
+            if (!val) rt.persistent_rooms.erase(ind);
+        }
+        return vnum(0);
+    };
     builtins["game_end"] = [](Runtime& rt, std::vector<Value>&){ rt.running=false; return vnum(0); };
     builtins["game_restart"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
 
@@ -3910,7 +3936,7 @@ void Runtime::register_builtins() {
         "window_set_position","window_center","steam_file_write_file",
         "surface_set_target","surface_reset_target","surface_free",
         "buffer_async_group_option","buffer_async_group_begin","buffer_async_group_end","buffer_write","buffer_save_async",
-        "buffer_load_async","buffer_delete","instance_activate_object","room_set_persistent",
+        "buffer_load_async","buffer_delete","instance_activate_object",
         "get_string_async",
         "joystick_check_button","joystick_has_pov","gamepad_axis_value","extension_stubfunc_real","ds_map_set_post"})
         if (!builtins.count(n)) builtins[n] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
@@ -4001,32 +4027,42 @@ void Runtime::start_room(int index, std::vector<std::unique_ptr<Instance>> keep)
         vv[0] = vnum(1.0);
     }
 
-    for (const auto& ri : room.instances) {
-        if (ri.obj < 0 || ri.obj >= (int)dw.objects.size()) continue;
-        auto inst = std::make_unique<Instance>(ri.iid, ri.obj);
-        inst->vars["x"] = vnum(ri.x); inst->vars["y"] = vnum(ri.y);
-        inst->vars["xstart"] = vnum(ri.x); inst->vars["ystart"] = vnum(ri.y);
-        inst->vars["image_xscale"] = vnum(ri.scale_x);
-        inst->vars["image_yscale"] = vnum(ri.scale_y);
-        inst->vars["image_angle"] = vnum(-ri.rotation);
-        inst->vars["sprite_index"] = vnum(dw.objects[ri.obj].sprite);
-        inst->vars["depth"] = vnum(dw.objects[ri.obj].depth);
-        inst->vars["visible"] = vnum(dw.objects[ri.obj].visible ? 1 : 0);
-        inst->vars["solid"] = vnum(dw.objects[ri.obj].solid ? 1 : 0);
-        inst->vars["persistent"] = vnum(dw.objects[ri.obj].persistent ? 1 : 0);
-        inst->vars["object_index"] = vnum(ri.obj);
-        inst->vars["id"] = vnum(ri.iid);
-        if ((int)ri.iid >= next_iid) next_iid = (int)ri.iid + 1;
-        instances.push_back(std::move(inst));
-        Instance* ip = instances.back().get();
-        if (ri.creation_code >= 0 && ri.creation_code < (int)dw.code.size()) {
-            std::vector<Value> noargs; run_entry(&dw.code[ri.creation_code], noargs, ip, ip);
+    auto it_pers = persistent_rooms.find(index);
+    if (it_pers != persistent_rooms.end()) {
+        current_room_persistent = true;
+        for (auto& inst : it_pers->second) {
+            if (inst && inst->alive) instances.push_back(std::move(inst));
         }
-        run_event(ip, 0, 0);
-    }
-    if (room.creation_code >= 0 && room.creation_code < (int)dw.code.size() && !instances.empty()) {
-        std::vector<Value> noargs;
-        run_entry(&dw.code[room.creation_code], noargs, instances[0].get(), instances[0].get());
+        persistent_rooms.erase(it_pers);
+    } else {
+        current_room_persistent = room.persistent;
+        for (const auto& ri : room.instances) {
+            if (ri.obj < 0 || ri.obj >= (int)dw.objects.size()) continue;
+            auto inst = std::make_unique<Instance>(ri.iid, ri.obj);
+            inst->vars["x"] = vnum(ri.x); inst->vars["y"] = vnum(ri.y);
+            inst->vars["xstart"] = vnum(ri.x); inst->vars["ystart"] = vnum(ri.y);
+            inst->vars["image_xscale"] = vnum(ri.scale_x);
+            inst->vars["image_yscale"] = vnum(ri.scale_y);
+            inst->vars["image_angle"] = vnum(-ri.rotation);
+            inst->vars["sprite_index"] = vnum(dw.objects[ri.obj].sprite);
+            inst->vars["depth"] = vnum(dw.objects[ri.obj].depth);
+            inst->vars["visible"] = vnum(dw.objects[ri.obj].visible ? 1 : 0);
+            inst->vars["solid"] = vnum(dw.objects[ri.obj].solid ? 1 : 0);
+            inst->vars["persistent"] = vnum(dw.objects[ri.obj].persistent ? 1 : 0);
+            inst->vars["object_index"] = vnum(ri.obj);
+            inst->vars["id"] = vnum(ri.iid);
+            if ((int)ri.iid >= next_iid) next_iid = (int)ri.iid + 1;
+            instances.push_back(std::move(inst));
+            Instance* ip = instances.back().get();
+            if (ri.creation_code >= 0 && ri.creation_code < (int)dw.code.size()) {
+                std::vector<Value> noargs; run_entry(&dw.code[ri.creation_code], noargs, ip, ip);
+            }
+            run_event(ip, 0, 0);
+        }
+        if (room.creation_code >= 0 && room.creation_code < (int)dw.code.size() && !instances.empty()) {
+            std::vector<Value> noargs;
+            run_entry(&dw.code[room.creation_code], noargs, instances[0].get(), instances[0].get());
+        }
     }
     static bool booted = false;
     if (!booted) {
@@ -4041,6 +4077,7 @@ void Runtime::start_room(int index, std::vector<std::unique_ptr<Instance>> keep)
     for (size_t i = 0; i < instances.size(); ++i)
         if (instances[i]->alive) run_event(instances[i].get(), 7, 4);
     globals["room"] = vnum(index);
+    globals["room_persistent"] = vnum(current_room_persistent ? 1.0 : 0.0);
     global_builtins["current_time"] = globals.count("__t") ? globals["__t"] : Value(0.0);
     update_camera();
 }
@@ -4050,12 +4087,20 @@ void Runtime::change_room(int index) {
         if (instances[i]->alive) run_event(instances[i].get(), 7, 5);
     if (index < 0 || index >= (int)dw.rooms.size()) { running = false; return; }
     std::vector<std::unique_ptr<Instance>> keep;
+    std::vector<std::unique_ptr<Instance>> room_saved;
     for (auto& i : instances) {
         if (!i || !i->alive) continue;
         bool pers = dw.objects[i->obj].persistent;
         if (i->vars.count("persistent")) pers = to_bool(i->vars["persistent"]);
         if (pers) keep.push_back(std::move(i));
+        else if (current_room_persistent) room_saved.push_back(std::move(i));
     }
+    if (current_room_persistent && room_index >= 0) {
+        persistent_rooms[room_index] = std::move(room_saved);
+    } else if (room_index >= 0) {
+        persistent_rooms.erase(room_index);
+    }
+    instances.clear();
     start_room(index, std::move(keep));
 }
 

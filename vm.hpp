@@ -221,6 +221,8 @@ public:
     bool gui_drawing = false;
     int gui_width = -1;
     int gui_height = -1;
+    bool current_room_persistent = false;
+    std::unordered_map<int, std::vector<std::unique_ptr<Instance>>> persistent_rooms;
     void update_camera();
 
     void step();
