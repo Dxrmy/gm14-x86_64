@@ -8,19 +8,30 @@ It provides 1:1 GameMaker: Studio 1.4 runtime parity on desktop platforms, servi
 
 ## Features
 
-- **100% Passing Test Suite**: 155 unit tests validating opcode execution, variable chains, array indices, type conversions, math, string manipulation, INI persistence, data structures (`ds_grid`, `ds_list`, `ds_map`), surfaces, and audio playback.
+- **100% Passing Test Suite**: **181 unit tests** validating opcode execution, variable chains, array references, type conversions, math, string manipulation, INI persistence, data structures (`ds_grid`, `ds_list`, `ds_map`), surfaces, path traversal, marker entrance placement, and audio playback.
+- **Configurable Engine Architecture (`gm14.ini`)**:
+  - Fully configurable via explicit `gm14.ini` (no hidden platform auto-detection heuristics).
+  - **Bounded LRU Texture Cache**: Configurable limit of cached texture sheets (default 6 pages / ~24 MB on low-spec PC/Pi, 2 pages / ~8 MB on 3DS). Eliminates thrashing and out-of-memory errors.
+  - **Bounded PCM Audio Budget**: Configurable sound buffer budget (default 16 MB on PC/Pi, 8 MB on 3DS).
+  - **Watchdog Instruction Budget**: Configurable execution step watchdog (default 2,000,000 steps).
+  - **Safety Margins**: Configurable culling margin (default 32 px) and additive blend modes (`bm_add`).
 - **Interactive Native PC Runner (`gm14_runner.exe`)**:
-  - Native Win32 window loop with fixed-timestep game pacing.
+  - Native Win32 window loop with fixed-timestep game pacing (30 FPS default for Undertale).
   - Double-buffered sharp nearest-neighbor GDI blitting (`StretchDIBits`) with letterbox/pillarbox aspect-ratio preservation.
   - Real-time keyboard mapping (Arrows, Z/Enter, X/Shift, C/Ctrl, Esc).
   - Dynamic fullscreen toggling via `F4` or `Alt+Enter`.
   - Headless execution and PNG frame capture for continuous integration and automated testing.
-- **1:1 Bytecode VM**: Complete stack machine for GameMaker bytecode v15 and v16.
+- **1:1 Bytecode VM & Engine Systems**:
+  - **Bytecode v15, v16 & v17 Support**: Full stack machine supporting modern GameMaker bytecode versions and chunk formats.
+  - **Path Traversal Engine**: Complete GameMaker path system (`path_start`, `path_end`, `path_position`, `path_speed`, etc.) with `PATH` chunk parsing and two-pass entrance marker placement.
+  - **Accurate Sprite Transformations**: Origin-pivoted rotation for `draw_sprite_ext`, `draw_self`, and default instance drawing, matching GameMaker's counter-clockwise angle convention (fixing spinning entities such as `obj_winkstar`).
+  - **Blend Mode Pipeline**: Support for `draw_set_blend_mode`, `draw_set_blend_mode_ext`, and `draw_get_blend_mode` with software additive blending (`bm_add`).
+  - **Compressed Texture Decoding**: Native support for QOI (`qoi.hpp`) and BZip2 (`bunzip.hpp`) compressed texture sheet formats.
   - **Script Shadowing**: User scripts shadow builtins (`control_*`, `draw_*`), preserving custom engine logic.
   - **Dynamic StackTop Resolution**: Full support for `inst_type == -9` / `ref_type == 0x80` stack-popped instance targets in variable reads/writes.
   - **Object 0 De-aliasing**: Proper separation of instance `self` (`-1`) from object index 0 (`dw.objects[0]`).
-  - **Lifecycle & Events**: Complete support for Create (`0,0`), Destroy (`1,0`), Alarm (`2,i`), Step (`3,sub`: Begin/Step/End), and Collision (`4,target`) events.
-  - **Motion & Animation**: Automated `xprevious`/`yprevious` tracking, `hspeed`/`vspeed` motion integration, and `image_index += image_speed` animation stepping.
+  - **Lifecycle & Events**: Complete support for Create (`0,0`), Destroy (`1,0`), Alarm (`2,i`), Step (`3,sub`: Begin/Step/End), Draw (`8,sub`: Pre-Draw, Draw Begin, Draw, Draw End, Post-Draw, GUI), and Collision (`4,target`) events.
+  - **Motion & Animation**: Automated `xprevious`/`yprevious` tracking, `hspeed`/`vspeed` motion integration, friction, and `image_index += image_speed` animation stepping.
   - **Bounding Box & Scaling**: Accurate `bbox_of` collision calculation respecting sprite margins (`ml`, `mr`, `mt`, `mb`), origin offsets, and instance scale (`image_xscale`, `image_yscale`).
 - **Complete Audio & Music Engine**:
   - Native Windows **WaveOut** output backend (`-lwinmm`) and Linux **ALSA** backend.
@@ -38,7 +49,6 @@ It provides 1:1 GameMaker: Studio 1.4 runtime parity on desktop platforms, servi
   - Corrected tile texture atlas UV mapping (`tp->sx + tl->srcx`, `tp->sy + tl->srcy`).
   - Independent horizontal and vertical background tiling (`tile_x` vs `tile_y`).
   - Instance scale transformations, flipping, depth-sorted rendering, and color modulation.
-  - LRU texture page cache (`TexturePageCache`).
 
 ---
 
@@ -47,13 +57,13 @@ It provides 1:1 GameMaker: Studio 1.4 runtime parity on desktop platforms, servi
 Verified directly against full Undertale `data.win` (bytecode v16):
 
 ```
-Chunks parsed        : 24 (FORM, GEN8, OPTN, SOND, SPRT, BGND, SCPT, FONT, OBJT, ROOM, DAFL, TPAG, CODE, VARI, FUNC, STRG, TXTR, AUDO, ...)
+Chunks parsed        : 24 (FORM, GEN8, OPTN, SOND, SPRT, BGND, SCPT, FONT, OBJT, ROOM, DAFL, TPAG, CODE, VARI, FUNC, STRG, TXTR, AUDO, PATH, ...)
 Strings              : 63,977
 Bytecode ops         : 891,526 instructions across 6,272 code entries
 Variables / Functions: 10,899 / 427 (206,598 var refs, 78,929 func refs)
 Sprites / Objects    : 2,583 / 1,709
 Rooms                : 336
-Unit tests           : 155 passed, 0 failed
+Unit tests           : 181 passed, 0 failed
 ```
 
 ---
@@ -66,7 +76,10 @@ Unit tests           : 155 passed, 0 failed
 | `vm.cpp` / `vm.hpp` | Virtual machine, opcode dispatcher, instance pool, event loop, builtins |
 | `dw.cpp` / `dw.hpp` | `data.win` IFF parser, chunk unpacker, room compositor |
 | `audio.cpp` / `audio.hpp` | Audio engine, Windows WaveOut / ALSA backends, mixer, LRU cache |
-| `vm_tests.cpp` | Comprehensive 155-test test suite |
+| `bunzip.cpp` / `bunzip.hpp` | Lightweight BZip2 decompressor for compressed assets |
+| `qoi.hpp` | QOI texture decoding header |
+| `gm14.ini.example` | Template engine configuration for memory and performance tuning |
+| `vm_tests.cpp` | Comprehensive 181-test test suite |
 | `vm_host.cpp` | Headless VM host runner (boots game, steps rooms, outputs state) |
 | `main_host.cpp` | DataWin inspector CLI (dumps stats and renders rooms to PNG) |
 | `stb_image.h` / `stb_image_write.h` | Image decoding and PNG writing |
@@ -76,33 +89,44 @@ Unit tests           : 155 passed, 0 failed
 
 ---
 
+## Configuration (`gm14.ini`)
+
+Copy `gm14.ini.example` to `gm14.ini` to customize runtime settings:
+
+```ini
+[engine]
+; Maximum texture sheets kept in RAM (2 on 3DS, 6 on low-spec/PC/Pi, 0 = unlimited)
+max_texture_pages = 6
+; Audio PCM cache budget in MB (8 MB on 3DS, 16 MB on low-spec/PC)
+pcm_cache_budget_mb = 16
+; Bytecode loop execution watchdog budget
+instruction_budget = 2000000
+; Safety margin in pixels for tile frustum culling
+culling_margin = 32
+; Enable additive blend modes (bm_add)
+enable_blend_modes = 1
+; Target FPS (0 = default room_speed)
+fps = 30
+; Save directory
+save_directory = ./saves
+; Diagnostic sink logging
+verbose_logging = 0
+```
+
+---
+
 ## Building
 
 ### Windows (MinGW-w64)
 
 ```bash
-make
-```
-
-Or manually using `g++`:
-
-```bash
-# Compile object files
-g++ -std=c++17 -O2 -c dw.cpp -o dw.o
-g++ -std=c++17 -O2 -c audio.cpp -o audio.o
-g++ -std=c++17 -O2 -c stb_vorbis_impl.c -o stb_vorbis_impl.o
-g++ -std=c++17 -O2 -c vm.cpp -o vm.o
-
-# Build executables
-g++ -std=c++17 -O2 -o vm_tests.exe vm_tests.cpp vm.o dw.o audio.o stb_vorbis_impl.o -lwinmm -static
-g++ -std=c++17 -O2 -o vm_host.exe vm_host.cpp vm.o dw.o audio.o stb_vorbis_impl.o -lwinmm -static
-g++ -std=c++17 -O2 -o gm14_host.exe main_host.cpp dw.o -lwinmm -static
+mingw32-make -j24
 ```
 
 ### Linux (GCC / Clang)
 
 ```bash
-make
+make -j24
 ```
 
 ### CMake (Windows / Linux / macOS)
@@ -130,25 +154,21 @@ Output:
 Game data loaded successfully!
   [info] embedded OGG sounds decoded: 5
 
-109 passed, 0 failed
+181 passed, 0 failed
 ```
 
-### Run the Headless VM
-
-Step Undertale from room 0 (`room_start`) through room 1 (`room_introstory`), stepping 150 frames through the typewriter text writer:
+### Run the Interactive PC Runner
 
 ```bash
-./vm_host path/to/data.win
+./gm14_runner.exe --data "path/to/data.win"
 ```
 
-### Inspect `data.win` and Render Rooms to PNG
+### Run Headless Verification
+
+Step Undertale headless for 60 frames and save output:
 
 ```bash
-# Print general statistics:
-./gm14_host path/to/data.win
-
-# Render specific room indices to PNG:
-./gm14_host path/to/data.win 2 4 6 108
+./gm14_runner.exe --data "path/to/data.win" --headless 60 --dump-frame out.png
 ```
 
 ---
