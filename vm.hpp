@@ -76,6 +76,13 @@ struct EnvFrame {
     int loop_pc = 0;
 };
 
+// Global execution context trackers for crash and OOM diagnostics
+extern const char* g_diag_code_name;
+extern int g_diag_pc;
+extern const char* g_diag_obj_name;
+extern int g_diag_inst_id;
+extern const char* g_diag_func_name;
+
 struct DsGrid {
     int width = 0;
     int height = 0;
@@ -162,8 +169,10 @@ public:
     int view_x = 0, view_y = 0;
     int draw_color = 0xFFFFFF;
     double draw_alpha = 1.0;
+    int draw_blend_mode = 0; // 0 = bm_normal, 1 = bm_add, 2 = bm_max, 3 = bm_subtract
     int draw_font = -1;
     std::unordered_map<int, Image> page_cache;
+    std::vector<int> page_lru;
     const Image& page(int tex_index);
     bool tpag_image(int tpag_index, Image& out, int& tx, int& ty);
     void blit_screen(const Image& src, int dx, int dy, double alpha);

@@ -7,6 +7,9 @@
 #include <sstream>
 #include <cctype>
 #include <cstring>
+#if (defined(_3DS) || defined(__arm__) || defined(__linux__)) && !defined(_WIN32)
+#include <malloc.h>
+#endif
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -211,7 +214,14 @@ void Runtime::set_var(Frame& fr, const Instruction& ins, const Value& v) {
         globals[name] = v;
         return;
     }
-    if (inst_type == -5) { globals[name] = v; return; }
+    if (inst_type == -5) {
+        globals[name] = v;
+        if (v.is_arr()) {
+            global_arrays[name] = *v.arrref;
+            globals[name].arrref = &global_arrays[name];
+        }
+        return;
+    }
     if (inst_type == -7) { if (varid >= 0 && varid < (int)fr.locals.size()) fr.locals[varid] = v; return; }
     if (inst_type == -15) { if (varid >= 0 && varid < (int)fr.args.size()) fr.args[varid] = v; return; }
     if (name.size() > 8 && name.compare(0, 8, "argument") == 0) {
@@ -221,7 +231,13 @@ void Runtime::set_var(Frame& fr, const Instruction& ins, const Value& v) {
         return;
     }
     Instance* inst = resolve_inst(inst_type);
-    if (inst) inst->vars[name] = v;
+    if (inst) {
+        inst->vars[name] = v;
+        if (v.is_arr()) {
+            inst->arrays[name] = *v.arrref;
+            inst->vars[name].arrref = &inst->arrays[name];
+        }
+    }
 }
 
 Value Runtime::get_array(Frame& fr, const Instruction& ins, int inst_type, int index) {
@@ -249,6 +265,11 @@ Value Runtime::get_array(Frame& fr, const Instruction& ins, int inst_type, int i
     if (inst_type == -5) {
         auto it = global_arrays.find(name);
         if (it != global_arrays.end() && index >= 0 && index < (int)it->second.size()) return it->second[index];
+        auto git = globals.find(name);
+        if (git != globals.end() && git->second.is_arr()) {
+            const auto& arr = *git->second.arrref;
+            if (index >= 0 && index < (int)arr.size()) return arr[index];
+        }
         return Value(0.0);
     }
     if (inst_type == -7) {
@@ -261,6 +282,11 @@ Value Runtime::get_array(Frame& fr, const Instruction& ins, int inst_type, int i
     if (inst) {
         auto it = inst->arrays.find(name);
         if (it != inst->arrays.end() && index >= 0 && index < (int)it->second.size()) return it->second[index];
+        auto vit = inst->vars.find(name);
+        if (vit != inst->vars.end() && vit->second.is_arr()) {
+            const auto& arr = *vit->second.arrref;
+            if (index >= 0 && index < (int)arr.size()) return arr[index];
+        }
     }
     return Value(0.0);
 }
@@ -300,14 +326,31 @@ void Runtime::set_array(Frame& fr, const Instruction& ins, int inst_type, int in
         Instance* inst = resolve_inst(inst_type);
         if (!inst) return;
         arr = &inst->arrays[name];
+        if (arr->empty()) {
+            auto vit = inst->vars.find(name);
+            if (vit != inst->vars.end() && vit->second.is_arr()) {
+                *arr = *vit->second.arrref;
+                vit->second.arrref = arr;
+            }
+        }
     }
     if (index < 0) return;
     if (index >= (int)arr->size()) arr->resize(index + 1, Value(0.0));
     (*arr)[index] = v;
 }
 
+// Global execution context trackers for crash and OOM diagnostics
+const char* g_diag_code_name = nullptr;
+int g_diag_pc = -1;
+const char* g_diag_obj_name = nullptr;
+int g_diag_inst_id = -1;
+const char* g_diag_func_name = nullptr;
+
 // ---------------- execution ----------------
 Value Runtime::call(const std::string& name, std::vector<Value>& args) {
+    const char* prev_func = g_diag_func_name;
+    g_diag_func_name = name.c_str();
+
     if (diag_sink) {
         std::string line = "call " + name + " argc=" + std::to_string(args.size());
         for (size_t i = 0; i < args.size() && i < 6; ++i) {
@@ -321,9 +364,17 @@ Value Runtime::call(const std::string& name, std::vector<Value>& args) {
     // SHADOWS the builtin. This matters for Undertale, which defines its own
     // control_* / draw_* etc. scripts. Check scripts first.
     auto s = scripts.find(name);
-    if (s != scripts.end()) return run_entry(s->second, args, cur, other);
+    if (s != scripts.end()) {
+        Value res = run_entry(s->second, args, cur, other);
+        g_diag_func_name = prev_func;
+        return res;
+    }
     auto b = builtins.find(name);
-    if (b != builtins.end()) return b->second(*this, args);
+    if (b != builtins.end()) {
+        Value res = b->second(*this, args);
+        g_diag_func_name = prev_func;
+        return res;
+    }
     // Unknown function: log once, record it, pop nothing extra (args are already
     // consumed by the caller), and push a default real 0.0 so the game keeps
     // running instead of crashing.
@@ -334,6 +385,7 @@ Value Runtime::call(const std::string& name, std::vector<Value>& args) {
         m_unimplemented.push_back(name);
     }
     if (diag_sink) { std::string l = "UNIMPLEMENTED " + name; diag_sink(l.c_str()); }
+    g_diag_func_name = prev_func;
     return Value(0.0);
 }
 
@@ -357,8 +409,29 @@ Value Runtime::run_entry(const CodeEntry* entry, std::vector<Value>& args, Insta
     fr.self = self; fr.other = other_;
     Instance* oc = cur; Instance* oo = other;
     cur = self; other = other_;
+
+    const char* prev_code = g_diag_code_name;
+    int prev_pc = g_diag_pc;
+    const char* prev_obj = g_diag_obj_name;
+    int prev_inst = g_diag_inst_id;
+
+    g_diag_code_name = entry ? entry->name.c_str() : nullptr;
+    g_diag_pc = 0;
+    g_diag_obj_name = (self && self->obj >= 0 && self->obj < (int)dw.objects.size()) ? dw.objects[self->obj].name.c_str() : nullptr;
+    g_diag_inst_id = self ? self->iid : -1;
+
     try { exec(fr); }
-    catch (...) { cur = oc; other = oo; throw; }
+    catch (...) {
+        g_diag_code_name = prev_code;
+        g_diag_pc = prev_pc;
+        g_diag_obj_name = prev_obj;
+        g_diag_inst_id = prev_inst;
+        cur = oc; other = oo; throw;
+    }
+    g_diag_code_name = prev_code;
+    g_diag_pc = prev_pc;
+    g_diag_obj_name = prev_obj;
+    g_diag_inst_id = prev_inst;
     cur = oc; other = oo;
     return fr.value;
 }
@@ -558,7 +631,22 @@ void Runtime::exec(Frame& fr) {
 // ---------------- images / drawing ----------------
 const Image& Runtime::page(int tex_index) {
     auto it = page_cache.find(tex_index);
-    if (it == page_cache.end()) it = page_cache.emplace(tex_index, dw.load_texture(tex_index)).first;
+    if (it != page_cache.end()) {
+        auto lit = std::find(page_lru.begin(), page_lru.end(), tex_index);
+        if (lit != page_lru.end()) page_lru.erase(lit);
+        page_lru.push_back(tex_index);
+        return it->second;
+    }
+    while (page_cache.size() >= 2 && !page_lru.empty()) {
+        int evict_idx = page_lru.front();
+        page_lru.erase(page_lru.begin());
+        page_cache.erase(evict_idx);
+#if defined(_3DS) || defined(__arm__)
+        malloc_trim(0);
+#endif
+    }
+    page_lru.push_back(tex_index);
+    it = page_cache.emplace(tex_index, dw.load_texture(tex_index)).first;
     return it->second;
 }
 
@@ -584,6 +672,20 @@ bool Runtime::tpag_image(int tpag_index, Image& out, int& tx, int& ty) {
     return true;
 }
 
+static inline void blend_pixel(uint8_t* d, uint8_t sr, uint8_t sg, uint8_t sb, double sa, int blend_mode) {
+    if (blend_mode == 1) { // bm_add
+        d[0] = (uint8_t)std::min(255.0, (double)d[0] + sr * sa);
+        d[1] = (uint8_t)std::min(255.0, (double)d[1] + sg * sa);
+        d[2] = (uint8_t)std::min(255.0, (double)d[2] + sb * sa);
+        d[3] = 255;
+    } else { // bm_normal
+        d[0] = (uint8_t)std::min(255.0, sr * sa + d[0] * (1.0 - sa));
+        d[1] = (uint8_t)std::min(255.0, sg * sa + d[1] * (1.0 - sa));
+        d[2] = (uint8_t)std::min(255.0, sb * sa + d[2] * (1.0 - sa));
+        d[3] = 255;
+    }
+}
+
 void Runtime::blit_screen(const Image& src, int dx, int dy, double alpha) {
     if (!screen || src.w <= 0 || src.h <= 0) return;
     dx -= view_x;
@@ -597,7 +699,7 @@ void Runtime::blit_screen(const Image& src, int dx, int dy, double alpha) {
             uint8_t* d = &screen->rgba[((size_t)ty * screen->w + tx) * 4];
             double sa = (s[3] / 255.0) * (a / 255.0);
             if (sa <= 0) continue;
-            for (int c = 0; c < 3; ++c) d[c] = (uint8_t)std::min(255.0, s[c] * sa + d[c] * (1 - sa));
+            blend_pixel(d, s[0], s[1], s[2], sa, draw_blend_mode);
         }
     }
 }
@@ -615,12 +717,11 @@ void Runtime::blit_sub_screen(const Image& src, int sx, int sy, int sw, int sh, 
             const uint8_t* s = &src.rgba[((size_t)sy_pos * src.w + sx_pos) * 4];
             uint8_t* d = &screen->rgba[((size_t)ty * screen->w + tx) * 4];
             if (s[3] == 0) continue;
-            if (s[3] == 255 && a == 255) {
+            if (s[3] == 255 && a == 255 && draw_blend_mode == 0) {
                 d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = 255;
             } else {
                 double sa = (s[3] / 255.0) * (a / 255.0);
-                for (int c = 0; c < 3; ++c) d[c] = (uint8_t)std::min(255.0, s[c] * sa + d[c] * (1.0 - sa));
-                d[3] = 255;
+                blend_pixel(d, s[0], s[1], s[2], sa, draw_blend_mode);
             }
         }
     }
@@ -669,14 +770,11 @@ void Runtime::blit_sub_screen_scaled(const Image& src, int sx, int sy, int sw, i
             uint8_t sr = (uint8_t)((s[0] * tr) / 255);
             uint8_t sg = (uint8_t)((s[1] * tg) / 255);
             uint8_t sb = (uint8_t)((s[2] * tb) / 255);
-            if (s[3] == 255 && a255 == 255) {
+            if (s[3] == 255 && a255 == 255 && draw_blend_mode == 0) {
                 d[0] = sr; d[1] = sg; d[2] = sb; d[3] = 255;
             } else {
                 double sfa = (s[3] / 255.0) * (a255 / 255.0);
-                d[0] = (uint8_t)std::min(255.0, sr * sfa + d[0] * (1.0 - sfa));
-                d[1] = (uint8_t)std::min(255.0, sg * sfa + d[1] * (1.0 - sfa));
-                d[2] = (uint8_t)std::min(255.0, sb * sfa + d[2] * (1.0 - sfa));
-                d[3] = 255;
+                blend_pixel(d, sr, sg, sb, sfa, draw_blend_mode);
             }
         }
     }
@@ -705,14 +803,11 @@ void Runtime::blit_sub_screen_tint(const Image& src, int sx, int sy, int sw, int
             uint8_t sg = (uint8_t)((s[1] * tg) / 255);
             uint8_t sb = (uint8_t)((s[2] * tb) / 255);
 
-            if (s[3] == 255 && a == 255) {
+            if (s[3] == 255 && a == 255 && draw_blend_mode == 0) {
                 d[0] = sr; d[1] = sg; d[2] = sb; d[3] = 255;
             } else {
                 double sa = (s[3] / 255.0) * (a / 255.0);
-                d[0] = (uint8_t)std::min(255.0, sr * sa + d[0] * (1.0 - sa));
-                d[1] = (uint8_t)std::min(255.0, sg * sa + d[1] * (1.0 - sa));
-                d[2] = (uint8_t)std::min(255.0, sb * sa + d[2] * (1.0 - sa));
-                d[3] = 255;
+                blend_pixel(d, sr, sg, sb, sa, draw_blend_mode);
             }
         }
     }
@@ -1034,7 +1129,7 @@ void Runtime::register_builtins() {
     builtins["draw_set_font"] = [](Runtime& rt, std::vector<Value>& a){ rt.draw_font = (int)narg(a,0); return vnum(0); };
     builtins["draw_set_halign"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
     builtins["draw_set_valign"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
-    builtins["draw_set_blend_mode"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["draw_set_blend_mode"] = [](Runtime& rt, std::vector<Value>& a){ rt.draw_blend_mode = a.empty() ? 0 : (int)to_num(a[0]); return vnum(0); };
 
     builtins["room_goto"] = [](Runtime& rt, std::vector<Value>& a){ rt.pending_room=(int)narg(a,0); return vnum(0); };
     builtins["room_goto_next"] = [](Runtime& rt, std::vector<Value>&){
@@ -2974,8 +3069,12 @@ void Runtime::register_builtins() {
     builtins["draw_get_color"] = [](Runtime& rt, std::vector<Value>&) -> Value { return vnum(rt.draw_color); };
     builtins["draw_get_colour"] = builtins["draw_get_color"];
     builtins["draw_get_alpha"] = [](Runtime& rt, std::vector<Value>&) -> Value { return vnum(rt.draw_alpha); };
-    builtins["draw_set_blend_mode"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
-    builtins["draw_set_blend_mode_ext"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["draw_set_blend_mode"] = [](Runtime& rt, std::vector<Value>& a){
+        rt.draw_blend_mode = a.empty() ? 0 : (int)to_num(a[0]);
+        return vnum(0);
+    };
+    builtins["draw_set_blend_mode_ext"] = builtins["draw_set_blend_mode"];
+    builtins["draw_get_blend_mode"] = [](Runtime& rt, std::vector<Value>&){ return vnum(rt.draw_blend_mode); };
 
     // ---- harmless stubs (no 3DS equivalent / not needed yet) ----
     for (const char* n : {"ini_write_real","ini_write_string","ini_open_from_string","sprite_replace","sprite_delete",
@@ -3120,6 +3219,11 @@ void Runtime::start_room(int index, std::vector<std::unique_ptr<Instance>> keep)
 }
 
 void Runtime::change_room(int index) {
+    page_cache.clear();
+    page_lru.clear();
+#if defined(_3DS) || defined(__arm__)
+    malloc_trim(0);
+#endif
     for (size_t i = 0; i < instances.size(); ++i)
         if (instances[i]->alive) run_event(instances[i].get(), 7, 5);
     if (index < 0 || index >= (int)dw.rooms.size()) { running = false; return; }
