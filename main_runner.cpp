@@ -73,6 +73,7 @@ bool g_debug_unfreeze = false;
 bool g_debug_restart_room = false;
 bool g_debug_dump_info = false;
 bool g_debug_toggle_record = false;
+double g_speed_modifier = 1.0;
 
 struct InputRecorder {
     bool recording = false;
@@ -520,6 +521,21 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 g_debug_toggle_record = true;
                 return 0;
             }
+            if (wParam == VK_OEM_6) { // ']' key: speed up
+                g_speed_modifier += 0.5;
+                std::printf("[speed] Game speed set to %.2fx\n", g_speed_modifier);
+                return 0;
+            }
+            if (wParam == VK_OEM_4) { // '[' key: slow down
+                g_speed_modifier = std::max(0.1, g_speed_modifier - 0.5);
+                std::printf("[speed] Game speed set to %.2fx\n", g_speed_modifier);
+                return 0;
+            }
+            if (wParam == VK_OEM_5) { // '\' key: reset speed
+                g_speed_modifier = 1.0;
+                std::printf("[speed] Game speed reset to 1.0x\n");
+                return 0;
+            }
 
             int gm_key = map_vk_to_gm(wParam);
             bool repeat = (lParam & (1 << 30)) != 0;
@@ -527,6 +543,20 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 g_keys_pressed.insert(gm_key);
             }
             g_keys_held.insert(gm_key);
+
+            // Also map WASD to arrow keys for universal menu & directional navigation
+            int extra_gm_key = 0;
+            if (wParam == 'W' || wParam == 'w') extra_gm_key = 38; // vk_up
+            else if (wParam == 'A' || wParam == 'a') extra_gm_key = 37; // vk_left
+            else if (wParam == 'S' || wParam == 's') extra_gm_key = 40; // vk_down
+            else if (wParam == 'D' || wParam == 'd') extra_gm_key = 39; // vk_right
+
+            if (extra_gm_key != 0) {
+                if (!repeat || !g_keys_held.count(extra_gm_key)) {
+                    g_keys_pressed.insert(extra_gm_key);
+                }
+                g_keys_held.insert(extra_gm_key);
+            }
 
             // F4 or Alt+Enter toggles fullscreen
             if (wParam == VK_F4 || (wParam == VK_RETURN && (GetKeyState(VK_MENU) & 0x8000))) {
@@ -540,6 +570,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             int gm_key = map_vk_to_gm(wParam);
             g_keys_held.erase(gm_key);
             g_keys_released.insert(gm_key);
+
+            int extra_gm_key = 0;
+            if (wParam == 'W' || wParam == 'w') extra_gm_key = 38;
+            else if (wParam == 'A' || wParam == 'a') extra_gm_key = 37;
+            else if (wParam == 'S' || wParam == 's') extra_gm_key = 40;
+            else if (wParam == 'D' || wParam == 'd') extra_gm_key = 39;
+
+            if (extra_gm_key != 0) {
+                g_keys_held.erase(extra_gm_key);
+                g_keys_released.insert(extra_gm_key);
+            }
             return 0;
         }
 
@@ -638,6 +679,7 @@ void print_usage(const char* prog) {
     std::printf("  --room <id|name>      Start directly in room by index or name\n");
     std::printf("  --scale <1|2|3|4>     Window scale factor (default: 2 -> 1280x960)\n");
     std::printf("  --fps <n>             Override target FPS (default: room speed)\n");
+    std::printf("  --speed, -s <mult>    Game speed multiplier (e.g. 1.5, 2.0; default: 1.0)\n");
     std::printf("  --headless <frames>   Run N frames headless without opening a window\n");
     std::printf("  --timeout <seconds>   Run for N seconds then exit cleanly\n");
     std::printf("  --dump-frame <path>   Save final frame as PNG\n");
@@ -649,10 +691,12 @@ void print_usage(const char* prog) {
     std::printf("  --verbose, -v         Enable verbose diagnostic logging\n");
     std::printf("  --help, -h            Show this help text\n");
     std::printf("\nControls & Hotkeys:\n");
-    std::printf("  Arrow Keys            Movement / Navigation (vk_left, vk_right, vk_up, vk_down)\n");
+    std::printf("  Arrow Keys / WASD     Movement / Navigation (vk_left, vk_right, vk_up, vk_down)\n");
     std::printf("  Z / Enter             Confirm / Interact (gp_face1)\n");
     std::printf("  X / Shift             Cancel / Run (gp_face2)\n");
     std::printf("  C / Ctrl              Menu / Item (gp_face3)\n");
+    std::printf("  [ / ]                 Decrease / Increase game speed (+-0.5x)\n");
+    std::printf("  \\                     Reset game speed to 1.0x\n");
     std::printf("  F4 / Alt+Enter        Toggle Fullscreen\n");
     std::printf("  [PageDown]/[PageUp]   Skip room forward / backward\n");
     std::printf("  [Home]                Reload current room\n");
@@ -678,6 +722,8 @@ int main(int argc, char** argv) {
             cfg.scale = std::max(1, std::atoi(argv[++i]));
         } else if (arg == "--fps" && i + 1 < argc) {
             cfg.override_fps = std::atof(argv[++i]);
+        } else if ((arg == "--speed" || arg == "-s") && i + 1 < argc) {
+            g_speed_modifier = std::max(0.05, std::atof(argv[++i]));
         } else if (arg == "--headless" && i + 1 < argc) {
             cfg.headless_frames = std::max(1, std::atoi(argv[++i]));
         } else if (arg == "--timeout" && i + 1 < argc) {
@@ -967,6 +1013,8 @@ int main(int argc, char** argv) {
                                 rt.room_index, dw.rooms[rt.room_index].name.c_str(),
                                 target, dw.rooms[target].name.c_str());
                     std::fflush(stdout);
+                    rt.globals["interact"] = gm14::Value(3.0);
+                    rt.globals["entrance"] = gm14::Value(g_debug_skip_room > 0 ? 1.0 : 2.0);
                     rt.change_room(target);
                 }
                 g_debug_skip_room = 0;
@@ -1038,7 +1086,7 @@ int main(int argc, char** argv) {
                     target_fps = 30.0;
                 }
             }
-            double frame_duration = 1.0 / target_fps;
+            double frame_duration = 1.0 / (target_fps * g_speed_modifier);
 
             // Sync input: replayer or live user input
             if (g_replayer.replaying) {

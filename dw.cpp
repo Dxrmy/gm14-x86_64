@@ -94,6 +94,7 @@ DataWin::DataWin(const std::string& path) : filepath(path) {
     log_status("[8/10] Parsing fonts & backgrounds...\n");
     parse_fonts();
     parse_bgnd();
+    parse_paths();
 
     log_status("[9/10] Parsing objects...\n");
     parse_objects();
@@ -481,6 +482,42 @@ void DataWin::parse_bgnd() {
         auto f = tmap.find(u32(p+16));
         b.tpag = (f==tmap.end()) ? -1 : f->second;
         bgnds.push_back(std::move(b));
+    }
+}
+
+void DataWin::parse_paths() {
+    auto it_path = chunks.find("PATH");
+    if (it_path == chunks.end() || it_path->second.size == 0) return;
+    Chunk c = it_path->second;
+    for (uint32_t p : list_ptrs(*this, c.off)) {
+        Path path;
+        path.name = str_content(u32(p));
+        path.smooth = u32(p + 4) != 0;
+        path.closed = u32(p + 8) != 0;
+        path.precision = u32(p + 12);
+        uint32_t num_pts = u32(p + 16);
+        double cum_len = 0.0;
+        path.cumulative_lengths.push_back(0.0);
+        for (uint32_t j = 0; j < num_pts; ++j) {
+            PathPoint pt;
+            pt.x = f32(p + 20 + j * 12);
+            pt.y = f32(p + 24 + j * 12);
+            pt.speed = f32(p + 28 + j * 12);
+            if (j > 0) {
+                double dx = pt.x - path.points[j - 1].x;
+                double dy = pt.y - path.points[j - 1].y;
+                cum_len += std::hypot(dx, dy);
+                path.cumulative_lengths.push_back(cum_len);
+            }
+            path.points.push_back(pt);
+        }
+        if (path.closed && num_pts > 1) {
+            double dx = path.points[0].x - path.points.back().x;
+            double dy = path.points[0].y - path.points.back().y;
+            cum_len += std::hypot(dx, dy);
+        }
+        path.total_length = (cum_len > 0.001) ? cum_len : 1.0;
+        paths.push_back(std::move(path));
     }
 }
 

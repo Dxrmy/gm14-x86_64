@@ -239,6 +239,12 @@ Value Runtime::get_var(Frame& fr, const Instruction& ins) {
         }
         if (name == "id") return Value((double)inst->iid);
         if (name == "object_index") return Value((double)inst->obj);
+        if (name == "path_index") return Value((double)inst->path_index);
+        if (name == "path_position") return Value(inst->path_position);
+        if (name == "path_speed") return Value(inst->path_speed);
+        if (name == "path_scale") return Value(inst->path_scale);
+        if (name == "path_orientation") return Value(inst->path_orientation);
+        if (name == "path_endaction") return Value((double)inst->path_endaction);
 
         if (name == "bbox_left" || name == "bbox_top" || name == "bbox_right" || name == "bbox_bottom") {
             double cur_x = inst->vars.count("x") ? to_num(inst->vars["x"]) : 0.0;
@@ -279,6 +285,8 @@ Value Runtime::get_var(Frame& fr, const Instruction& ins) {
         {"xprevious",0},{"yprevious",0},{"bbox_left",0},{"bbox_top",0},
         {"bbox_right",0},{"bbox_bottom",0},{"gravity",0},{"gravity_direction",270},
         {"friction",0},
+        {"path_index",-1},{"path_position",0},{"path_positionprevious",0},
+        {"path_speed",0},{"path_scale",1},{"path_orientation",0},{"path_endaction",0},
     };
     auto d = defs.find(name);
     if (d != defs.end()) return Value(d->second);
@@ -303,6 +311,47 @@ void Runtime::set_var_inst(Instance* inst, const std::string& name, const Value&
         current_room_persistent = to_bool(v);
         globals["room_persistent"] = Value(current_room_persistent ? 1.0 : 0.0);
         if (!current_room_persistent && room_index >= 0) persistent_rooms.erase(room_index);
+        return;
+    }
+    if (name == "path_index") {
+        inst->path_index = (int)to_num(v);
+        inst->vars["path_index"] = Value((double)inst->path_index);
+        return;
+    }
+    if (name == "path_position") {
+        inst->path_position = std::max(0.0, std::min(1.0, to_num(v)));
+        inst->vars["path_position"] = Value(inst->path_position);
+        if (inst->path_index >= 0 && inst->path_index < (int)dw.paths.size()) {
+            double nx, ny, nspd;
+            get_path_point(dw.paths[inst->path_index], inst->path_position, nx, ny, nspd);
+            if (inst->path_absolute) {
+                inst->vars["x"] = Value(nx);
+                inst->vars["y"] = Value(ny);
+            } else {
+                inst->vars["x"] = Value(inst->path_start_x + nx);
+                inst->vars["y"] = Value(inst->path_start_y + ny);
+            }
+        }
+        return;
+    }
+    if (name == "path_speed") {
+        inst->path_speed = to_num(v);
+        inst->vars["path_speed"] = Value(inst->path_speed);
+        return;
+    }
+    if (name == "path_endaction") {
+        inst->path_endaction = (int)to_num(v);
+        inst->vars["path_endaction"] = Value((double)inst->path_endaction);
+        return;
+    }
+    if (name == "path_scale") {
+        inst->path_scale = to_num(v);
+        inst->vars["path_scale"] = Value(inst->path_scale);
+        return;
+    }
+    if (name == "path_orientation") {
+        inst->path_orientation = to_num(v);
+        inst->vars["path_orientation"] = Value(inst->path_orientation);
         return;
     }
     if (v.is_arr() && v.arrref) {
@@ -3927,9 +3976,112 @@ void Runtime::register_builtins() {
     builtins["draw_set_blend_mode"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
     builtins["draw_set_blend_mode_ext"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
 
+    // Path builtins
+    builtins["path_start"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        Instance* inst = rt.cur;
+        if (!inst || a.empty()) return vnum(0);
+        int path_idx = (int)narg(a, 0);
+        double spd = (a.size() > 1) ? narg(a, 1) : 1.0;
+        int endaction = (a.size() > 2) ? (int)narg(a, 2) : 0;
+        bool absolute = (a.size() > 3) ? to_bool(a[3]) : true;
+
+        if (path_idx < 0 || path_idx >= (int)rt.dw.paths.size()) {
+            inst->path_index = -1;
+            inst->vars["path_index"] = vnum(-1);
+            return vnum(0);
+        }
+
+        const auto& path = rt.dw.paths[path_idx];
+        inst->path_index = path_idx;
+        inst->path_speed = spd;
+        inst->path_endaction = endaction;
+        inst->path_absolute = absolute;
+        inst->path_position = (spd >= 0.0) ? 0.0 : 1.0;
+        inst->path_scale = 1.0;
+        inst->path_orientation = 0.0;
+
+        double cur_x = inst->vars.count("x") ? to_num(inst->vars["x"]) : 0.0;
+        double cur_y = inst->vars.count("y") ? to_num(inst->vars["y"]) : 0.0;
+
+        if (!path.points.empty()) {
+            if (absolute) {
+                inst->path_start_x = 0.0;
+                inst->path_start_y = 0.0;
+            } else {
+                inst->path_start_x = cur_x - path.points[0].x;
+                inst->path_start_y = cur_y - path.points[0].y;
+            }
+            double nx, ny, nspd;
+            rt.get_path_point(path, inst->path_position, nx, ny, nspd);
+            if (absolute) {
+                inst->vars["x"] = vnum(nx);
+                inst->vars["y"] = vnum(ny);
+            } else {
+                inst->vars["x"] = vnum(inst->path_start_x + nx);
+                inst->vars["y"] = vnum(inst->path_start_y + ny);
+            }
+        }
+        inst->vars["path_index"] = vnum(path_idx);
+        inst->vars["path_speed"] = vnum(spd);
+        inst->vars["path_position"] = vnum(inst->path_position);
+        inst->vars["path_endaction"] = vnum(endaction);
+        inst->vars["path_scale"] = vnum(1.0);
+        inst->vars["path_orientation"] = vnum(0.0);
+        return vnum(0);
+    };
+
+    builtins["path_end"] = [](Runtime& rt, std::vector<Value>&) -> Value {
+        Instance* inst = rt.cur;
+        if (!inst) return vnum(0);
+        inst->path_index = -1;
+        inst->path_speed = 0.0;
+        inst->vars["path_index"] = vnum(-1);
+        inst->vars["path_speed"] = vnum(0.0);
+        return vnum(0);
+    };
+
+    builtins["path_get_length"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        int idx = (int)narg(a, 0);
+        if (idx >= 0 && idx < (int)rt.dw.paths.size()) return vnum(rt.dw.paths[idx].total_length);
+        return vnum(0);
+    };
+    builtins["path_get_point_x"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        int idx = (int)narg(a, 0); int pt = (int)narg(a, 1);
+        if (idx >= 0 && idx < (int)rt.dw.paths.size() && pt >= 0 && pt < (int)rt.dw.paths[idx].points.size())
+            return vnum(rt.dw.paths[idx].points[pt].x);
+        return vnum(0);
+    };
+    builtins["path_get_point_y"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        int idx = (int)narg(a, 0); int pt = (int)narg(a, 1);
+        if (idx >= 0 && idx < (int)rt.dw.paths.size() && pt >= 0 && pt < (int)rt.dw.paths[idx].points.size())
+            return vnum(rt.dw.paths[idx].points[pt].y);
+        return vnum(0);
+    };
+    builtins["path_get_point_speed"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        int idx = (int)narg(a, 0); int pt = (int)narg(a, 1);
+        if (idx >= 0 && idx < (int)rt.dw.paths.size() && pt >= 0 && pt < (int)rt.dw.paths[idx].points.size())
+            return vnum(rt.dw.paths[idx].points[pt].speed);
+        return vnum(100);
+    };
+    builtins["path_get_number"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        int idx = (int)narg(a, 0);
+        if (idx >= 0 && idx < (int)rt.dw.paths.size()) return vnum(rt.dw.paths[idx].points.size());
+        return vnum(0);
+    };
+    builtins["path_get_closed"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        int idx = (int)narg(a, 0);
+        if (idx >= 0 && idx < (int)rt.dw.paths.size()) return vnum(rt.dw.paths[idx].closed ? 1 : 0);
+        return vnum(0);
+    };
+    builtins["path_get_name"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        int idx = (int)narg(a, 0);
+        if (idx >= 0 && idx < (int)rt.dw.paths.size()) return Value(rt.dw.paths[idx].name);
+        return Value(std::string(""));
+    };
+
     // ---- harmless stubs (no 3DS equivalent / not needed yet) ----
     for (const char* n : {"ini_write_real","ini_write_string","ini_open_from_string","sprite_replace","sprite_delete",
-        "sprite_create_from_surface","sprite_collision_mask","path_start","path_end","tile_layer_shift","tile_layer_hide",
+        "sprite_create_from_surface","sprite_collision_mask","tile_layer_shift","tile_layer_hide",
         "tile_layer_show","move_snap","draw_line_width","draw_line_width_color","draw_line_color","draw_set_circle_precision",
         "draw_ellipse_color","draw_triangle","draw_triangle_color","draw_roundrect","draw_point_color","draw_clear_alpha",
         "draw_background_part_ext","draw_background_stretched","draw_surface","draw_surface_ext",
@@ -4036,6 +4188,7 @@ void Runtime::start_room(int index, std::vector<std::unique_ptr<Instance>> keep)
         persistent_rooms.erase(it_pers);
     } else {
         current_room_persistent = room.persistent;
+        std::vector<std::pair<Instance*, int>> initial_new;
         for (const auto& ri : room.instances) {
             if (ri.obj < 0 || ri.obj >= (int)dw.objects.size()) continue;
             auto inst = std::make_unique<Instance>(ri.iid, ri.obj);
@@ -4052,12 +4205,20 @@ void Runtime::start_room(int index, std::vector<std::unique_ptr<Instance>> keep)
             inst->vars["object_index"] = vnum(ri.obj);
             inst->vars["id"] = vnum(ri.iid);
             if ((int)ri.iid >= next_iid) next_iid = (int)ri.iid + 1;
+            Instance* ip = inst.get();
             instances.push_back(std::move(inst));
-            Instance* ip = instances.back().get();
-            if (ri.creation_code >= 0 && ri.creation_code < (int)dw.code.size()) {
-                std::vector<Value> noargs; run_entry(&dw.code[ri.creation_code], noargs, ip, ip);
+            initial_new.push_back({ip, ri.creation_code});
+        }
+        for (auto& item : initial_new) {
+            Instance* ip = item.first;
+            int cc = item.second;
+            if (ip && ip->alive) {
+                run_event(ip, 0, 0);
+                if (cc >= 0 && cc < (int)dw.code.size() && ip->alive) {
+                    std::vector<Value> noargs;
+                    run_entry(&dw.code[cc], noargs, ip, ip);
+                }
             }
-            run_event(ip, 0, 0);
         }
         if (room.creation_code >= 0 && room.creation_code < (int)dw.code.size() && !instances.empty()) {
             std::vector<Value> noargs;
@@ -4223,6 +4384,65 @@ void Runtime::step() {
         double cur_x = v.count("x") ? to_num(v["x"]) : 0.0;
         double cur_y = v.count("y") ? to_num(v["y"]) : 0.0;
 
+        // Path motion integration
+        if (inst->path_index >= 0 && inst->path_index < (int)dw.paths.size() && inst->path_speed != 0.0) {
+            const auto& path = dw.paths[inst->path_index];
+            v["path_positionprevious"] = vnum(inst->path_position);
+            double cur_px, cur_py, cur_spd;
+            get_path_point(path, inst->path_position, cur_px, cur_py, cur_spd);
+            double step_dist = inst->path_speed * (cur_spd / 100.0);
+            double delta = (path.total_length > 0.0001) ? (step_dist / path.total_length) : 0.0;
+            inst->path_position += delta;
+
+            bool path_finished = false;
+            if (inst->path_speed > 0.0 && inst->path_position >= 1.0) {
+                path_finished = true;
+                if (inst->path_endaction == 0) { // stop
+                    inst->path_position = 1.0;
+                    inst->path_speed = 0.0;
+                } else if (inst->path_endaction == 1) { // restart
+                    inst->path_position = std::fmod(inst->path_position, 1.0);
+                } else if (inst->path_endaction == 2) { // continue
+                    inst->path_position = std::fmod(inst->path_position, 1.0);
+                } else if (inst->path_endaction == 3) { // reverse
+                    inst->path_position = 1.0 - (inst->path_position - 1.0);
+                    inst->path_speed = -inst->path_speed;
+                }
+            } else if (inst->path_speed < 0.0 && inst->path_position <= 0.0) {
+                path_finished = true;
+                if (inst->path_endaction == 0) { // stop
+                    inst->path_position = 0.0;
+                    inst->path_speed = 0.0;
+                } else if (inst->path_endaction == 1) { // restart
+                    inst->path_position = 1.0 + std::fmod(inst->path_position, 1.0);
+                } else if (inst->path_endaction == 2) { // continue
+                    inst->path_position = 1.0 + std::fmod(inst->path_position, 1.0);
+                } else if (inst->path_endaction == 3) { // reverse
+                    inst->path_position = -inst->path_position;
+                    inst->path_speed = -inst->path_speed;
+                }
+            }
+
+            double nx, ny, nspd;
+            get_path_point(path, inst->path_position, nx, ny, nspd);
+            if (inst->path_absolute) {
+                cur_x = nx;
+                cur_y = ny;
+            } else {
+                cur_x = inst->path_start_x + nx;
+                cur_y = inst->path_start_y + ny;
+            }
+            v["x"] = vnum(cur_x);
+            v["y"] = vnum(cur_y);
+            v["path_position"] = vnum(inst->path_position);
+            v["path_speed"] = vnum(inst->path_speed);
+
+            if (path_finished) {
+                run_event(inst, 7, 8); // Other 8: End of Path
+                if (!inst->alive) continue;
+            }
+        }
+
         double hs = v.count("hspeed") ? to_num(v["hspeed"]) : 0.0;
         double vs = v.count("vspeed") ? to_num(v["vspeed"]) : 0.0;
         double dir = v.count("direction") ? to_num(v["direction"]) : 0.0;
@@ -4296,6 +4516,8 @@ void Runtime::step() {
         if (anim_ended) run_event(inst, 7, 7); // Other 7: Animation End
     }
 
+    update_view_follow();
+
     // End step (subtype 2)
     {
         size_t n = instances.size();
@@ -4363,6 +4585,105 @@ void Runtime::step() {
     update_camera();
 }
 
+void Runtime::get_path_point(const Path& path, double pos, double& out_x, double& out_y, double& out_spd) {
+    if (path.points.empty()) {
+        out_x = 0.0; out_y = 0.0; out_spd = 100.0;
+        return;
+    }
+    if (path.points.size() == 1 || path.total_length <= 0.0001) {
+        out_x = path.points[0].x;
+        out_y = path.points[0].y;
+        out_spd = path.points[0].speed;
+        return;
+    }
+    pos = std::max(0.0, std::min(1.0, pos));
+    double target_d = pos * path.total_length;
+    size_t n = path.points.size();
+
+    if (target_d <= 0.0) {
+        out_x = path.points[0].x;
+        out_y = path.points[0].y;
+        out_spd = path.points[0].speed;
+        return;
+    }
+    if (!path.closed && target_d >= path.cumulative_lengths.back()) {
+        out_x = path.points.back().x;
+        out_y = path.points.back().y;
+        out_spd = path.points.back().speed;
+        return;
+    }
+
+    for (size_t i = 0; i + 1 < n; ++i) {
+        double d0 = path.cumulative_lengths[i];
+        double d1 = path.cumulative_lengths[i + 1];
+        if (target_d >= d0 && target_d <= d1) {
+            double seg_len = d1 - d0;
+            double t = (seg_len > 1e-6) ? (target_d - d0) / seg_len : 0.0;
+            out_x = path.points[i].x + t * (path.points[i + 1].x - path.points[i].x);
+            out_y = path.points[i].y + t * (path.points[i + 1].y - path.points[i].y);
+            out_spd = path.points[i].speed + t * (path.points[i + 1].speed - path.points[i].speed);
+            return;
+        }
+    }
+
+    if (path.closed) {
+        double d0 = path.cumulative_lengths.back();
+        double d1 = path.total_length;
+        if (target_d >= d0 && target_d <= d1) {
+            double seg_len = d1 - d0;
+            double t = (seg_len > 1e-6) ? (target_d - d0) / seg_len : 0.0;
+            out_x = path.points.back().x + t * (path.points[0].x - path.points.back().x);
+            out_y = path.points.back().y + t * (path.points[0].y - path.points.back().y);
+            out_spd = path.points.back().speed + t * (path.points[0].speed - path.points.back().speed);
+            return;
+        }
+    }
+
+    out_x = path.points.back().x;
+    out_y = path.points.back().y;
+    out_spd = path.points.back().speed;
+}
+
+void Runtime::update_view_follow() {
+    if (room_index < 0 || room_index >= (int)dw.rooms.size()) return;
+    const Room& room = dw.rooms[room_index];
+    int cw = 320, ch = 240;
+    bool views_on = (globals.count("view_enabled") && to_bool(globals["view_enabled"]));
+    if (views_on && global_arrays.count("view_wview") && !global_arrays["view_wview"].empty()) {
+        int vw = (int)to_num(global_arrays["view_wview"][0]);
+        int vh = (int)to_num(global_arrays["view_hview"][0]);
+        if (vw > 0 && vh > 0) { cw = vw; ch = vh; }
+    } else if (room.width > 0 && room.height > 0) {
+        cw = (int)room.width;
+        ch = (int)room.height;
+    }
+
+    int follow_obj = -1;
+    auto it_vo = global_arrays.find("view_object");
+    if (it_vo != global_arrays.end() && !it_vo->second.empty()) follow_obj = (int)to_num(it_vo->second[0]);
+
+    if (follow_obj >= 0 && (room.width > (uint32_t)cw || room.height > (uint32_t)ch)) {
+        for (auto& inst : instances) {
+            if (inst->alive && is_obj(dw, inst.get(), follow_obj)) {
+                double px = to_num(inst->vars.count("x") ? inst->vars["x"] : Value(0.0));
+                double py = to_num(inst->vars.count("y") ? inst->vars["y"] : Value(0.0));
+                int cam_x = (int)px - cw / 2;
+                int cam_y = (int)py - ch / 2;
+                cam_x = std::clamp(cam_x, 0, std::max(0, (int)room.width - cw));
+                cam_y = std::clamp(cam_y, 0, std::max(0, (int)room.height - ch));
+                if (!global_arrays.count("view_xview") || global_arrays["view_xview"].empty())
+                    global_arrays["view_xview"].resize(1, Value(0.0));
+                global_arrays["view_xview"][0] = Value((double)cam_x);
+
+                if (!global_arrays.count("view_yview") || global_arrays["view_yview"].empty())
+                    global_arrays["view_yview"].resize(1, Value(0.0));
+                global_arrays["view_yview"][0] = Value((double)cam_y);
+                break;
+            }
+        }
+    }
+}
+
 void Runtime::update_camera() {
     if (room_index < 0 || room_index >= (int)dw.rooms.size()) return;
     const Room& room = dw.rooms[room_index];
@@ -4378,29 +4699,11 @@ void Runtime::update_camera() {
     }
 
     int cam_x = 0, cam_y = 0;
-    int follow_obj = -1;
-    auto it_vo = global_arrays.find("view_object");
-    if (it_vo != global_arrays.end() && !it_vo->second.empty()) follow_obj = (int)to_num(it_vo->second[0]);
+    auto it_vx = global_arrays.find("view_xview");
+    auto it_vy = global_arrays.find("view_yview");
+    if (it_vx != global_arrays.end() && !it_vx->second.empty()) cam_x = (int)to_num(it_vx->second[0]);
+    if (it_vy != global_arrays.end() && !it_vy->second.empty()) cam_y = (int)to_num(it_vy->second[0]);
 
-    bool following = false;
-    if (follow_obj >= 0 && (room.width > (uint32_t)cw || room.height > (uint32_t)ch)) {
-        for (auto& inst : instances) {
-            if (inst->alive && is_obj(dw, inst.get(), follow_obj)) {
-                double px = to_num(inst->vars.count("x") ? inst->vars["x"] : Value(0.0));
-                double py = to_num(inst->vars.count("y") ? inst->vars["y"] : Value(0.0));
-                cam_x = (int)px - cw / 2;
-                cam_y = (int)py - ch / 2;
-                following = true;
-                break;
-            }
-        }
-    }
-    if (!following) {
-        auto it_vx = global_arrays.find("view_xview");
-        auto it_vy = global_arrays.find("view_yview");
-        if (it_vx != global_arrays.end() && !it_vx->second.empty()) cam_x = (int)to_num(it_vx->second[0]);
-        if (it_vy != global_arrays.end() && !it_vy->second.empty()) cam_y = (int)to_num(it_vy->second[0]);
-    }
     cam_x = std::clamp(cam_x, 0, std::max(0, (int)room.width - cw));
     cam_y = std::clamp(cam_y, 0, std::max(0, (int)room.height - ch));
 
@@ -4465,9 +4768,10 @@ Image Runtime::draw() {
 
     // Tiles (with frustum culling and zero-copy blitting)
     std::vector<const Tile*> ts;
+    const int margin = 32;
     for (auto& t : room.tiles) {
-        if (t.x + t.w <= view_x || t.x >= view_x + canvas.w ||
-            t.y + t.h <= view_y || t.y >= view_y + canvas.h) continue;
+        if (t.x + t.w < view_x - margin || t.x > view_x + canvas.w + margin ||
+            t.y + t.h < view_y - margin || t.y > view_y + canvas.h + margin) continue;
         ts.push_back(&t);
     }
     std::sort(ts.begin(), ts.end(), [](const Tile* a, const Tile* b){ return a->depth > b->depth; });

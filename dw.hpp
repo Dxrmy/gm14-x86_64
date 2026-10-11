@@ -152,6 +152,20 @@ struct Room {
     std::vector<Tile> tiles;
 };
 
+struct PathPoint {
+    float x = 0.0f, y = 0.0f, speed = 100.0f;
+};
+
+struct Path {
+    std::string name;
+    bool smooth = false;
+    bool closed = false;
+    uint32_t precision = 4;
+    std::vector<PathPoint> points;
+    double total_length = 0.0;
+    std::vector<double> cumulative_lengths;
+};
+
 // Event type -> subtype -> list of code-entry indices
 using EventMap = std::unordered_map<uint32_t, std::unordered_map<uint32_t, std::vector<int>>>;
 
@@ -299,6 +313,7 @@ public:
     std::vector<Font> fonts;
     std::vector<ObjDef> objects;
     std::vector<Room> rooms;
+    std::vector<Path> paths;
     std::vector<Sound> sounds;
     std::vector<EmbeddedAudio> audio;
 
@@ -361,6 +376,7 @@ private:
     void parse_scripts();
     void parse_sprites();
     void parse_bgnd();
+    void parse_paths();
     void parse_fonts();
     void parse_objects();
     void parse_rooms();

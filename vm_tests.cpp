@@ -9,6 +9,7 @@
 #endif
 #include <string>
 #include <vector>
+#include <set>
 
 using namespace gm14;
 
@@ -218,10 +219,12 @@ int main(int argc, char** argv) {
         std::vector<uint8_t> wav;
         auto push32 = [&](uint32_t v){ for (int i=0;i<4;++i) wav.push_back((uint8_t)(v>>(8*i))); };
         auto push16 = [&](uint16_t v){ for (int i=0;i<2;++i) wav.push_back((uint8_t)(v>>(8*i))); };
-        for (char c : std::string("RIFF")) wav.push_back((uint8_t)c); push32(36 + 8);
+        for (char c : std::string("RIFF")) wav.push_back((uint8_t)c);
+        push32(36 + 8);
         for (char c : std::string("WAVEfmt ")) wav.push_back((uint8_t)c);
         push32(16); push16(1); push16(1); push32(44100); push32(88200); push16(2); push16(16);
-        for (char c : std::string("data")) wav.push_back((uint8_t)c); push32(4);
+        for (char c : std::string("data")) wav.push_back((uint8_t)c);
+        push32(4);
         push16(1000); push16((uint16_t)65000);
         gm14::AudioClip clip;
         bool ok = gm14::decode_wav(wav.data(), wav.size(), clip);
@@ -411,6 +414,74 @@ int main(int argc, char** argv) {
         ok_num("action_move_to sets y", to_num(inst_ptr->vars["y"]), 456);
         C("action_kill_object", {});
         ok_bool("action_kill_object destroys instance", C("instance_exists", {num(inst_id)}), false);
+    }
+
+    // ================= Path system & two-pass room loading =================
+    {
+        // 1. PATH chunk parsing verification
+        ok_bool("paths parsed >= 45", Value(dw.paths.size() >= 45 ? 1.0 : 0.0), true);
+        if (dw.paths.size() > 5) {
+            ok_str("path 5 name is path_torielwalk1", dw.paths[5].name, "path_torielwalk1");
+            ok_num("path_get_number(5) == 7", to_num(C("path_get_number", {num(5)})), 7);
+            ok_str("path_get_name(5)", to_str(C("path_get_name", {num(5)})), "path_torielwalk1");
+            ok_bool("path_get_length(5) > 300", Value(to_num(C("path_get_length", {num(5)})) > 300 ? 1.0 : 0.0), true);
+        }
+
+        // 2. path_start and path following
+        double p_inst = to_num(C("instance_create", {num(100), num(100), num(0)}));
+        gm14::Instance* pi = rt.resolve_inst((int)p_inst);
+        rt.cur = pi;
+        C("path_start", {num(5), num(2.0), num(0), num(1)});
+        ok_num("pi path_index == 5", (double)pi->path_index, 5);
+        ok_num("pi path_speed == 2.0", pi->path_speed, 2.0);
+        ok_num("pi initial x snapped to path point 0", to_num(pi->vars["x"]), 140.0);
+        ok_num("pi initial y snapped to path point 0", to_num(pi->vars["y"]), 320.0);
+        C("path_end", {});
+        ok_num("pi path_index == -1 after path_end", (double)pi->path_index, -1);
+        C("instance_destroy", {num(p_inst)});
+
+        // 3. Room 6 entrance marker positioning & Toriel path following
+        if (dw.rooms.size() > 6 && dw.rooms[6].name == "room_ruins1") {
+            rt.globals["entrance"] = gm14::Value(1.0); // markerA entrance
+            rt.globals["interact"] = gm14::Value(3.0); // room transition state
+            rt.start_room(6);
+
+            gm14::Instance* player = nullptr;
+            for (auto& inst : rt.instances) {
+                if (inst->alive && dw.objects[inst->obj].name == "obj_mainchara") {
+                    player = inst.get();
+                    break;
+                }
+            }
+            ok_bool("player obj_mainchara found in room 6", Value(player != nullptr ? 1.0 : 0.0), true);
+            if (player) {
+                double px = to_num(player->vars["x"]);
+                double py = to_num(player->vars["y"]);
+                ok_num("player x at entrance marker", px, 150.0);
+                ok_num("player y at entrance marker (420 not 200)", py, 420.0);
+            }
+
+            Instance* tori = nullptr;
+            for (auto& inst : rt.instances) {
+                if (inst->alive && dw.objects[inst->obj].name == "obj_toroverworld2") {
+                    tori = inst.get();
+                    break;
+                }
+            }
+            ok_bool("obj_toroverworld2 found in room 6", Value(tori != nullptr ? 1.0 : 0.0), true);
+            if (tori && player) {
+                ok_num("Toriel initial path_index", (double)tori->path_index, 5.0);
+                // Simulate player following Toriel
+                for (int frame = 0; frame < 200; ++frame) {
+                    player->vars["y"] = gm14::Value(to_num(tori->vars["y"]) + 40.0);
+                    player->vars["x"] = tori->vars["x"];
+                    rt.step();
+                }
+                ok_bool("Toriel reached buster and destroyed herself", Value(!tori->alive ? 1.0 : 0.0), true);
+                double plot_val = rt.globals.count("plot") ? to_num(rt.globals["plot"]) : 0.0;
+                ok_num("global.plot advanced to 2 after path", plot_val, 2.0);
+            }
+        }
     }
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);

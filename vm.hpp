@@ -42,6 +42,16 @@ struct Instance {
     std::unordered_map<std::string, Value> vars;
     std::unordered_map<std::string, std::vector<Value>> arrays;
     std::vector<int> alarms;   // -1 == unset
+    // Path tracking
+    int path_index = -1;
+    double path_speed = 0.0;
+    double path_position = 0.0;
+    int path_endaction = 0;
+    bool path_absolute = true;
+    double path_scale = 1.0;
+    double path_orientation = 0.0;
+    double path_start_x = 0.0;
+    double path_start_y = 0.0;
     Instance(int iid_, int obj_) : iid(iid_), obj(obj_), alarms(12, -1) {}
 };
 
@@ -224,6 +234,8 @@ public:
     bool current_room_persistent = false;
     std::unordered_map<int, std::vector<std::unique_ptr<Instance>>> persistent_rooms;
     void update_camera();
+    void update_view_follow();
+    void get_path_point(const Path& path, double pos, double& out_x, double& out_y, double& out_spd);
 
     void step();
     Image draw();
