@@ -939,10 +939,15 @@ Image DataWin::render_room(int room_index) const {
         }
         if (pass == 0) {
             // tiles (behind instances)
-            std::vector<const Tile*> ts;
-            for (const auto& tl : room.tiles) ts.push_back(&tl);
-            std::sort(ts.begin(), ts.end(), [](const Tile* a, const Tile* b){ return a->depth > b->depth; });
-            for (const Tile* tl : ts) {
+            struct IndexedTile { const Tile* tl; size_t idx; };
+            std::vector<IndexedTile> ts;
+            for (size_t i = 0; i < room.tiles.size(); ++i) ts.push_back({&room.tiles[i], i});
+            std::sort(ts.begin(), ts.end(), [](const IndexedTile& a, const IndexedTile& b){
+                if (a.tl->depth != b.tl->depth) return a.tl->depth > b.tl->depth;
+                return a.idx < b.idx;
+            });
+            for (const auto& it : ts) {
+                const Tile* tl = it.tl;
                 if (tl->bgnd < 0 || tl->bgnd >= (int)bgnds.size()) continue;
                 const Bgnd& b = bgnds[tl->bgnd];
                 if (b.tpag < 0) continue;

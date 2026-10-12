@@ -779,11 +779,6 @@ void Runtime::exec(Frame& fr) {
         g_diag_pc = fr.pc;
         const Instruction& ins = ins_list[fr.pc];
         uint8_t k = ins.kind(), t1 = ins.type1();
-        if (diag_sink && fr.entry && fr.entry->name == "gml_Object_obj_overworldcontroller_Draw_0" && fr.pc >= 2345 && fr.pc <= 2385) {
-            std::string l = "OWC_PC=" + std::to_string(fr.pc) + " k=0x" + std::to_string((int)k) + " stk=" + std::to_string(fr.stack.size());
-            if (!fr.stack.empty()) l += " top=" + std::to_string(to_num(fr.stack.back()));
-            diag_sink(l.c_str());
-        }
         // Safe stack pop: GML bytecode occasionally under-flows on unusual paths
         // (malformed branch targets, missing event setup). Popping an empty stack
         // is undefined behaviour and manifests as a segfault or bad_alloc, so we
@@ -809,10 +804,17 @@ void Runtime::exec(Frame& fr) {
             if (t1 == 0x0F) {
                 if (fr.stack.size() >= 2) std::swap(fr.stack[fr.stack.size()-1], fr.stack[fr.stack.size()-2]);
             } else if (ins.var >= 0 && ins.ref_type() == 0x00) {
-                int idx = (int)to_num(stk_pop());
-                int it = (int)to_num(stk_pop());
-                Value v = stk_pop();
-                set_array(fr, ins, it, idx, v);
+                if (t1 != 0x5 && ins.type2() == 0x5) {
+                    Value v = stk_pop();
+                    int idx = (int)to_num(stk_pop());
+                    int it = (int)to_num(stk_pop());
+                    set_array(fr, ins, it, idx, v);
+                } else {
+                    int idx = (int)to_num(stk_pop());
+                    int it = (int)to_num(stk_pop());
+                    Value v = stk_pop();
+                    set_array(fr, ins, it, idx, v);
+                }
             } else {
                 int inst_type = (int)(int16_t)ins.low16();
                 if (inst_type == -9 || ins.ref_type() == 0x80) {
@@ -1481,7 +1483,8 @@ void Runtime::register_builtins() {
     // We look up optional scale/angle by fixed indices passed in.
     auto render_text_fn = [](Runtime& rt, std::vector<Value>& a,
                              int color_arg_idx, int alpha_arg_idx,
-                             int xscale_idx, int yscale_idx, int angle_idx) {
+                             int xscale_idx, int yscale_idx, int angle_idx,
+                             int sep_idx = -1) {
         if (a.size() < 3) return vnum(0);
         std::string txt = to_str(a[2]);
         if (txt.empty() || txt == "undefined") return vnum(0);
@@ -1513,42 +1516,98 @@ void Runtime::register_builtins() {
                 if (t.tex >= 0 && t.tex < (int)rt.dw.tex_ptrs.size()) {
                     const Image& pg = rt.page(t.tex);
                     bool transformed = (xscale != 1.0 || yscale != 1.0 || angle != 0.0);
-                    double x = x0, y = y0;
-                    for (char c : txt) {
-                        if (c == '\n') { x = x0; y += std::max<uint32_t>(1, f.em) * yscale; continue; }
-                        auto g = f.glyphs.find((uint8_t)c);
-                        if (g == f.glyphs.end()) g = f.glyphs.find((uint16_t)63);
-                        if (g == f.glyphs.end()) { x += 8 * xscale; continue; }
-                        const Glyph& gl = g->second;
-                        int g_sx = t.sx + gl.sx;
-                        int g_sy = t.sy + gl.sy;
-                        auto subpixel_round = [](double val) -> int {
-                            double f = std::floor(val);
-                            double frac = val - f;
-                            if (frac <= 0.001) return (int)f;
-                            if (frac >= 0.999) return (int)f + 1;
-                            double prob = (frac <= 0.5) ? (frac * 1.55) : frac;
-                            return (int)f + (((double)std::rand() / RAND_MAX < prob) ? 1 : 0);
-                        };
-                        if (gl.sw > 0 && gl.sh > 0 && g_sx + gl.sw <= pg.w && g_sy + gl.sh <= pg.h) {
-                            int base_dx = subpixel_round(x + gl.offset * xscale) - rt.view_x;
-                            int base_dy = subpixel_round(y) - rt.view_y;
-                            if (!transformed) {
-                                rt.blit_sub_screen_tint(pg, g_sx, g_sy, gl.sw, gl.sh, base_dx, base_dy, alp, col);
+
+                    // Split txt into lines considering unescaped '#' and '\n', with '\#' as literal '#'
+                    struct LineInfo {
+                        std::string text;
+                        double width = 0.0;
+                    };
+                    std::vector<LineInfo> lines;
+                    lines.emplace_back();
+                    for (size_t i = 0; i < txt.size(); ++i) {
+                        char c = txt[i];
+                        if (c == '\r') continue;
+                        if (c == '\\' && i + 1 < txt.size() && txt[i+1] == '#') {
+                            lines.back().text += '#';
+                            i++;
+                        } else if (c == '#' || c == '\n') {
+                            lines.emplace_back();
+                        } else {
+                            lines.back().text += c;
+                        }
+                    }
+
+                    double sep_val = (sep_idx >= 0 && (int)a.size() > sep_idx && to_num(a[sep_idx]) > 0)
+                        ? to_num(a[sep_idx])
+                        : (double)std::max<uint32_t>(1, f.em);
+                    double line_h = sep_val * yscale;
+
+                    for (auto& line : lines) {
+                        double lw = 0.0;
+                        for (char c : line.text) {
+                            auto g = f.glyphs.find((uint8_t)c);
+                            if (g == f.glyphs.end()) g = f.glyphs.find((uint16_t)63);
+                            if (g != f.glyphs.end()) {
+                                lw += g->second.shift * xscale;
                             } else {
-                                int ow = (int)std::lround(gl.sw * xscale);
-                                int oh = (int)std::lround(gl.sh * yscale);
-                                // Rotate each glyph about the text origin (x0,y0) so the
-                                // whole string stays coherent under one angle.
-                                double ang = angle * 3.14159265358979 / 180.0;
-                                double rx = (base_dx + rt.view_x) - x0;
-                                double ry = (base_dy + rt.view_y) - y0;
-                                int gx = subpixel_round(x0 + rx * std::cos(ang) - ry * std::sin(ang)) - rt.view_x;
-                                int gy = subpixel_round(y0 + rx * std::sin(ang) + ry * std::cos(ang)) - rt.view_y;
-                                rt.blit_sub_screen_scaled(pg, g_sx, g_sy, gl.sw, gl.sh, gx, gy, ow, oh, alp, col, angle);
+                                lw += 8.0 * xscale;
                             }
                         }
-                        x += gl.shift * xscale;
+                        line.width = lw;
+                    }
+
+                    double total_h = (double)lines.size() * line_h;
+                    double start_y = y0;
+                    if (rt.draw_valign == 1) { // fa_middle
+                        start_y = y0 - total_h / 2.0;
+                    } else if (rt.draw_valign == 2) { // fa_bottom
+                        start_y = y0 - total_h;
+                    }
+
+                    auto subpixel_round = [](double val) -> int {
+                        double fl = std::floor(val);
+                        double frac = val - fl;
+                        if (frac <= 0.001) return (int)fl;
+                        if (frac >= 0.999) return (int)fl + 1;
+                        double prob = (frac <= 0.5) ? (frac * 1.55) : frac;
+                        return (int)fl + (((double)std::rand() / RAND_MAX < prob) ? 1 : 0);
+                    };
+
+                    double cur_y = start_y;
+                    for (const auto& line : lines) {
+                        double cur_x = x0;
+                        if (rt.draw_halign == 1) { // fa_center
+                            cur_x = x0 - line.width / 2.0;
+                        } else if (rt.draw_halign == 2) { // fa_right
+                            cur_x = x0 - line.width;
+                        }
+                        double x = cur_x;
+                        for (char c : line.text) {
+                            auto g = f.glyphs.find((uint8_t)c);
+                            if (g == f.glyphs.end()) g = f.glyphs.find((uint16_t)63);
+                            if (g == f.glyphs.end()) { x += 8.0 * xscale; continue; }
+                            const Glyph& gl = g->second;
+                            int g_sx = t.sx + gl.sx;
+                            int g_sy = t.sy + gl.sy;
+                            if (gl.sw > 0 && gl.sh > 0 && g_sx + gl.sw <= pg.w && g_sy + gl.sh <= pg.h) {
+                                int base_dx = subpixel_round(x + gl.offset * xscale) - rt.view_x;
+                                int base_dy = subpixel_round(cur_y) - rt.view_y;
+                                if (!transformed) {
+                                    rt.blit_sub_screen_tint(pg, g_sx, g_sy, gl.sw, gl.sh, base_dx, base_dy, alp, col);
+                                } else {
+                                    int ow = (int)std::lround(gl.sw * xscale);
+                                    int oh = (int)std::lround(gl.sh * yscale);
+                                    double ang = angle * 3.14159265358979 / 180.0;
+                                    double rx = (base_dx + rt.view_x) - x0;
+                                    double ry = (base_dy + rt.view_y) - y0;
+                                    int gx = subpixel_round(x0 + rx * std::cos(ang) - ry * std::sin(ang)) - rt.view_x;
+                                    int gy = subpixel_round(y0 + rx * std::sin(ang) + ry * std::cos(ang)) - rt.view_y;
+                                    rt.blit_sub_screen_scaled(pg, g_sx, g_sy, gl.sw, gl.sh, gx, gy, ow, oh, alp, col, angle);
+                                }
+                            }
+                            x += gl.shift * xscale;
+                        }
+                        cur_y += line_h;
                     }
                     return vnum(0);
                 }
@@ -1559,15 +1618,15 @@ void Runtime::register_builtins() {
 
     builtins["draw_text"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, -1, -1, -1, -1, -1); };
     builtins["draw_text_transformed"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, -1, -1, 3, 4, 5); };
-    builtins["draw_text_ext"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, -1, -1, -1, -1, -1); };
+    builtins["draw_text_ext"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, -1, -1, -1, -1, -1, 3); };
     builtins["draw_text_color"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, 3, 7, -1, -1, -1); };
     builtins["draw_text_colour"] = builtins["draw_text_color"];
     builtins["draw_text_transformed_color"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, 6, 10, 3, 4, 5); };
     builtins["draw_text_transformed_colour"] = builtins["draw_text_transformed_color"];
-    builtins["draw_text_ext_color"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, 5, 9, -1, -1, -1); };
+    builtins["draw_text_ext_color"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, 5, 9, -1, -1, -1, 3); };
     builtins["draw_text_ext_colour"] = builtins["draw_text_ext_color"];
-    builtins["draw_text_ext_transformed"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, -1, -1, 5, 6, 7); };
-    builtins["draw_text_ext_transformed_color"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, 8, 12, 5, 6, 7); };
+    builtins["draw_text_ext_transformed"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, -1, -1, 5, 6, 7, 3); };
+    builtins["draw_text_ext_transformed_color"] = [=](Runtime& rt, std::vector<Value>& a){ return render_text_fn(rt, a, 8, 12, 5, 6, 7, 3); };
     builtins["draw_text_ext_transformed_colour"] = builtins["draw_text_ext_transformed_color"];
 
     builtins["draw_rectangle"] = [](Runtime& rt, std::vector<Value>& a){
@@ -1606,8 +1665,10 @@ void Runtime::register_builtins() {
     builtins["draw_circle"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
     builtins["draw_point"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
     builtins["draw_set_font"] = [](Runtime& rt, std::vector<Value>& a){ rt.draw_font = (int)narg(a,0); return vnum(0); };
-    builtins["draw_set_halign"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
-    builtins["draw_set_valign"] = [](Runtime&, std::vector<Value>&){ return vnum(0); };
+    builtins["draw_set_halign"] = [](Runtime& rt, std::vector<Value>& a){ rt.draw_halign = a.empty() ? 0 : (int)to_num(a[0]); return vnum(0); };
+    builtins["draw_get_halign"] = [](Runtime& rt, std::vector<Value>&){ return vnum(rt.draw_halign); };
+    builtins["draw_set_valign"] = [](Runtime& rt, std::vector<Value>& a){ rt.draw_valign = a.empty() ? 0 : (int)to_num(a[0]); return vnum(0); };
+    builtins["draw_get_valign"] = [](Runtime& rt, std::vector<Value>&){ return vnum(rt.draw_valign); };
     builtins["draw_set_blend_mode"] = [](Runtime& rt, std::vector<Value>& a){ rt.draw_blend_mode = a.empty() ? 0 : (int)to_num(a[0]); return vnum(0); };
 
     builtins["room_goto"] = [](Runtime& rt, std::vector<Value>& a){ rt.pending_room=(int)narg(a,0); return vnum(0); };
@@ -1991,8 +2052,70 @@ void Runtime::register_builtins() {
     builtins["string_upper"] = [](Runtime&, std::vector<Value>& a){ std::string s=sarg(a,0); for(auto&c:s)c=(char)std::toupper((unsigned char)c); return Value(s); };
     builtins["string_lower"] = [](Runtime&, std::vector<Value>& a){ std::string s=sarg(a,0); for(auto&c:s)c=(char)std::tolower((unsigned char)c); return Value(s); };
     builtins["string_pos"] = [](Runtime&, std::vector<Value>& a){ std::string h=sarg(a,1), n=sarg(a,0); auto p=h.find(n); return vnum(p==std::string::npos?0:(double)p+1); };
-    builtins["string_width"] = [](Runtime&, std::vector<Value>& a){ return vnum((double)sarg(a,0).size()*8); };
-    builtins["string_height"] = [](Runtime&, std::vector<Value>&){ return vnum(16); };
+    auto measure_string_fn = [](Runtime& rt, const std::string& str, double& out_w, double& out_h, double sep = -1.0) {
+        int fi = rt.draw_font;
+        if (fi < 0 && rt.dw.fonts.size() > 1) fi = 1;
+        else if (fi < 0 && !rt.dw.fonts.empty()) fi = 0;
+        const Font* f = (fi >= 0 && fi < (int)rt.dw.fonts.size()) ? &rt.dw.fonts[fi] : nullptr;
+        double line_h = (sep > 0) ? sep : (f ? (double)std::max<uint32_t>(1, f->em) : 16.0);
+
+        double max_w = 0.0;
+        double cur_w = 0.0;
+        int lines = 1;
+        for (size_t i = 0; i < str.size(); ++i) {
+            char c = str[i];
+            if (c == '\r') continue;
+            if (c == '\\' && i + 1 < str.size() && str[i+1] == '#') {
+                c = '#';
+                i++;
+            } else if (c == '#' || c == '\n') {
+                if (cur_w > max_w) max_w = cur_w;
+                cur_w = 0.0;
+                lines++;
+                continue;
+            }
+            if (f && !f->glyphs.empty()) {
+                auto g = f->glyphs.find((uint8_t)c);
+                if (g == f->glyphs.end()) g = f->glyphs.find((uint16_t)63);
+                if (g != f->glyphs.end()) {
+                    cur_w += g->second.shift;
+                } else {
+                    cur_w += 8.0;
+                }
+            } else {
+                cur_w += 8.0;
+            }
+        }
+        if (cur_w > max_w) max_w = cur_w;
+        out_w = max_w;
+        out_h = (double)lines * line_h;
+    };
+    builtins["string_width"] = [measure_string_fn](Runtime& rt, std::vector<Value>& a) {
+        if (a.empty()) return vnum(0.0);
+        double w = 0, h = 0;
+        measure_string_fn(rt, to_str(a[0]), w, h);
+        return vnum(w);
+    };
+    builtins["string_height"] = [measure_string_fn](Runtime& rt, std::vector<Value>& a) {
+        if (a.empty()) return vnum(16.0);
+        double w = 0, h = 0;
+        measure_string_fn(rt, to_str(a[0]), w, h);
+        return vnum(h);
+    };
+    builtins["string_width_ext"] = [measure_string_fn](Runtime& rt, std::vector<Value>& a) {
+        if (a.empty()) return vnum(0.0);
+        double sep = (a.size() > 1) ? to_num(a[1]) : -1.0;
+        double w = 0, h = 0;
+        measure_string_fn(rt, to_str(a[0]), w, h, sep);
+        return vnum(w);
+    };
+    builtins["string_height_ext"] = [measure_string_fn](Runtime& rt, std::vector<Value>& a) {
+        if (a.empty()) return vnum(16.0);
+        double sep = (a.size() > 1) ? to_num(a[1]) : -1.0;
+        double w = 0, h = 0;
+        measure_string_fn(rt, to_str(a[0]), w, h, sep);
+        return vnum(h);
+    };
     builtins["ord"] = [](Runtime&, std::vector<Value>& a){ std::string s=sarg(a,0); return vnum(s.empty()?0:(double)(unsigned char)s[0]); };
     builtins["chr"] = [](Runtime&, std::vector<Value>& a){ return Value(std::string(1,(char)(int)narg(a,0))); };
     builtins["is_undefined"] = [](Runtime&, std::vector<Value>& a){ return vnum((!a.empty() && a[0].type == Value::UNDEF) ? 1.0 : 0.0); };
@@ -4637,6 +4760,8 @@ void Runtime::step() {
                 }
             }
 
+            double prev_x = cur_x;
+            double prev_y = cur_y;
             double nx, ny, nspd;
             get_path_point(path, inst->path_position, nx, ny, nspd);
             if (inst->path_absolute) {
@@ -4650,6 +4775,11 @@ void Runtime::step() {
             v["y"] = vnum(cur_y);
             v["path_position"] = vnum(inst->path_position);
             v["path_speed"] = vnum(inst->path_speed);
+            if (std::abs(cur_x - prev_x) > 1e-4 || std::abs(cur_y - prev_y) > 1e-4) {
+                double pdir = std::atan2(-(cur_y - prev_y), cur_x - prev_x) * 180.0 / 3.14159265358979323846;
+                if (pdir < 0.0) pdir += 360.0;
+                v["direction"] = vnum(pdir);
+            }
 
             if (path_finished) {
                 run_event(inst, 7, 8); // Other 8: End of Path
@@ -4981,15 +5111,21 @@ Image Runtime::draw() {
     }
 
     // Tiles (with frustum culling and zero-copy blitting)
-    std::vector<const Tile*> ts;
+    struct IndexedTile { const Tile* tl; size_t idx; };
+    std::vector<IndexedTile> ts;
     const int margin = cfg.culling_margin;
-    for (auto& t : room.tiles) {
+    for (size_t i = 0; i < room.tiles.size(); ++i) {
+        const auto& t = room.tiles[i];
         if (t.x + t.w < view_x - margin || t.x > view_x + canvas.w + margin ||
             t.y + t.h < view_y - margin || t.y > view_y + canvas.h + margin) continue;
-        ts.push_back(&t);
+        ts.push_back({&t, i});
     }
-    std::sort(ts.begin(), ts.end(), [](const Tile* a, const Tile* b){ return a->depth > b->depth; });
-    for (const Tile* tl : ts) {
+    std::sort(ts.begin(), ts.end(), [](const IndexedTile& a, const IndexedTile& b){
+        if (a.tl->depth != b.tl->depth) return a.tl->depth > b.tl->depth;
+        return a.idx < b.idx;
+    });
+    for (const auto& it : ts) {
+        const Tile* tl = it.tl;
         if (tl->bgnd < 0 || tl->bgnd >= (int)dw.bgnds.size()) continue;
         int tp = dw.bgnds[tl->bgnd].tpag;
         if (tp < 0 || tp >= (int)dw.tpags.size()) continue;

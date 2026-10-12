@@ -146,7 +146,11 @@ extern int g_diag_inst_id;
 extern const char* g_diag_func_name;
 
 struct EngineConfig {
-    int max_texture_pages = 6;            // Max texture sheets kept in RAM (2 on 3DS, 6 on low-spec/PC, 0 = unlimited)
+#ifdef _3DS
+    int max_texture_pages = 2;            // Max texture sheets kept in RAM (2 on 3DS, 0 = unlimited on PC)
+#else
+    int max_texture_pages = 0;            // Max texture sheets kept in RAM (0 = unlimited on PC)
+#endif
     size_t audio_pcm_budget_bytes = 16 * 1024 * 1024; // Bounded PCM sound cache (8MB on 3DS, 16MB on low-spec/PC)
     long long instruction_budget = 2000000;// Bytecode loop watchdog (250k on 3DS, 2M on PC)
     int culling_margin = 32;              // Safety margin for tile culling
@@ -199,6 +203,8 @@ public:
     double draw_alpha = 1.0;
     int draw_blend_mode = 0; // 0 = bm_normal, 1 = bm_add, 2 = bm_max, 3 = bm_subtract
     int draw_font = -1;
+    int draw_halign = 0; // 0=fa_left, 1=fa_center, 2=fa_right
+    int draw_valign = 0; // 0=fa_top, 1=fa_middle, 2=fa_bottom
     std::unordered_map<int, Image> page_cache;
     std::vector<int> page_lru;
     const Image& page(int tex_index);
