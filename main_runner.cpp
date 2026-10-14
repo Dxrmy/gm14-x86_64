@@ -45,6 +45,8 @@ struct RunnerConfig {
     std::string record_path;
     std::string replay_path;
     bool verbose = true;
+    std::string save_state_on_exit;
+    std::string load_state_on_start;
 };
 
 // Global state
@@ -74,6 +76,80 @@ bool g_debug_restart_room = false;
 bool g_debug_dump_info = false;
 bool g_debug_toggle_record = false;
 double g_speed_modifier = 1.0;
+
+HWND g_debug_hwnd = nullptr;
+HWND g_lbl_room = nullptr;
+HWND g_lbl_speed = nullptr;
+HWND g_lbl_player = nullptr;
+HWND g_lbl_stats = nullptr;
+HWND g_edit_room = nullptr;
+std::string g_debug_goto_room_str;
+bool g_debug_heal = false;
+
+// Extended Debug & Cheat controls
+bool g_debug_disable_encounters = false;
+bool g_debug_god_mode = false;
+bool g_debug_noclip = false;
+bool g_debug_native_mode = false;
+bool g_debug_max_gold = false;
+bool g_debug_max_stats = false;
+bool g_debug_save_anywhere = false;
+bool g_debug_open_box = false;
+int g_debug_set_fun_val = -1;
+int g_debug_give_item_id = -1;
+bool g_debug_clear_items = false;
+
+HWND g_chk_no_encounters = nullptr;
+HWND g_chk_god_mode = nullptr;
+HWND g_chk_noclip = nullptr;
+HWND g_chk_native_debug = nullptr;
+HWND g_lbl_fun = nullptr;
+HWND g_edit_fun = nullptr;
+HWND g_cmb_items = nullptr;
+HWND g_edit_item_id = nullptr;
+HWND g_lbl_item_status = nullptr;
+
+// State Saver / Loader controls
+std::string g_debug_save_state_name;
+std::string g_debug_load_state_name;
+HWND g_lbl_state_status = nullptr;
+HWND g_edit_state = nullptr;
+
+enum {
+    IDC_DEBUG_PREV = 1001,
+    IDC_DEBUG_NEXT = 1002,
+    IDC_DEBUG_RELOAD = 1003,
+    IDC_DEBUG_GOTO = 1004,
+    IDC_DEBUG_EDIT = 1005,
+    IDC_DEBUG_SPDDOWN = 1006,
+    IDC_DEBUG_SPDUP = 1007,
+    IDC_DEBUG_SPD1X = 1008,
+    IDC_DEBUG_SPD2X = 1009,
+    IDC_DEBUG_SPD5X = 1010,
+    IDC_DEBUG_SPD10X = 1011,
+    IDC_DEBUG_UNFREEZE = 1012,
+    IDC_DEBUG_HEAL = 1013,
+    IDC_DEBUG_DUMP = 1014,
+    IDC_DEBUG_RECORD = 1015,
+    IDC_DEBUG_FULLSCREEN = 1016,
+    IDC_DEBUG_SAVESTATE = 1017,
+    IDC_DEBUG_LOADSTATE = 1018,
+    IDC_DEBUG_EDIT_STATE = 1019,
+    IDC_DEBUG_NO_ENCOUNTERS = 1020,
+    IDC_DEBUG_GOD_MODE = 1021,
+    IDC_DEBUG_NOCLIP = 1022,
+    IDC_DEBUG_NATIVE_DEBUG = 1023,
+    IDC_DEBUG_MAX_GOLD = 1024,
+    IDC_DEBUG_MAX_STATS = 1025,
+    IDC_DEBUG_SAVE_ANYWHERE = 1026,
+    IDC_DEBUG_OPEN_BOX = 1027,
+    IDC_DEBUG_SET_FUN = 1028,
+    IDC_DEBUG_EDIT_FUN = 1029,
+    IDC_DEBUG_CMB_ITEMS = 1030,
+    IDC_DEBUG_EDIT_ITEM_ID = 1031,
+    IDC_DEBUG_GIVE_ITEM = 1032,
+    IDC_DEBUG_CLEAR_ITEMS = 1033
+};
 
 struct InputRecorder {
     bool recording = false;
@@ -475,6 +551,375 @@ void render_frame(HDC hdc) {
                   dst, &bmi, DIB_RGB_COLORS, SRCCOPY);
 }
 
+static void sync_fun_to_disk_ini(const std::string& path, int fval) {
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> sections;
+    FILE* fp = std::fopen(path.c_str(), "rb");
+    if (fp) {
+        std::fseek(fp, 0, SEEK_END);
+        long sz = std::ftell(fp);
+        std::fseek(fp, 0, SEEK_SET);
+        if (sz > 0) {
+            std::string content(sz, '\0');
+            size_t r = std::fread(&content[0], 1, sz, fp);
+            content.resize(r);
+            std::string current_sec = "";
+            size_t pos = 0;
+            while (pos < content.size()) {
+                size_t next = content.find_first_of("\r\n", pos);
+                std::string line = (next == std::string::npos) ? content.substr(pos) : content.substr(pos, next - pos);
+                pos = (next == std::string::npos) ? content.size() : next + 1;
+                if (pos < content.size() && content[pos-1] == '\r' && content[pos] == '\n') pos++;
+                size_t first = line.find_first_not_of(" \t");
+                if (first == std::string::npos) continue;
+                size_t last = line.find_last_not_of(" \t");
+                line = line.substr(first, last - first + 1);
+                if (line.empty() || line[0] == ';' || line[0] == '#') continue;
+                if (line.front() == '[' && line.back() == ']') {
+                    current_sec = line.substr(1, line.size() - 2);
+                } else {
+                    size_t eq = line.find('=');
+                    if (eq != std::string::npos) {
+                        std::string key = line.substr(0, eq);
+                        std::string val = line.substr(eq + 1);
+                        size_t klast = key.find_last_not_of(" \t");
+                        if (klast != std::string::npos) key = key.substr(0, klast + 1);
+                        if (val.size() >= 2 && ((val.front() == '"' && val.back() == '"') || (val.front() == '\'' && val.back() == '\'')))
+                            val = val.substr(1, val.size() - 2);
+                        sections[current_sec][key] = val;
+                    }
+                }
+            }
+        }
+        std::fclose(fp);
+    }
+    sections["General"]["fun"] = std::to_string(fval);
+    std::string out;
+    for (const auto& sec : sections) {
+        out += "[" + sec.first + "]\r\n";
+        for (const auto& kv : sec.second) {
+            out += kv.first + "=" + kv.second + "\r\n";
+        }
+    }
+    fp = std::fopen(path.c_str(), "wb");
+    if (fp) {
+        std::fwrite(out.data(), 1, out.size(), fp);
+        std::fclose(fp);
+    }
+}
+
+static void refresh_state_list() {
+    if (!g_edit_state) return;
+    char current_txt[128] = {0};
+    GetWindowTextA(g_edit_state, current_txt, sizeof(current_txt));
+    SendMessageA(g_edit_state, CB_RESETCONTENT, 0, 0);
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind = FindFirstFileA("states/*.state", &fd);
+    bool found_any = false;
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                std::string fn = fd.cFileName;
+                if (fn.size() > 6 && fn.substr(fn.size() - 6) == ".state") {
+                    fn = fn.substr(0, fn.size() - 6);
+                }
+                SendMessageA(g_edit_state, CB_ADDSTRING, 0, (LPARAM)fn.c_str());
+                found_any = true;
+            }
+        } while (FindNextFileA(hFind, &fd));
+        FindClose(hFind);
+    }
+    if (current_txt[0] != '\0') {
+        SetWindowTextA(g_edit_state, current_txt);
+    } else if (!found_any) {
+        SetWindowTextA(g_edit_state, "quicksave");
+    } else {
+        SendMessageA(g_edit_state, CB_SETCURSEL, 0, 0);
+    }
+}
+
+LRESULT CALLBACK DebugWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    switch (uMsg) {
+        case WM_COMMAND: {
+            int id = LOWORD(wParam);
+            int code = HIWORD(wParam);
+            if (id == IDC_DEBUG_EDIT_STATE && code == CBN_DROPDOWN) {
+                refresh_state_list();
+            }
+            if (id == IDC_DEBUG_CMB_ITEMS && code == CBN_SELCHANGE) {
+                if (g_cmb_items && g_edit_item_id) {
+                    int cur_sel = (int)SendMessageA(g_cmb_items, CB_GETCURSEL, 0, 0);
+                    if (cur_sel != CB_ERR) {
+                        char buf[128] = {0};
+                        SendMessageA(g_cmb_items, CB_GETLBTEXT, cur_sel, (LPARAM)buf);
+                        int item_id = std::atoi(buf);
+                        char id_str[32];
+                        std::snprintf(id_str, sizeof(id_str), "%d", item_id);
+                        SetWindowTextA(g_edit_item_id, id_str);
+                    }
+                }
+            }
+            if (id == IDC_DEBUG_PREV) g_debug_skip_room = -1;
+            else if (id == IDC_DEBUG_NEXT) g_debug_skip_room = 1;
+            else if (id == IDC_DEBUG_RELOAD) g_debug_restart_room = true;
+            else if (id == IDC_DEBUG_GOTO) {
+                if (g_edit_room) {
+                    char buf[128] = {0};
+                    GetWindowTextA(g_edit_room, buf, sizeof(buf));
+                    g_debug_goto_room_str = buf;
+                }
+            }
+            else if (id == IDC_DEBUG_SPDDOWN) {
+                g_speed_modifier = std::max(0.1, g_speed_modifier - 0.5);
+                std::printf("[speed] Game speed set to %.2fx\n", g_speed_modifier);
+            }
+            else if (id == IDC_DEBUG_SPDUP) {
+                g_speed_modifier += 0.5;
+                std::printf("[speed] Game speed set to %.2fx\n", g_speed_modifier);
+            }
+            else if (id == IDC_DEBUG_SPD1X) {
+                g_speed_modifier = 1.0;
+                std::printf("[speed] Game speed set to 1.0x\n");
+            }
+            else if (id == IDC_DEBUG_SPD2X) {
+                g_speed_modifier = 2.0;
+                std::printf("[speed] Game speed set to 2.0x\n");
+            }
+            else if (id == IDC_DEBUG_SPD5X) {
+                g_speed_modifier = 5.0;
+                std::printf("[speed] Game speed set to 5.0x\n");
+            }
+            else if (id == IDC_DEBUG_SPD10X) {
+                g_speed_modifier = 10.0;
+                std::printf("[speed] Game speed set to 10.0x\n");
+            }
+            else if (id == IDC_DEBUG_UNFREEZE) g_debug_unfreeze = true;
+            else if (id == IDC_DEBUG_HEAL) g_debug_heal = true;
+            else if (id == IDC_DEBUG_DUMP) g_debug_dump_info = true;
+            else if (id == IDC_DEBUG_RECORD) g_debug_toggle_record = true;
+            else if (id == IDC_DEBUG_FULLSCREEN) toggle_fullscreen(g_hwnd);
+            else if (id == IDC_DEBUG_NO_ENCOUNTERS) {
+                g_debug_disable_encounters = (SendMessageA(g_chk_no_encounters, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                std::printf("[debug] Encounters: %s\n", g_debug_disable_encounters ? "DISABLED" : "ENABLED");
+            }
+            else if (id == IDC_DEBUG_GOD_MODE) {
+                g_debug_god_mode = (SendMessageA(g_chk_god_mode, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                std::printf("[debug] God Mode: %s\n", g_debug_god_mode ? "ON" : "OFF");
+            }
+            else if (id == IDC_DEBUG_NOCLIP) {
+                g_debug_noclip = (SendMessageA(g_chk_noclip, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                std::printf("[debug] Noclip / Phasing: %s\n", g_debug_noclip ? "ON" : "OFF");
+            }
+            else if (id == IDC_DEBUG_NATIVE_DEBUG) {
+                g_debug_native_mode = (SendMessageA(g_chk_native_debug, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                std::printf("[debug] Undertale Debug Mode: %s\n", g_debug_native_mode ? "ON" : "OFF");
+            }
+            else if (id == IDC_DEBUG_MAX_GOLD) g_debug_max_gold = true;
+            else if (id == IDC_DEBUG_MAX_STATS) g_debug_max_stats = true;
+            else if (id == IDC_DEBUG_SAVE_ANYWHERE) g_debug_save_anywhere = true;
+            else if (id == IDC_DEBUG_OPEN_BOX) g_debug_open_box = true;
+            else if (id == IDC_DEBUG_SET_FUN) {
+                if (g_edit_fun) {
+                    char buf[64] = {0};
+                    GetWindowTextA(g_edit_fun, buf, sizeof(buf));
+                    if (buf[0] != '\0') g_debug_set_fun_val = std::atoi(buf);
+                }
+            }
+            else if (id == IDC_DEBUG_GIVE_ITEM) {
+                int item_id = -1;
+                if (g_edit_item_id) {
+                    char buf[64] = {0};
+                    GetWindowTextA(g_edit_item_id, buf, sizeof(buf));
+                    if (buf[0] != '\0') item_id = std::atoi(buf);
+                }
+                if (item_id < 0 && g_cmb_items) {
+                    int cur_sel = (int)SendMessageA(g_cmb_items, CB_GETCURSEL, 0, 0);
+                    if (cur_sel != CB_ERR) {
+                        char buf[128] = {0};
+                        SendMessageA(g_cmb_items, CB_GETLBTEXT, cur_sel, (LPARAM)buf);
+                        item_id = std::atoi(buf);
+                    }
+                }
+                if (item_id >= 0) {
+                    g_debug_give_item_id = item_id;
+                }
+            }
+            else if (id == IDC_DEBUG_CLEAR_ITEMS) g_debug_clear_items = true;
+            else if (id == IDC_DEBUG_SAVESTATE) {
+                char buf[128] = {0};
+                if (g_edit_state) GetWindowTextA(g_edit_state, buf, sizeof(buf));
+                std::string s = buf;
+                if (s.empty()) s = "quicksave";
+                g_debug_save_state_name = s;
+            }
+            else if (id == IDC_DEBUG_LOADSTATE) {
+                char buf[128] = {0};
+                if (g_edit_state) GetWindowTextA(g_edit_state, buf, sizeof(buf));
+                std::string s = buf;
+                if (s.empty()) s = "quicksave";
+                g_debug_load_state_name = s;
+            }
+            return 0;
+        }
+        case WM_CLOSE: {
+            ShowWindow(hwnd, SW_HIDE);
+            return 0;
+        }
+        default:
+            return DefWindowProcA(hwnd, uMsg, wParam, lParam);
+    }
+}
+
+void create_debug_window(HINSTANCE hInst, int x, int y) {
+    const char* kDbgClass = "GM14_DEBUG_CLASS";
+    WNDCLASSEXA dwc;
+    ZeroMemory(&dwc, sizeof(dwc));
+    dwc.cbSize = sizeof(dwc);
+    dwc.lpfnWndProc = DebugWindowProc;
+    dwc.hInstance = hInst;
+    dwc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    dwc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    dwc.lpszClassName = kDbgClass;
+    RegisterClassExA(&dwc);
+
+    g_debug_hwnd = CreateWindowExA(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        kDbgClass,
+        "gm14 Debug Menu (~ to toggle)",
+        WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        x, y, 380, 775,
+        nullptr, nullptr, hInst, nullptr
+    );
+    if (!g_debug_hwnd) return;
+
+    HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+    auto make_ctrl = [&](const char* cls, const char* txt, DWORD style, int cx, int cy, int cw, int ch, int id) -> HWND {
+        HWND h = CreateWindowA(cls, txt, WS_CHILD | WS_VISIBLE | style, cx, cy, cw, ch, g_debug_hwnd, (HMENU)(intptr_t)id, hInst, nullptr);
+        if (h && hFont) SendMessageA(h, WM_SETFONT, (WPARAM)hFont, TRUE);
+        return h;
+    };
+
+    // Room controls
+    make_ctrl("STATIC", "--- Room Navigation ---", SS_CENTER, 10, 10, 340, 18, 0);
+    g_lbl_room = make_ctrl("STATIC", "Room: ...", 0, 10, 30, 340, 20, 0);
+    make_ctrl("BUTTON", "< Prev (PgUp)", 0, 10, 55, 105, 26, IDC_DEBUG_PREV);
+    make_ctrl("BUTTON", "Reload (Home)", 0, 125, 55, 110, 26, IDC_DEBUG_RELOAD);
+    make_ctrl("BUTTON", "Next > (PgDn)", 0, 245, 55, 105, 26, IDC_DEBUG_NEXT);
+
+    make_ctrl("STATIC", "Jump to Room:", 0, 10, 88, 90, 20, 0);
+    g_edit_room = make_ctrl("EDIT", "", WS_BORDER | ES_AUTOHSCROLL, 105, 86, 160, 22, IDC_DEBUG_EDIT);
+    make_ctrl("BUTTON", "Go", 0, 275, 85, 75, 24, IDC_DEBUG_GOTO);
+
+    // Speed controls
+    make_ctrl("STATIC", "--- Game Speed ---", SS_CENTER, 10, 120, 340, 18, 0);
+    g_lbl_speed = make_ctrl("STATIC", "Speed: 1.00x", 0, 10, 140, 340, 20, 0);
+    make_ctrl("BUTTON", "-0.5x [", 0, 10, 165, 50, 26, IDC_DEBUG_SPDDOWN);
+    make_ctrl("BUTTON", "1.0x \\", 0, 65, 165, 50, 26, IDC_DEBUG_SPD1X);
+    make_ctrl("BUTTON", "2.0x", 0, 120, 165, 50, 26, IDC_DEBUG_SPD2X);
+    make_ctrl("BUTTON", "5.0x", 0, 175, 165, 50, 26, IDC_DEBUG_SPD5X);
+    make_ctrl("BUTTON", "10x", 0, 230, 165, 50, 26, IDC_DEBUG_SPD10X);
+    make_ctrl("BUTTON", "+0.5x ]", 0, 285, 165, 65, 26, IDC_DEBUG_SPDUP);
+
+    // Cheats & Gameplay
+    make_ctrl("STATIC", "--- Cheats & Gameplay ---", SS_CENTER, 10, 202, 340, 18, 0);
+    g_chk_no_encounters = make_ctrl("BUTTON", "Disable Encounters (Ctrl+E)", BS_AUTOCHECKBOX, 10, 222, 170, 22, IDC_DEBUG_NO_ENCOUNTERS);
+    g_chk_god_mode = make_ctrl("BUTTON", "God Mode / Inf HP (Ctrl+G)", BS_AUTOCHECKBOX, 185, 222, 165, 22, IDC_DEBUG_GOD_MODE);
+    g_chk_noclip = make_ctrl("BUTTON", "Noclip / Phasing (F10)", BS_AUTOCHECKBOX, 10, 246, 170, 22, IDC_DEBUG_NOCLIP);
+    g_chk_native_debug = make_ctrl("BUTTON", "UT Debug Mode", BS_AUTOCHECKBOX, 185, 246, 165, 22, IDC_DEBUG_NATIVE_DEBUG);
+
+    make_ctrl("BUTTON", "Heal HP", 0, 10, 272, 75, 26, IDC_DEBUG_HEAL);
+    make_ctrl("BUTTON", "Unfreeze (F1)", 0, 90, 272, 85, 26, IDC_DEBUG_UNFREEZE);
+    make_ctrl("BUTTON", "Max Gold", 0, 180, 272, 80, 26, IDC_DEBUG_MAX_GOLD);
+    make_ctrl("BUTTON", "Max Stats", 0, 265, 272, 85, 26, IDC_DEBUG_MAX_STATS);
+
+    make_ctrl("BUTTON", "Save Anywhere (Ctrl+S)", 0, 10, 302, 165, 26, IDC_DEBUG_SAVE_ANYWHERE);
+    make_ctrl("BUTTON", "Open Dim Box", 0, 185, 302, 165, 26, IDC_DEBUG_OPEN_BOX);
+
+    // Fun Value
+    make_ctrl("STATIC", "--- Fun Value ---", SS_CENTER, 10, 336, 340, 18, 0);
+    g_lbl_fun = make_ctrl("STATIC", "Fun Value (flag[5]): 0", 0, 10, 358, 180, 20, 0);
+    g_edit_fun = make_ctrl("EDIT", "0", WS_BORDER | ES_AUTOHSCROLL, 195, 356, 65, 22, IDC_DEBUG_EDIT_FUN);
+    make_ctrl("BUTTON", "Set Fun", 0, 268, 355, 82, 24, IDC_DEBUG_SET_FUN);
+
+    // Item Editor
+    make_ctrl("STATIC", "--- Item Editor ---", SS_CENTER, 10, 388, 340, 18, 0);
+    make_ctrl("STATIC", "Item:", 0, 10, 410, 35, 20, 0);
+    g_cmb_items = make_ctrl("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL, 48, 408, 195, 250, IDC_DEBUG_CMB_ITEMS);
+    make_ctrl("STATIC", "ID:", 0, 248, 410, 22, 20, 0);
+    g_edit_item_id = make_ctrl("EDIT", "10", WS_BORDER | ES_AUTOHSCROLL, 272, 408, 30, 22, IDC_DEBUG_EDIT_ITEM_ID);
+    make_ctrl("BUTTON", "Give", 0, 308, 407, 42, 24, IDC_DEBUG_GIVE_ITEM);
+
+    make_ctrl("BUTTON", "Clear Inventory", 0, 10, 438, 120, 26, IDC_DEBUG_CLEAR_ITEMS);
+    g_lbl_item_status = make_ctrl("STATIC", "Inventory: 0/8 items", 0, 140, 442, 210, 20, 0);
+
+    const char* const kCommonItems[] = {
+        "10: Butterscotch Pie",
+        "63: Temmie Armor (temy armor)",
+        "51: Real Knife",
+        "52: The Locket",
+        "35: Instant Noodles",
+        "42: Legendary Hero",
+        "39: Glamburger",
+        "16: Nice Cream",
+        "26: Annoying Dog",
+        "27: Dog Salad",
+        "22: Abandoned Quiche",
+        "15: Snowman Piece",
+        "6: Spider Donut",
+        "9: Spider Cider",
+        "20: Cinnamon Bun",
+        "4: Rock Candy",
+        "1: Monster Candy",
+        "2: Stick",
+        "3: Bandage",
+        "11: Faded Ribbon",
+        "12: Toy Knife",
+        "13: Tough Glove",
+        "14: Manly Bandanna",
+        "23: Old Tutu",
+        "24: Ballet Shoes",
+        "44: Torn Notebook",
+        "43: Cloudy Glasses",
+        "46: Burnt Pan",
+        "45: Stained Apron",
+        "48: Empty Gun",
+        "47: Cowboy Hat",
+        "50: Worn Dagger",
+        "49: Heart Locket",
+        "59: Mystery Key",
+        "60: Face Steak",
+        "61: Hush Puppy",
+        "62: Snail Pie"
+    };
+    for (const char* item_str : kCommonItems) {
+        SendMessageA(g_cmb_items, CB_ADDSTRING, 0, (LPARAM)item_str);
+    }
+    SendMessageA(g_cmb_items, CB_SETCURSEL, 0, 0);
+
+    // Diagnostics & Recording
+    make_ctrl("STATIC", "--- Diagnostics & Session ---", SS_CENTER, 10, 474, 340, 18, 0);
+    g_lbl_player = make_ctrl("STATIC", "Player: ...", 0, 10, 494, 340, 20, 0);
+    g_lbl_stats = make_ctrl("STATIC", "Stats: ...", 0, 10, 516, 340, 30, 0);
+    make_ctrl("BUTTON", "Dump State (F2)", 0, 10, 550, 105, 26, IDC_DEBUG_DUMP);
+    make_ctrl("BUTTON", "Toggle Rec (Ctrl+R)", 0, 122, 550, 110, 26, IDC_DEBUG_RECORD);
+    make_ctrl("BUTTON", "Fullscreen (F4)", 0, 238, 550, 112, 26, IDC_DEBUG_FULLSCREEN);
+
+    // Save / Load State controls
+    make_ctrl("STATIC", "--- State Saver / Loader (F5 / F8) ---", SS_CENTER, 10, 586, 340, 18, 0);
+    g_lbl_state_status = make_ctrl("STATIC", "State: Ready", 0, 10, 606, 340, 20, 0);
+    make_ctrl("STATIC", "Name:", 0, 10, 630, 45, 20, 0);
+    g_edit_state = make_ctrl("COMBOBOX", "quicksave", CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL, 60, 628, 150, 220, IDC_DEBUG_EDIT_STATE);
+    make_ctrl("BUTTON", "Save (F5)", 0, 218, 627, 64, 24, IDC_DEBUG_SAVESTATE);
+    make_ctrl("BUTTON", "Load (F8)", 0, 286, 627, 64, 24, IDC_DEBUG_LOADSTATE);
+
+    refresh_state_list();
+
+    make_ctrl("STATIC", "Hotkeys: ~ Menu | F5/F8 State | Ctrl+E NoBattles | Ctrl+G God\nF10 Noclip | Ctrl+S SaveAny | F1 Unfreeze | [ / ] Speed", SS_CENTER, 10, 664, 340, 35, 0);
+
+    ShowWindow(g_debug_hwnd, SW_SHOW);
+    UpdateWindow(g_debug_hwnd);
+}
+
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
         case WM_PAINT: {
@@ -496,15 +941,40 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         }
 
         case WM_KEYDOWN: {
+            bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+
             // Debug hotkeys
-            if (wParam == VK_NEXT) { // PageDown
-                g_debug_skip_room = 1;
+            // 1. Runner Debug Menu Toggle: ~ (Tilde / VK_OEM_3)
+            if (wParam == VK_OEM_3) {
+                if (g_debug_hwnd) {
+                    if (IsWindowVisible(g_debug_hwnd)) ShowWindow(g_debug_hwnd, SW_HIDE);
+                    else {
+                        ShowWindow(g_debug_hwnd, SW_SHOW);
+                        SetForegroundWindow(g_debug_hwnd);
+                    }
+                }
                 return 0;
             }
-            if (wParam == VK_PRIOR) { // PageUp
-                g_debug_skip_room = -1;
+
+            // 2. State controls (F5 Quick-Save, F8 Quick-Load - non-conflicting!)
+            if (wParam == VK_F5) {
+                char buf[128] = {0};
+                if (g_edit_state) GetWindowTextA(g_edit_state, buf, sizeof(buf));
+                std::string s = buf;
+                if (s.empty()) s = "quicksave";
+                g_debug_save_state_name = s;
                 return 0;
             }
+            if (wParam == VK_F8) {
+                char buf[128] = {0};
+                if (g_edit_state) GetWindowTextA(g_edit_state, buf, sizeof(buf));
+                std::string s = buf;
+                if (s.empty()) s = "quicksave";
+                g_debug_load_state_name = s;
+                return 0;
+            }
+
+            // 3. Player status / unfreeze (F1 / F2 - non-conflicting!)
             if (wParam == VK_F1) {
                 g_debug_unfreeze = true;
                 return 0;
@@ -513,14 +983,64 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 g_debug_dump_info = true;
                 return 0;
             }
-            if (wParam == VK_HOME) {
-                g_debug_restart_room = true;
-                return 0;
+
+            // 4. Modifier-based runner hotkeys (Ctrl + key)
+            if (ctrl) {
+                if (wParam == 'E' || wParam == 'e') {
+                    g_debug_disable_encounters = !g_debug_disable_encounters;
+                    if (g_chk_no_encounters) {
+                        SendMessageA(g_chk_no_encounters, BM_SETCHECK, g_debug_disable_encounters ? BST_CHECKED : BST_UNCHECKED, 0);
+                    }
+                    std::printf("[debug] Encounters: %s\n", g_debug_disable_encounters ? "DISABLED" : "ENABLED");
+                    return 0;
+                }
+                if (wParam == 'G' || wParam == 'g') {
+                    g_debug_god_mode = !g_debug_god_mode;
+                    if (g_chk_god_mode) {
+                        SendMessageA(g_chk_god_mode, BM_SETCHECK, g_debug_god_mode ? BST_CHECKED : BST_UNCHECKED, 0);
+                    }
+                    std::printf("[debug] God Mode: %s\n", g_debug_god_mode ? "ON" : "OFF");
+                    return 0;
+                }
+                if (wParam == 'S' || wParam == 's') {
+                    g_debug_save_anywhere = true;
+                    return 0;
+                }
+                if (wParam == 'R' || wParam == 'r') {
+                    g_debug_toggle_record = true;
+                    return 0;
+                }
+                if (wParam == VK_NEXT || wParam == VK_RIGHT) {
+                    g_debug_skip_room = 1;
+                    return 0;
+                }
+                if (wParam == VK_PRIOR || wParam == VK_LEFT) {
+                    g_debug_skip_room = -1;
+                    return 0;
+                }
+                if (wParam == VK_HOME) {
+                    g_debug_restart_room = true;
+                    return 0;
+                }
             }
-            if (wParam == VK_F9) {
-                g_debug_toggle_record = true;
-                return 0;
+
+            // 5. Room skip / reload when NOT in native debug mode
+            if (!g_debug_native_mode) {
+                if (wParam == VK_NEXT) { // PageDown
+                    g_debug_skip_room = 1;
+                    return 0;
+                }
+                if (wParam == VK_PRIOR) { // PageUp
+                    g_debug_skip_room = -1;
+                    return 0;
+                }
+                if (wParam == VK_HOME) {
+                    g_debug_restart_room = true;
+                    return 0;
+                }
             }
+
+            // 6. Speed modifiers
             if (wParam == VK_OEM_6) { // ']' key: speed up
                 g_speed_modifier += 0.5;
                 std::printf("[speed] Game speed set to %.2fx\n", g_speed_modifier);
@@ -537,6 +1057,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 return 0;
             }
 
+            // 7. F10 Noclip: toggle runner noclip AND let F10 fall through to GameMaker!
+            if (wParam == VK_F10) {
+                g_debug_noclip = !g_debug_noclip;
+                if (g_chk_noclip) {
+                    SendMessageA(g_chk_noclip, BM_SETCHECK, g_debug_noclip ? BST_CHECKED : BST_UNCHECKED, 0);
+                }
+                std::printf("[debug] Noclip / Phasing: %s\n", g_debug_noclip ? "ON" : "OFF");
+                // DO NOT return 0; falls through so GameMaker receives F10!
+            }
+
             int gm_key = map_vk_to_gm(wParam);
             bool repeat = (lParam & (1 << 30)) != 0;
             if (!repeat || !g_keys_held.count(gm_key)) {
@@ -544,12 +1074,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             }
             g_keys_held.insert(gm_key);
 
-            // Also map WASD to arrow keys for universal menu & directional navigation
+            // Also map WASD to arrow keys only when UT debug mode is NOT active (preventing 'S' save menu collision)
             int extra_gm_key = 0;
-            if (wParam == 'W' || wParam == 'w') extra_gm_key = 38; // vk_up
-            else if (wParam == 'A' || wParam == 'a') extra_gm_key = 37; // vk_left
-            else if (wParam == 'S' || wParam == 's') extra_gm_key = 40; // vk_down
-            else if (wParam == 'D' || wParam == 'd') extra_gm_key = 39; // vk_right
+            if (!g_debug_native_mode) {
+                if (wParam == 'W' || wParam == 'w') extra_gm_key = 38; // vk_up
+                else if (wParam == 'A' || wParam == 'a') extra_gm_key = 37; // vk_left
+                else if (wParam == 'S' || wParam == 's') extra_gm_key = 40; // vk_down
+                else if (wParam == 'D' || wParam == 'd') extra_gm_key = 39; // vk_right
+            }
 
             if (extra_gm_key != 0) {
                 if (!repeat || !g_keys_held.count(extra_gm_key)) {
@@ -566,16 +1098,47 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
         }
 
+        case WM_SYSKEYDOWN: {
+            if (wParam == VK_F10) {
+                g_debug_noclip = !g_debug_noclip;
+                if (g_chk_noclip) {
+                    SendMessageA(g_chk_noclip, BM_SETCHECK, g_debug_noclip ? BST_CHECKED : BST_UNCHECKED, 0);
+                }
+                std::printf("[debug] Noclip / Phasing: %s\n", g_debug_noclip ? "ON" : "OFF");
+                int gm_key = map_vk_to_gm(VK_F10);
+                g_keys_pressed.insert(gm_key);
+                g_keys_held.insert(gm_key);
+                return 0;
+            }
+            if (wParam == VK_RETURN) {
+                toggle_fullscreen(hwnd);
+                return 0;
+            }
+            return DefWindowProcA(hwnd, uMsg, wParam, lParam);
+        }
+
+        case WM_SYSKEYUP: {
+            if (wParam == VK_F10) {
+                int gm_key = map_vk_to_gm(VK_F10);
+                g_keys_held.erase(gm_key);
+                g_keys_released.insert(gm_key);
+                return 0;
+            }
+            return DefWindowProcA(hwnd, uMsg, wParam, lParam);
+        }
+
         case WM_KEYUP: {
             int gm_key = map_vk_to_gm(wParam);
             g_keys_held.erase(gm_key);
             g_keys_released.insert(gm_key);
 
             int extra_gm_key = 0;
-            if (wParam == 'W' || wParam == 'w') extra_gm_key = 38;
-            else if (wParam == 'A' || wParam == 'a') extra_gm_key = 37;
-            else if (wParam == 'S' || wParam == 's') extra_gm_key = 40;
-            else if (wParam == 'D' || wParam == 'd') extra_gm_key = 39;
+            if (!g_debug_native_mode) {
+                if (wParam == 'W' || wParam == 'w') extra_gm_key = 38;
+                else if (wParam == 'A' || wParam == 'a') extra_gm_key = 37;
+                else if (wParam == 'S' || wParam == 's') extra_gm_key = 40;
+                else if (wParam == 'D' || wParam == 'd') extra_gm_key = 39;
+            }
 
             if (extra_gm_key != 0) {
                 g_keys_held.erase(extra_gm_key);
@@ -658,6 +1221,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
         case WM_CLOSE: {
             g_running = false;
+            if (g_debug_hwnd) {
+                DestroyWindow(g_debug_hwnd);
+                g_debug_hwnd = nullptr;
+            }
             DestroyWindow(hwnd);
             return 0;
         }
@@ -686,6 +1253,8 @@ void print_usage(const char* prog) {
     std::printf("  --save-dir <path>     Directory for game save/INI files (default: ./saves)\n");
     std::printf("  --fresh               Start fresh: wipe save directory before running\n");
     std::printf("  --bind <action>=<key> Custom key mapping (e.g. up=w, confirm=space)\n");
+    std::printf("  --save-state <name>   Save game state on exit to states/<name>.state\n");
+    std::printf("  --load-state <name>   Load game state on start from states/<name>.state\n");
     std::printf("  --record [path]       Record gameplay input to file (default: session_<timestamp>.rec)\n");
     std::printf("  --replay <path>       Replay recorded input frame-by-frame\n");
     std::printf("  --verbose, -v         Enable verbose diagnostic logging\n");
@@ -698,11 +1267,15 @@ void print_usage(const char* prog) {
     std::printf("  [ / ]                 Decrease / Increase game speed (+-0.5x)\n");
     std::printf("  \\                     Reset game speed to 1.0x\n");
     std::printf("  F4 / Alt+Enter        Toggle Fullscreen\n");
-    std::printf("  [PageDown]/[PageUp]   Skip room forward / backward\n");
-    std::printf("  [Home]                Reload current room\n");
+    std::printf("  ~ (Tilde)             Toggle Debug Menu window\n");
+    std::printf("  [F5] / [F8]           Quick-save state / Quick-load state\n");
+    std::printf("  [F10]                 Toggle Noclip / Phasing\n");
+    std::printf("  [Ctrl+E] / [Ctrl+G]   Toggle Encounters / Toggle God Mode\n");
+    std::printf("  [Ctrl+S] / [Ctrl+R]   Save Game Anywhere / Toggle Recording\n");
+    std::printf("  [PageDown]/[PageUp]   Skip room forward / backward (or Ctrl+PgDn/PgUp)\n");
+    std::printf("  [Home]                Reload current room (or Ctrl+Home)\n");
     std::printf("  [F1]                  Unfreeze player (reset global.interact = 0)\n");
     std::printf("  [F2]                  Dump room, player and instance state\n");
-    std::printf("  [F9]                  Toggle real-time input recording\n");
     std::printf("  Esc                   Exit / Back\n");
 }
 
@@ -734,6 +1307,10 @@ int main(int argc, char** argv) {
             cfg.save_dir = argv[++i];
         } else if (arg == "--fresh") {
             cfg.fresh_save = true;
+        } else if (arg == "--save-state" && i + 1 < argc) {
+            cfg.save_state_on_exit = argv[++i];
+        } else if (arg == "--load-state" && i + 1 < argc) {
+            cfg.load_state_on_start = argv[++i];
         } else if (arg == "--record") {
             if (i + 1 < argc && argv[i + 1][0] != '-') cfg.record_path = argv[++i];
             else {
@@ -868,6 +1445,15 @@ int main(int argc, char** argv) {
 
         // Headless execution mode (ideal for automated testing / verification)
         if (cfg.headless_frames > 0) {
+            if (!cfg.load_state_on_start.empty()) {
+                if (rt.load_state_file(cfg.load_state_on_start)) {
+                    std::printf("[state] Loaded initial state from '%s' (room %d, %zu instances)\n",
+                                cfg.load_state_on_start.c_str(), rt.room_index, rt.instances.size());
+                } else {
+                    std::printf("[state] Warning: Failed to load initial state from '%s'\n",
+                                cfg.load_state_on_start.c_str());
+                }
+            }
             std::printf("[runner] Executing %d headless frames...\n", cfg.headless_frames);
             for (int f = 0; f < cfg.headless_frames && rt.running; ++f) {
                 rt.keys_held = g_keys_held;
@@ -896,6 +1482,15 @@ int main(int argc, char** argv) {
                 rt.mouse_wheel_delta = 0;
             }
             std::printf("[runner] Headless execution completed successfully.\n");
+            if (!cfg.save_state_on_exit.empty()) {
+                if (rt.save_state_file(cfg.save_state_on_exit)) {
+                    std::printf("[state] Saved exit state to '%s' (room %d, %zu instances)\n",
+                                cfg.save_state_on_exit.c_str(), rt.room_index, rt.instances.size());
+                } else {
+                    std::printf("[state] Warning: Failed to save exit state to '%s'\n",
+                                cfg.save_state_on_exit.c_str());
+                }
+            }
             if (!cfg.dump_frame_path.empty() && g_current_frame.w > 0) {
                 stbi_write_png(cfg.dump_frame_path.c_str(), g_current_frame.w, g_current_frame.h, 4,
                                g_current_frame.rgba.data(), g_current_frame.w * 4);
@@ -960,6 +1555,9 @@ int main(int argc, char** argv) {
         ShowWindow(g_hwnd, SW_SHOW);
         UpdateWindow(g_hwnd);
 
+        // Open debug menu window alongside main game window
+        create_debug_window(hInstance, win_x + win_w + 10, win_y);
+
         // High resolution timer setup
         timeBeginPeriod(1);
 
@@ -975,17 +1573,47 @@ int main(int argc, char** argv) {
             g_recorder.start(cfg.record_path);
         }
 
+        if (!cfg.load_state_on_start.empty()) {
+            if (rt.load_state_file(cfg.load_state_on_start)) {
+                std::printf("[state] Loaded initial state from '%s' (room %d, %zu instances)\n",
+                            cfg.load_state_on_start.c_str(), rt.room_index, rt.instances.size());
+            } else {
+                std::printf("[state] Warning: Failed to load initial state from '%s'\n",
+                            cfg.load_state_on_start.c_str());
+            }
+        }
+
         std::printf("\n=======================================================\n");
         std::printf("  gm14 runner - Undertale Engine & Debug Tools\n");
         std::printf("  Room: %d (%s) | Scale: %dx\n",
                     rt.room_index, dw.rooms[rt.room_index].name.c_str(), cfg.scale);
-        std::printf("  Hotkeys:\n");
-        std::printf("    [PageDown] / [PageUp] : Skip to next / previous room\n");
-        std::printf("    [Home]                : Reload current room\n");
-        std::printf("    [F1]                  : Unfreeze player (reset interact = 0)\n");
+        std::printf("  Runner Controls & Hotkeys:\n");
+        std::printf("    [~] (Tilde)           : Toggle Debug Menu window\n");
+        std::printf("    [F1]                  : Unfreeze player (global.interact = 0)\n");
         std::printf("    [F2]                  : Print room and player debug status\n");
-        std::printf("    [F4]                  : Toggle fullscreen\n");
-        std::printf("    [F9]                  : Toggle input recording\n");
+        std::printf("    [F4] / [Alt+Enter]    : Toggle fullscreen\n");
+        std::printf("    [F5] / [F8]           : Quick-save state / Quick-load state\n");
+        std::printf("    [F10]                 : Toggle Noclip / Phasing\n");
+        std::printf("    [ [ ] / [ ] ]         : Slow down / speed up simulation (+-0.5x)\n");
+        std::printf("    [ \\ ]                 : Reset game speed to 1.0x\n");
+        std::printf("    [Ctrl+E] / [Ctrl+G]   : Toggle Encounters / Toggle God Mode\n");
+        std::printf("    [Ctrl+S] / [Ctrl+R]   : Save Game Anywhere / Toggle Recording\n");
+        std::printf("    [Ctrl+PgDn] / [PgUp]  : Skip to next / previous room\n");
+        std::printf("    [Ctrl+Home]           : Reload current room\n");
+        std::printf("  Undertale Native Debug Keys (when UT Debug Mode is ON):\n");
+        std::printf("    [F6]                  : Instakill in battle (at=999, mercy=0)\n");
+        std::printf("    [F7]                  : Gold += 500 (overworld)\n");
+        std::printf("    [F9]                  : Stop audio (caster_free)\n");
+        std::printf("    [F10]                 : Native Phasing (noclip)\n");
+        std::printf("    [F11]                 : Warp to Room 82 (Waterfall)\n");
+        std::printf("    [F12]                 : Restart current room\n");
+        std::printf("    [Delete]              : 999 HP (battle) / Previous room (overworld)\n");
+        std::printf("    [Insert]              : Next room (overworld)\n");
+        std::printf("    [PageDown] / [PageUp] : AT = 999 / Steps += 100\n");
+        std::printf("    [Home] / [End]        : Trigger Battlegroup / Test Battle\n");
+        std::printf("    [P + O]               : Instant Spare / Mercy in battle\n");
+        std::printf("    [S] / [L] (hold)      : Native Save Menu / Load Game anywhere\n");
+        std::printf("    [I] / [G]             : Native Item Menu / Dimensional Box anywhere\n");
         std::printf("=======================================================\n\n");
         std::fflush(stdout);
 
@@ -1036,10 +1664,208 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 rt.change_room(rt.room_index);
             }
+            if (!g_debug_goto_room_str.empty()) {
+                std::string s = g_debug_goto_room_str;
+                g_debug_goto_room_str.clear();
+                while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(s.begin());
+                while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n')) s.pop_back();
+                int target_idx = -1;
+                bool is_num = !s.empty();
+                for (char c : s) if (!std::isdigit((unsigned char)c)) { is_num = false; break; }
+                if (is_num) {
+                    target_idx = std::atoi(s.c_str());
+                } else {
+                    for (size_t i = 0; i < dw.rooms.size(); ++i) {
+                        if (dw.rooms[i].name == s) {
+                            target_idx = (int)i;
+                            break;
+                        }
+                    }
+                }
+                if (target_idx >= 0 && target_idx < (int)dw.rooms.size()) {
+                    std::printf("\n[debug] Jumping to room %d (%s)\n\n", target_idx, dw.rooms[target_idx].name.c_str());
+                    std::fflush(stdout);
+                    rt.globals["interact"] = gm14::Value(0.0);
+                    rt.change_room(target_idx);
+                } else {
+                    std::printf("\n[debug] Room '%s' not found!\n\n", s.c_str());
+                    std::fflush(stdout);
+                }
+            }
+            if (!g_debug_save_state_name.empty()) {
+                std::string sname = g_debug_save_state_name;
+                g_debug_save_state_name.clear();
+                bool ok = rt.save_state_file(sname);
+                char status_buf[256];
+                if (ok) {
+                    std::snprintf(status_buf, sizeof(status_buf), "Saved: %s (R:%d F:%d)",
+                                  sname.c_str(), rt.room_index, rt.frame_count);
+                    std::printf("\n[state] Saved state to '%s' (room %d, %zu instances, frame %d)\n\n",
+                                sname.c_str(), rt.room_index, rt.instances.size(), rt.frame_count);
+                    refresh_state_list();
+                } else {
+                    std::snprintf(status_buf, sizeof(status_buf), "Error: Failed to save '%s'", sname.c_str());
+                    std::printf("\n[state] ERROR: Failed to save state to '%s'\n\n", sname.c_str());
+                }
+                if (g_lbl_state_status) SetWindowTextA(g_lbl_state_status, status_buf);
+                std::fflush(stdout);
+            }
+            if (!g_debug_load_state_name.empty()) {
+                std::string sname = g_debug_load_state_name;
+                g_debug_load_state_name.clear();
+                bool ok = rt.load_state_file(sname);
+                char status_buf[256];
+                if (ok) {
+                    std::snprintf(status_buf, sizeof(status_buf), "Loaded: %s (R:%d F:%d)",
+                                  sname.c_str(), rt.room_index, rt.frame_count);
+                    std::printf("\n[state] Loaded state from '%s' (room %d, %zu instances, frame %d)\n\n",
+                                sname.c_str(), rt.room_index, rt.instances.size(), rt.frame_count);
+                    refresh_state_list();
+                } else {
+                    std::snprintf(status_buf, sizeof(status_buf), "Error: Failed to load '%s'", sname.c_str());
+                    std::printf("\n[state] ERROR: Failed to load state from '%s'\n\n", sname.c_str());
+                }
+                if (g_lbl_state_status) SetWindowTextA(g_lbl_state_status, status_buf);
+                std::fflush(stdout);
+            }
+            if (g_debug_heal) {
+                g_debug_heal = false;
+                double maxhp = 20.0;
+                if (rt.globals.count("maxhp")) maxhp = gm14::to_num(rt.globals["maxhp"]);
+                rt.globals["hp"] = gm14::Value(maxhp);
+                std::printf("\n[debug] Player healed to full HP (%.0f)\n\n", maxhp);
+                std::fflush(stdout);
+            }
             if (g_debug_unfreeze) {
                 g_debug_unfreeze = false;
                 rt.globals["interact"] = gm14::Value(0.0);
                 std::printf("\n[debug] Player unfreeze: global.interact reset to 0\n\n");
+                std::fflush(stdout);
+            }
+            if (g_debug_max_gold) {
+                g_debug_max_gold = false;
+                rt.globals["gold"] = gm14::Value(99999.0);
+                std::printf("\n[debug] Gold set to 99999\n\n");
+                std::fflush(stdout);
+            }
+            if (g_debug_max_stats) {
+                g_debug_max_stats = false;
+                rt.globals["lv"] = gm14::Value(20.0);
+                rt.globals["xp"] = gm14::Value(99999.0);
+                rt.globals["maxhp"] = gm14::Value(99.0);
+                rt.globals["hp"] = gm14::Value(99.0);
+                rt.globals["at"] = gm14::Value(99.0);
+                rt.globals["df"] = gm14::Value(99.0);
+                std::printf("\n[debug] Player stats maxed: LV 20, HP 99, AT 99, DF 99, XP 99999\n\n");
+                std::fflush(stdout);
+            }
+            if (g_debug_save_anywhere) {
+                g_debug_save_anywhere = false;
+                rt.globals["interact"] = gm14::Value(5.0);
+                rt.globals["menuno"] = gm14::Value(4.0);
+                std::printf("\n[debug] Save dialogue triggered anywhere (interact=5, menuno=4)\n\n");
+                std::fflush(stdout);
+            }
+            if (g_debug_open_box) {
+                g_debug_open_box = false;
+                int box_obj = -1;
+                for (size_t i = 0; i < dw.objects.size(); ++i) {
+                    if (dw.objects[i].name == "obj_itemswapper") {
+                        box_obj = (int)i;
+                        break;
+                    }
+                }
+                if (box_obj >= 0) {
+                    std::vector<gm14::Value> ca = { gm14::Value(0.0), gm14::Value(0.0), gm14::Value((double)box_obj) };
+                    rt.call("instance_create", ca);
+                    std::printf("\n[debug] Spawned obj_itemswapper (Dimensional Box)\n\n");
+                    std::fflush(stdout);
+                } else {
+                    std::printf("\n[debug] obj_itemswapper not found in game data!\n\n");
+                    std::fflush(stdout);
+                }
+            }
+            if (g_debug_set_fun_val >= 0) {
+                int fval = g_debug_set_fun_val;
+                g_debug_set_fun_val = -1;
+                auto& flags = rt.global_arrays["flag"];
+                if (flags.size() <= 5) flags.resize(6, gm14::Value(0.0));
+                flags[5] = gm14::Value((double)fval);
+                rt.globals["fun"] = gm14::Value((double)fval);
+
+                // Update runtime INI cache
+                std::string s_fval = std::to_string(fval);
+                rt.ini_files["undertale.ini"].sections["General"]["fun"] = s_fval;
+                if (rt.ini_is_open) {
+                    rt.current_ini.sections["General"]["fun"] = s_fval;
+                }
+
+                // Persist to disk INI files (both saves directory and working directory)
+                std::string ini_p1 = rt.resolve_path("undertale.ini");
+                sync_fun_to_disk_ini(ini_p1, fval);
+                if (ini_p1 != "./undertale.ini" && ini_p1 != "undertale.ini") {
+                    sync_fun_to_disk_ini("./undertale.ini", fval);
+                }
+
+                // Immediately reload room so that room objects execute Create events with new Fun value
+                rt.change_room(rt.room_index);
+
+                std::printf("\n================ [FUN EVENT APPLIED] ================\n");
+                std::printf("  Fun value set to: %d\n", fval);
+                std::printf("  Updated: global.flag[5], global.fun, undertale.ini [General] fun=%d\n", fval);
+                std::printf("  Reloaded room %d (%s) to re-trigger instance Create events.\n",
+                            rt.room_index, dw.rooms[rt.room_index].name.c_str());
+                if (fval == 66) {
+                    std::printf("  [Fun 66] Mystery Man / Fake Hallway: Enter Room 95 from Room 94 (room_water_waterfall)!\n");
+                    std::printf("           (Grey Door in room 268 rolls choose(0..9)==4 (10%% chance) to appear)\n");
+                } else if (fval >= 61 && fval <= 63) {
+                    std::printf("  [Fun 61-63] Gaster Followers: Check Hotland elevators L1 (156), L2 (169), or R3 (159)!\n");
+                } else if (fval >= 90 && fval <= 100) {
+                    std::printf("  [Fun 90-100] Goner Kid: Check Waterfall dock before the bird (room 91)!\n");
+                } else if (fval >= 80 && fval <= 89) {
+                    std::printf("  [Fun 80-89] Clam Girl: Check Waterfall quiet area (room 82)!\n");
+                } else if (fval >= 40 && fval <= 50) {
+                    std::printf("  [Fun 40-50] Sans / Pizza Phone Call: Walk right in room 61 (room_water1)!\n");
+                } else if (fval >= 2 && fval <= 39) {
+                    std::printf("  [Fun 2-39] Wrong Number Song: Walk right in room 61 (room_water1)!\n");
+                } else if (fval == 65) {
+                    std::printf("  [Fun 65] Sound Test Room: Fishing rod in room 97 (room_water9) -> room 264!\n");
+                } else if (fval >= 56 && fval <= 57) {
+                    std::printf("  [Fun 56-57] Nightmare Sans / Puzzle crosswords (room 48)!\n");
+                }
+                std::printf("  Note: Undertale scripts automatically wipe fun back to 0 once triggered!\n");
+                std::printf("=====================================================\n\n");
+                std::fflush(stdout);
+            }
+            if (g_debug_give_item_id >= 0) {
+                int iid = g_debug_give_item_id;
+                g_debug_give_item_id = -1;
+                auto& items = rt.global_arrays["item"];
+                if (items.size() < 9) items.resize(9, gm14::Value(0.0));
+                items[8] = gm14::Value(999.0);
+                int slot = -1;
+                for (int i = 0; i < 8; ++i) {
+                    if (gm14::to_num(items[i]) == 0.0) {
+                        slot = i;
+                        break;
+                    }
+                }
+                if (slot != -1) {
+                    items[slot] = gm14::Value((double)iid);
+                    std::printf("\n[debug] Added item %d to inventory slot %d\n\n", iid, slot);
+                } else {
+                    items[7] = gm14::Value((double)iid);
+                    std::printf("\n[debug] Inventory full! Replaced slot 7 with item %d\n\n", iid);
+                }
+                std::fflush(stdout);
+            }
+            if (g_debug_clear_items) {
+                g_debug_clear_items = false;
+                auto& items = rt.global_arrays["item"];
+                if (items.size() < 9) items.resize(9, gm14::Value(0.0));
+                for (int i = 0; i < 8; ++i) items[i] = gm14::Value(0.0);
+                items[8] = gm14::Value(999.0);
+                std::printf("\n[debug] Cleared inventory items (slots 0..7 reset to 0)\n\n");
                 std::fflush(stdout);
             }
             if (g_debug_dump_info) {
@@ -1097,80 +1923,187 @@ int main(int argc, char** argv) {
                     target_fps = 30.0;
                 }
             }
-            double frame_duration = 1.0 / (target_fps * g_speed_modifier);
+            double display_fps = (target_fps > 0.0) ? target_fps : 30.0;
+            double frame_duration = 1.0 / display_fps;
 
-            // Sync input: replayer or live user input
-            if (g_replayer.replaying) {
-                g_replayer.step(total_frames, rt);
-            } else {
-                rt.keys_held = g_keys_held;
-                rt.keys_pressed = g_keys_pressed;
-                rt.keys_released = g_keys_released;
+            static double s_step_acc = 0.0;
+            s_step_acc += g_speed_modifier;
+            int steps_to_run = (int)s_step_acc;
+            if (steps_to_run > 10) steps_to_run = 10;
+            s_step_acc -= steps_to_run;
 
-                // Sync real-time mouse state with aspect-ratio letterbox compensation
-                if (g_current_frame.w > 0 && g_current_frame.h > 0) {
-                    double scale_x = (double)g_client_w / (double)g_current_frame.w;
-                    double scale_y = (double)g_client_h / (double)g_current_frame.h;
-                    double scale = std::min(scale_x, scale_y);
-                    if (scale > 0.0) {
-                        int dst_w = (int)(g_current_frame.w * scale);
-                        int dst_h = (int)(g_current_frame.h * scale);
-                        int dst_x = (g_client_w - dst_w) / 2;
-                        int dst_y = (g_client_h - dst_h) / 2;
-                        double gx = (g_mouse_raw_x - dst_x) / scale;
-                        double gy = (g_mouse_raw_y - dst_y) / scale;
-                        gx = std::max(0.0, std::min((double)g_current_frame.w - 1.0, gx));
-                        gy = std::max(0.0, std::min((double)g_current_frame.h - 1.0, gy));
-                        rt.mouse_x = gx + rt.view_x;
-                        rt.mouse_y = gy + rt.view_y;
+            for (int s = 0; s < steps_to_run; ++s) {
+                // Sync input: replayer or live user input
+                if (g_replayer.replaying) {
+                    g_replayer.step(total_frames, rt);
+                } else {
+                    rt.keys_held = g_keys_held;
+                    if (s == 0) {
+                        rt.keys_pressed = g_keys_pressed;
+                        rt.keys_released = g_keys_released;
+                    } else {
+                        rt.keys_pressed.clear();
+                        rt.keys_released.clear();
+                    }
+
+                    // Sync real-time mouse state with aspect-ratio letterbox compensation
+                    if (g_current_frame.w > 0 && g_current_frame.h > 0) {
+                        double scale_x = (double)g_client_w / (double)g_current_frame.w;
+                        double scale_y = (double)g_client_h / (double)g_current_frame.h;
+                        double scale = std::min(scale_x, scale_y);
+                        if (scale > 0.0) {
+                            int dst_w = (int)(g_current_frame.w * scale);
+                            int dst_h = (int)(g_current_frame.h * scale);
+                            int dst_x = (g_client_w - dst_w) / 2;
+                            int dst_y = (g_client_h - dst_h) / 2;
+                            double gx = (g_mouse_raw_x - dst_x) / scale;
+                            double gy = (g_mouse_raw_y - dst_y) / scale;
+                            gx = std::max(0.0, std::min((double)g_current_frame.w - 1.0, gx));
+                            gy = std::max(0.0, std::min((double)g_current_frame.h - 1.0, gy));
+                            rt.mouse_x = gx + rt.view_x;
+                            rt.mouse_y = gy + rt.view_y;
+                        }
+                    }
+                    rt.mouse_buttons_held = g_mouse_buttons_held;
+                    if (s == 0) {
+                        rt.mouse_buttons_pressed = g_mouse_buttons_pressed;
+                        rt.mouse_buttons_released = g_mouse_buttons_released;
+                        rt.mouse_wheel_delta = g_mouse_wheel_delta;
+                    } else {
+                        rt.mouse_buttons_pressed.clear();
+                        rt.mouse_buttons_released.clear();
+                        rt.mouse_wheel_delta = 0;
                     }
                 }
-                rt.mouse_buttons_held = g_mouse_buttons_held;
-                rt.mouse_buttons_pressed = g_mouse_buttons_pressed;
-                rt.mouse_buttons_released = g_mouse_buttons_released;
-                rt.mouse_wheel_delta = g_mouse_wheel_delta;
-                g_mouse_wheel_delta = 0;
+
+                if (g_recorder.recording) {
+                    g_recorder.record_frame(total_frames, rt.keys_held, rt.keys_pressed, rt.keys_released,
+                                            rt.mouse_x, rt.mouse_y,
+                                            rt.mouse_buttons_held, rt.mouse_buttons_pressed, rt.mouse_buttons_released,
+                                            rt.mouse_wheel_delta, rt.room_index);
+                }
+
+                if (g_debug_disable_encounters) {
+                    rt.globals["encounter"] = gm14::Value(0.0);
+                }
+                if (g_debug_god_mode) {
+                    double maxhp = 20.0;
+                    if (rt.globals.count("maxhp")) maxhp = gm14::to_num(rt.globals["maxhp"]);
+                    rt.globals["hp"] = gm14::Value(maxhp);
+                    rt.globals["invc"] = gm14::Value(60.0);
+                    rt.globals["inv"] = gm14::Value(60.0);
+                }
+                if (g_debug_noclip) {
+                    rt.globals["phasing"] = gm14::Value(1.0);
+                }
+                rt.globals["debug"] = gm14::Value(g_debug_native_mode ? 1.0 : 0.0);
+
+                // Step game simulation with room transition tracking
+                int prev_room = rt.room_index;
+                rt.step();
+                if (rt.room_index != prev_room) {
+                    std::printf("[room] Switched to room %d (%s) - %zu active instances\n",
+                                rt.room_index, dw.rooms[rt.room_index].name.c_str(), rt.instances.size());
+                    std::fflush(stdout);
+                }
+
+                if (g_debug_disable_encounters) {
+                    rt.globals["encounter"] = gm14::Value(0.0);
+                }
+                if (g_debug_god_mode) {
+                    double maxhp = 20.0;
+                    if (rt.globals.count("maxhp")) maxhp = gm14::to_num(rt.globals["maxhp"]);
+                    rt.globals["hp"] = gm14::Value(maxhp);
+                    rt.globals["invc"] = gm14::Value(60.0);
+                    rt.globals["inv"] = gm14::Value(60.0);
+                }
+
+                if (s == 0) {
+                    g_keys_pressed.clear();
+                    g_keys_released.clear();
+                    g_mouse_buttons_pressed.clear();
+                    g_mouse_buttons_released.clear();
+                    g_mouse_wheel_delta = 0;
+                }
+                total_frames++;
             }
 
-            if (g_recorder.recording) {
-                g_recorder.record_frame(total_frames, rt.keys_held, rt.keys_pressed, rt.keys_released,
-                                        rt.mouse_x, rt.mouse_y,
-                                        rt.mouse_buttons_held, rt.mouse_buttons_pressed, rt.mouse_buttons_released,
-                                        rt.mouse_wheel_delta, rt.room_index);
+            // Draw new frame and present to window
+            if (steps_to_run > 0) {
+                g_current_frame = rt.draw();
+                HDC hdc = GetDC(g_hwnd);
+                if (hdc) {
+                    render_frame(hdc);
+                    ReleaseDC(g_hwnd, hdc);
+                }
+                rt.keys_pressed.clear();
+                rt.keys_released.clear();
+                rt.mouse_buttons_pressed.clear();
+                rt.mouse_buttons_released.clear();
+                rt.mouse_wheel_delta = 0;
             }
 
-            // Step game simulation with room transition tracking
-            int prev_room = rt.room_index;
-            rt.step();
-            if (rt.room_index != prev_room) {
-                std::printf("[room] Switched to room %d (%s) - %zu active instances\n",
-                            rt.room_index, dw.rooms[rt.room_index].name.c_str(), rt.instances.size());
-                std::fflush(stdout);
+            // Update debug window labels periodically
+            if (g_debug_hwnd && IsWindowVisible(g_debug_hwnd) && (total_frames % 5 == 0)) {
+                char buf[256];
+                if (g_lbl_room) {
+                    std::snprintf(buf, sizeof(buf), "Room: %d / %zu (%s)",
+                                  rt.room_index, dw.rooms.size(),
+                                  (rt.room_index < (int)dw.rooms.size() ? dw.rooms[rt.room_index].name.c_str() : "???"));
+                    SetWindowTextA(g_lbl_room, buf);
+                }
+                if (g_lbl_speed) {
+                    std::snprintf(buf, sizeof(buf), "Speed: %.2fx (Target: %.1f FPS)",
+                                  g_speed_modifier, target_fps * g_speed_modifier);
+                    SetWindowTextA(g_lbl_speed, buf);
+                }
+                if (g_lbl_player) {
+                    double px = 0, py = 0, hp = 0, maxhp = 0, interact = 0;
+                    if (rt.globals.count("hp")) hp = gm14::to_num(rt.globals["hp"]);
+                    if (rt.globals.count("maxhp")) maxhp = gm14::to_num(rt.globals["maxhp"]);
+                    if (rt.globals.count("interact")) interact = gm14::to_num(rt.globals["interact"]);
+                    for (auto& inst : rt.instances) {
+                        if (inst->alive && dw.objects[inst->obj].name == "obj_mainchara") {
+                            if (inst->vars.count("x")) px = gm14::to_num(inst->vars["x"]);
+                            if (inst->vars.count("y")) py = gm14::to_num(inst->vars["y"]);
+                            break;
+                        }
+                    }
+                    std::snprintf(buf, sizeof(buf), "Pos: (%.1f, %.1f) | HP: %.0f/%.0f | Act: %.0f",
+                                  px, py, hp, maxhp, interact);
+                    SetWindowTextA(g_lbl_player, buf);
+                }
+                if (g_lbl_stats) {
+                    std::snprintf(buf, sizeof(buf), "Frame: %d | Instances: %zu\n%s",
+                                  total_frames, rt.instances.size(),
+                                  g_recorder.recording ? "[REC] Recording..." : "[Ready]");
+                    SetWindowTextA(g_lbl_stats, buf);
+                }
+                if (g_lbl_fun && GetFocus() != g_edit_fun) {
+                    double fval = 0.0;
+                    auto it = rt.global_arrays.find("flag");
+                    if (it != rt.global_arrays.end() && it->second.size() > 5) {
+                        fval = gm14::to_num(it->second[5]);
+                    } else if (rt.globals.count("fun")) {
+                        fval = gm14::to_num(rt.globals["fun"]);
+                    }
+                    char fbuf[128];
+                    std::snprintf(fbuf, sizeof(fbuf), "Fun Value (flag[5]): %.0f", fval);
+                    SetWindowTextA(g_lbl_fun, fbuf);
+                }
+                if (g_lbl_item_status) {
+                    int count = 0;
+                    auto it = rt.global_arrays.find("item");
+                    if (it != rt.global_arrays.end()) {
+                        for (size_t i = 0; i < 8 && i < it->second.size(); ++i) {
+                            if (gm14::to_num(it->second[i]) > 0.0) count++;
+                        }
+                    }
+                    char ibuf[128];
+                    std::snprintf(ibuf, sizeof(ibuf), "Inventory: %d/8 items", count);
+                    SetWindowTextA(g_lbl_item_status, ibuf);
+                }
             }
-
-            // Draw new frame
-            g_current_frame = rt.draw();
-
-            // Blit RGBA buffer to window device context
-            HDC hdc = GetDC(g_hwnd);
-            if (hdc) {
-                render_frame(hdc);
-                ReleaseDC(g_hwnd, hdc);
-            }
-
-            // Clear single-step trigger sets AFTER draw has executed
-            g_keys_pressed.clear();
-            g_keys_released.clear();
-            rt.keys_pressed.clear();
-            rt.keys_released.clear();
-
-            g_mouse_buttons_pressed.clear();
-            g_mouse_buttons_released.clear();
-            rt.mouse_buttons_pressed.clear();
-            rt.mouse_buttons_released.clear();
-            rt.mouse_wheel_delta = 0;
-
-            total_frames++;
 
             // Precise frame limiter
             LARGE_INTEGER qpc_now;
@@ -1199,6 +2132,16 @@ int main(int argc, char** argv) {
         }
 
         std::printf("[runner] Execution finished (%d frames simulated).\n", total_frames);
+
+        if (!cfg.save_state_on_exit.empty()) {
+            if (rt.save_state_file(cfg.save_state_on_exit)) {
+                std::printf("[state] Saved exit state to '%s' (room %d, %zu instances)\n",
+                            cfg.save_state_on_exit.c_str(), rt.room_index, rt.instances.size());
+            } else {
+                std::printf("[state] Warning: Failed to save exit state to '%s'\n",
+                            cfg.save_state_on_exit.c_str());
+            }
+        }
 
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[fatal error] %s\n", e.what());

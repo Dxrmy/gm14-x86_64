@@ -456,24 +456,13 @@ private:
         if (!m_hWaveOut) return;
 
         if (m_in_flight[m_cur]) {
-            while (m_in_flight[m_cur] && !(m_wave[m_cur].dwFlags & WHDR_DONE)) {
-                if (m_hEvent) {
-                    DWORD wr = WaitForSingleObject(m_hEvent, 50);
-                    if (wr == WAIT_TIMEOUT && !(m_wave[m_cur].dwFlags & WHDR_DONE)) {
-                        break;
-                    }
-                } else {
-                    Sleep(1);
-                }
-            }
-            if (m_wave[m_cur].dwFlags & WHDR_DONE) {
-                waveOutUnprepareHeader(m_hWaveOut, &m_wave[m_cur], sizeof(WAVEHDR));
-                m_in_flight[m_cur] = false;
-            } else {
-                m_cur = (m_cur + 1) % kBufs;
+            if (!(m_wave[m_cur].dwFlags & WHDR_DONE)) {
+                // Hardware is still playing buffer; do not stall game loop during fast-forward
                 m_fill = 0;
                 return;
             }
+            waveOutUnprepareHeader(m_hWaveOut, &m_wave[m_cur], sizeof(WAVEHDR));
+            m_in_flight[m_cur] = false;
         }
 
         m_wave[m_cur].lpData = (LPSTR)m_buf[m_cur].data();
@@ -827,5 +816,57 @@ void AudioEngine::render(int frames) {
 }
 
 void AudioEngine::flush() {}
+
+std::vector<SavedVoice> AudioEngine::get_active_voices() const {
+    std::vector<SavedVoice> out;
+    for (const auto& v : m_voices) {
+        if (!v.active) continue;
+        SavedVoice sv;
+        sv.asset = v.asset;
+        sv.handle = v.handle;
+        sv.loop = v.loop;
+        sv.paused = v.paused;
+        sv.gain = v.gain;
+        sv.pitch = v.pitch;
+        sv.priority = v.priority;
+        double pos = 0.0;
+        if (has_clip(v.asset)) {
+            int sr = m_clips[v.asset]->sample_rate;
+            if (sr > 0) pos = v.cursor / (double)sr;
+        }
+        sv.position_seconds = pos;
+        out.push_back(sv);
+    }
+    return out;
+}
+
+void AudioEngine::restore_voices(const std::vector<SavedVoice>& voices) {
+    stop_all();
+    for (const auto& sv : voices) {
+        if (sv.asset < 0) continue;
+        const AudioClip* clip = acquire(sv.asset);
+        if (!clip) continue;
+        Voice* v = find_free_voice();
+        if (!v) continue;
+        v->active = true;
+        v->paused = sv.paused;
+        v->loop = sv.loop;
+        v->asset = sv.asset;
+        v->handle = sv.handle;
+        v->gain = sv.gain;
+        v->pitch = sv.pitch > 0 ? sv.pitch : 1.0;
+        v->priority = sv.priority;
+        double start_frame = sv.position_seconds * clip->sample_rate;
+        if (start_frame < 0) start_frame = 0;
+        if (clip->channels > 0 && start_frame >= (double)(clip->pcm.size() / (size_t)clip->channels)) {
+            start_frame = sv.loop ? 0 : (double)(clip->pcm.size() / (size_t)clip->channels);
+        }
+        v->cursor = start_frame;
+        v->position = start_frame;
+        if (sv.handle >= m_next_handle) {
+            m_next_handle = sv.handle + 1;
+        }
+    }
+}
 
 } // namespace gm14

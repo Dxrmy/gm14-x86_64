@@ -11,15 +11,16 @@ It provides 1:1 GameMaker: Studio 1.4 runtime parity on desktop platforms, servi
 | Subsystem | Progress Bar | Status | Coverage / Details |
 |---|---|---|---|
 | **`data.win` Chunk & Asset Parsing** | `[██████████]` 100% | **Complete** | All 24 chunks parsed (FORM, GEN8, OPTN, SOND, SPRT, BGND, SCPT, FONT, OBJT, ROOM, DAFL, TPAG, CODE, VARI, FUNC, STRG, TXTR, AUDO, PATH, ...) |
-| **Bytecode Virtual Machine** | `[█████████░]` 96% | **In Progress** | 891k ops across 6,272 code entries, stack machine, scopes, user script shadowing, compound array operations |
-| **Automated Unit Test Suite** | `[██████████]` 100% | **Complete** | **181 / 181 passing unit tests** across all core runtime subsystems |
+| **Bytecode Virtual Machine** | `[█████████░]` 97% | **In Progress** | 891k ops across 6,272 code entries, stack machine, scopes, user script shadowing, collision event routing, dialogue state machine |
+| **Automated Unit Test Suite** | `[██████████]` 100% | **Complete** | **198 / 198 passing unit tests** across all core runtime subsystems, Flowey battle collision, and dialogue interact isolation |
+| **State Save / Load System** | `[██████████]` 100% | **Complete** | Named binary state snapshots (`states/<name>.state`), full memory restoration (globals, arrays, VARPTR, DS structures, persistent rooms, audio voices) |
 | **Graphics & Compositor** | `[█████████░]` 92% | **In Progress** | Origin-pivoted sprite rotations, CCW conventions, blend modes (`bm_add`), tile atlas UV mapping & depth layering |
 | **Path Traversal & Kinematics** | `[█████████░]` 95% | **In Progress** | `PATH` interpolation, entrance marker placement, directional heading calculation, path action handling |
-| **Audio & Music Mixer** | `[█████████░]` 95% | **In Progress** | Multi-voice mixer, native WaveOut/ALSA, `stb_vorbis` decoding, GM `audio_*` and Undertale `caster_*` engines |
+| **Audio & Music Mixer** | `[█████████░]` 95% | **In Progress** | Working realtime audio on PC (native Win32 WaveOut / Linux ALSA), multi-voice mixer, `stb_vorbis` decoding, GM `audio_*` and Undertale `caster_*` engines |
 | **Battle Engine & Menu Flow** | `[█████████░]` 90% | **In Progress** | Battle controller, FIGHT / ACT / ITEM / MERCY navigation, monster setup, damage computation, target cursors |
 | **Overworld & Dialog Engine** | `[█████████░]` 92% | **In Progress** | C-menu item/stat screens, multi-page typewriter text rendering (`OBJ_WRITER`), camera tracking, room transitions |
 | **Memory Budgets & Config (`gm14.ini`)** | `[██████████]` 100% | **Complete** | Explicit INI config with bounded LRU texture cache, bounded PCM audio budget, watchdog, and culling margins |
-| **Target & Emulator Parity** | `[█████████░]` 95% | **In Progress** | Win32 desktop runner (`gm14_runner.exe`), Steam deployment, Azahar / Citra 3DS emulation parity |
+| **Desktop Runner & Target Parity** | `[██████████]` 98% | **Complete** | Win32 desktop runner (`gm14_runner.exe`), Steam deployment detection, variable speed throttle, fullscreen toggle, quicksave/load hotkeys |
 
 ---
 
@@ -194,7 +195,11 @@ verbose_logging = 0
 
 ## Features
 
-- **100% Passing Test Suite**: **181 unit tests** validating opcode execution, variable chains, array references, type conversions, math, string manipulation, INI persistence, data structures (`ds_grid`, `ds_list`, `ds_map`), surfaces, path traversal, marker entrance placement, and audio playback.
+- **100% Passing Test Suite**: **198 unit tests** validating opcode execution, variable chains, array references, type conversions, math, string manipulation, INI persistence, data structures (`ds_grid`, `ds_list`, `ds_map`), surfaces, path traversal, marker entrance placement, audio playback, Flowey fireball collision routing, and dialogue interact isolation.
+- **State Save / Load Snapshot System**:
+  - Full binary snapshot serialization (`GM14STAT` format v1) saving all globals, dynamic arrays with `VARPTR` relinking, dynamic DS maps/lists/grids, persistent rooms, and active audio voice channels.
+  - Named persistent save files in `states/<name>.state` (or SD card path).
+  - Seamless desktop hotkeys (`F5` quicksave, `F6` quickload, `F8` speed toggle).
 - **Configurable Engine Architecture (`gm14.ini`)**:
   - Fully configurable via explicit `gm14.ini` (no hidden platform auto-detection heuristics).
   - **Bounded LRU Texture Cache**: Configurable limit of cached texture sheets (default 6 pages / ~24 MB on low-spec PC/Pi, 2 pages / ~8 MB on 3DS). Eliminates thrashing and out-of-memory errors.
@@ -249,7 +254,7 @@ Bytecode ops         : 891,526 instructions across 6,272 code entries
 Variables / Functions: 10,899 / 427 (206,598 var refs, 78,929 func refs)
 Sprites / Objects    : 2,583 / 1,709
 Rooms                : 336
-Unit tests           : 181 passed, 0 failed
+Unit tests           : 198 passed, 0 failed
 ```
 
 ---
@@ -259,13 +264,13 @@ Unit tests           : 181 passed, 0 failed
 | File | Purpose |
 |---|---|
 | `main_runner.cpp` | Interactive playable Win32 desktop runner (`gm14_runner.exe`) |
-| `vm.cpp` / `vm.hpp` | Virtual machine, opcode dispatcher, instance pool, event loop, builtins |
+| `vm.cpp` / `vm.hpp` | Virtual machine, opcode dispatcher, instance pool, event loop, builtins, state serialization |
 | `dw.cpp` / `dw.hpp` | `data.win` IFF parser, chunk unpacker, room compositor |
 | `audio.cpp` / `audio.hpp` | Audio engine, Windows WaveOut / ALSA backends, mixer, LRU cache |
 | `bunzip.cpp` / `bunzip.hpp` | Lightweight BZip2 decompressor for compressed assets |
 | `qoi.hpp` | QOI texture decoding header |
 | `gm14.ini.example` | Template engine configuration for memory and performance tuning |
-| `vm_tests.cpp` | Comprehensive 181-test test suite |
+| `vm_tests.cpp` | Comprehensive 198-test test suite |
 | `vm_host.cpp` | Headless VM host runner (boots game, steps rooms, outputs state) |
 | `main_host.cpp` | DataWin inspector CLI (dumps stats and renders rooms to PNG) |
 | `stb_image.h` / `stb_image_write.h` | Image decoding and PNG writing |
@@ -283,11 +288,19 @@ Unit tests           : 181 passed, 0 failed
 | **Z / Enter** | Confirm / Interact | `ord("Z")`, `vk_enter`, `gp_face1` |
 | **X / Shift** | Cancel / Run / Skip | `ord("X")`, `vk_shift`, `gp_face2` |
 | **C / Ctrl** | Menu / Item / Cell screen | `ord("C")`, `vk_control`, `gp_face3` |
+| **~ (Tilde)** | Toggle Graphical Debug Control Menu | Debug UI toggle |
 | **F4 / Alt+Enter** | Toggle Fullscreen | Hardware display mode toggle |
-| **[ / ]** | Slow down / Speed up (±0.5x) | Engine speed modifier |
-| **\\** | Reset speed to 1.0x | Engine speed modifier |
+| **F5** | Quick Save State (`states/quicksave.state`) | State serializer snapshot |
+| **F8** | Quick Load State (`states/quicksave.state`) | State deserializer snapshot |
+| **Ctrl + G** | Toggle God Mode (Max HP & invulnerability) | Debug cheat |
+| **Ctrl + E** | Toggle Encounters (Disable random battles) | Debug cheat |
+| **Ctrl + S** | Save Anywhere (Trigger save box dialogue) | Debug cheat |
+| **Ctrl + R** | Toggle Input Recording (`session_*.rec`) | Input recorder |
+| **F10** | Synchronized Noclip / Phasing | Debug shortcut |
 | **F1** | Unfreeze player (`global.interact = 0`) | Debug shortcut |
 | **F2** | Dump room & player coordinates | Debug diagnostics |
+| **[ / ]** | Fine slow down / Speed up (±0.5x) | Engine speed modifier |
+| **\\** | Reset speed to 1.0x | Engine speed modifier |
 | **PageUp / PageDown** | Skip rooms backward / forward | Debug room navigation |
 | **Home** | Reload current room | Debug reset |
 

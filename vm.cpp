@@ -5,6 +5,7 @@
 #endif
 #include <cstdio>
 #include <sstream>
+#include <fstream>
 #include <cctype>
 #include <cstring>
 #if (defined(_3DS) || defined(__arm__) || defined(__linux__)) && !defined(_WIN32)
@@ -13,6 +14,9 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <direct.h>
+#else
+#include <sys/stat.h>
 #endif
 
 namespace gm14 {
@@ -95,7 +99,7 @@ std::string to_str(const Value& v) {
 }
 bool to_bool(const Value& v) {
     if (v.type == Value::STR) return !v.str.empty();
-    if (v.type == Value::NUM) return v.num != 0;
+    if (v.type == Value::NUM) return v.num >= 0.5;
     return false;
 }
 
@@ -222,6 +226,16 @@ static bool is_obj(const DataWin& dw, Instance* inst, int target) {
         if (o == target) return true;
         if (o < 0 || o >= (int)dw.objects.size()) return false;
         o = dw.objects[o].parent;
+    }
+    return false;
+}
+
+static bool obj_has_event(const DataWin& dw, int obj_id, int etype) {
+    for (int p = 0; p < 16 && obj_id >= 0 && obj_id < (int)dw.objects.size(); ++p) {
+        const ObjDef& o = dw.objects[obj_id];
+        auto it = o.events.find(etype);
+        if (it != o.events.end() && !it->second.empty()) return true;
+        obj_id = o.parent;
     }
     return false;
 }
@@ -518,9 +532,6 @@ void Runtime::set_var(Frame& fr, const Instruction& ins, int inst_type, const Va
 }
 
 Value Runtime::get_array(Frame& fr, const Instruction& ins, int inst_type, int index) {
-    if (inst_type == -9 || ins.ref_type() == 0x80) {
-        if (!fr.stack.empty()) { inst_type = (int)to_num(fr.stack.back()); fr.stack.pop_back(); }
-    }
     std::string name;
     if (ins.var >= 0 && ins.var < (int)dw.variables.size()) name = dw.variables[ins.var].name;
     if (name.compare(0, 5, "view_") == 0) {
@@ -570,38 +581,21 @@ Value Runtime::get_array(Frame& fr, const Instruction& ins, int inst_type, int i
 }
 
 void Runtime::set_array(Frame& fr, const Instruction& ins, int inst_type, int index, const Value& v) {
-    if (inst_type == -9 || ins.ref_type() == 0x80) {
-        if (!fr.stack.empty()) { inst_type = (int)to_num(fr.stack.back()); fr.stack.pop_back(); }
-    }
     std::string name;
     if (ins.var >= 0 && ins.var < (int)dw.variables.size()) name = dw.variables[ins.var].name;
     if (name.compare(0, 5, "view_") == 0) {
-        int r_w = globals.count("room_width") ? (int)to_num(globals["room_width"]) : (int)dw.rooms[room_index].width;
-        int r_h = globals.count("room_height") ? (int)to_num(globals["room_height"]) : (int)dw.rooms[room_index].height;
-        int v_w = (global_arrays.count("view_wview") && !global_arrays["view_wview"].empty()) ? (int)to_num(global_arrays["view_wview"][0]) : 320;
-        int v_h = (global_arrays.count("view_hview") && !global_arrays["view_hview"].empty()) ? (int)to_num(global_arrays["view_hview"][0]) : 240;
-        if (v_w <= 0) v_w = 320;
-        if (v_h <= 0) v_h = 240;
-
-        Value clamped_v = v;
         if (index == 0) {
             if (name == "view_xview") {
-                int max_x = std::max(0, r_w - v_w);
-                int cx = std::clamp((int)std::lround(to_num(v)), 0, max_x);
-                clamped_v = Value((double)cx);
-                view_x = cx;
+                view_x = (int)std::lround(to_num(v));
             } else if (name == "view_yview") {
-                int max_y = std::max(0, r_h - v_h);
-                int cy = std::clamp((int)std::lround(to_num(v)), 0, max_y);
-                clamped_v = Value((double)cy);
-                view_y = cy;
+                view_y = (int)std::lround(to_num(v));
             }
         }
 
         auto& arr = global_arrays[name];
         if (index >= 0) {
             if (index >= (int)arr.size()) arr.resize(index + 1, Value(0.0));
-            arr[index] = clamped_v;
+            arr[index] = v;
         }
         return;
     }
@@ -818,10 +812,19 @@ void Runtime::exec(Frame& fr) {
             } else {
                 int inst_type = (int)(int16_t)ins.low16();
                 if (inst_type == -9 || ins.ref_type() == 0x80) {
-                    inst_type = (int)to_num(stk_pop());
+                    if (t1 != 0x5 && ins.type2() == 0x5) {
+                        Value v = stk_pop();
+                        inst_type = (int)to_num(stk_pop());
+                        set_var(fr, ins, inst_type, v);
+                    } else {
+                        inst_type = (int)to_num(stk_pop());
+                        Value v = stk_pop();
+                        set_var(fr, ins, inst_type, v);
+                    }
+                } else {
+                    Value v = stk_pop();
+                    set_var(fr, ins, inst_type, v);
                 }
-                Value v = stk_pop();
-                set_var(fr, ins, inst_type, v);
             }
             fr.pc++;
         } else if (k == OP_POPZ) {
@@ -1374,9 +1377,9 @@ static bool bbox_of(Runtime& rt, Instance* inst, double x, double y, double* bb)
     const Sprite& s = rt.dw.sprites[sprite];
     double xs = v.count("image_xscale") ? to_num(v["image_xscale"]) : 1.0;
     double ys = v.count("image_yscale") ? to_num(v["image_yscale"]) : 1.0;
-    double l = s.ml, r = s.mr, t = s.mt, b = s.mb;
-    if (r <= l) r = (double)std::max<uint32_t>(1, s.width) - 1;
-    if (b <= t) b = (double)std::max<uint32_t>(1, s.height) - 1;
+    double l = s.ml, r = s.mr + 1.0, t = s.mt, b = s.mb + 1.0;
+    if (r <= l) r = (double)std::max<uint32_t>(1, s.width);
+    if (b <= t) b = (double)std::max<uint32_t>(1, s.height);
     double x0 = (l - s.origin_x) * xs;
     double x1 = (r - s.origin_x) * xs;
     double y0 = (t - s.origin_y) * ys;
@@ -1384,11 +1387,70 @@ static bool bbox_of(Runtime& rt, Instance* inst, double x, double y, double* bb)
     if (x0 > x1) std::swap(x0, x1);
     if (y0 > y1) std::swap(y0, y1);
     bb[0] = x + x0; bb[1] = y + y0;
-    bb[2] = x + x1; bb[3] = y + y1;
+    bb[2] = x + x1 - 1.0; bb[3] = y + y1 - 1.0;
     return true;
 }
 static bool overlap(const double* a, const double* b) {
     return !(a[2] < b[0] || a[0] > b[2] || a[3] < b[1] || a[1] > b[3]);
+}
+static int inst_mask_or_sprite(const Runtime& rt, Instance* inst) {
+    if (!inst) return -1;
+    const auto& v = inst->vars;
+    int sprite = v.count("mask_index") ? (int)to_num(v.at("mask_index")) : -1;
+    if (sprite < 0) sprite = v.count("sprite_index") ? (int)to_num(v.at("sprite_index")) : -1;
+    if (sprite < 0 && inst->obj >= 0 && inst->obj < (int)rt.dw.objects.size()) sprite = rt.dw.objects[inst->obj].sprite;
+    return sprite;
+}
+
+static bool check_instances_collide(Runtime& rt, Instance* a, double ax, double ay, Instance* b, double bx, double by) {
+    if (!a || !b) return false;
+    double bb_a[4], bb_b[4];
+    if (!bbox_of(rt, a, ax, ay, bb_a) || !bbox_of(rt, b, bx, by, bb_b)) return false;
+    if (!overlap(bb_a, bb_b)) return false;
+
+    int spr_idx_a = inst_mask_or_sprite(rt, a);
+    int spr_idx_b = inst_mask_or_sprite(rt, b);
+
+    const Sprite* sa = (spr_idx_a >= 0 && spr_idx_a < (int)rt.dw.sprites.size()) ? &rt.dw.sprites[spr_idx_a] : nullptr;
+    const Sprite* sb = (spr_idx_b >= 0 && spr_idx_b < (int)rt.dw.sprites.size()) ? &rt.dw.sprites[spr_idx_b] : nullptr;
+
+    bool prec_a = sa && sa->is_precise();
+    bool prec_b = sb && sb->is_precise();
+
+    if (!prec_a && !prec_b) return true;
+
+    int ix0 = (int)std::floor(std::max(bb_a[0], bb_b[0]));
+    int iy0 = (int)std::floor(std::max(bb_a[1], bb_b[1]));
+    int ix1 = (int)std::floor(std::min(bb_a[2], bb_b[2]));
+    int iy1 = (int)std::floor(std::min(bb_a[3], bb_b[3]));
+
+    double xs_a = a->vars.count("image_xscale") ? to_num(a->vars["image_xscale"]) : 1.0;
+    double ys_a = a->vars.count("image_yscale") ? to_num(a->vars["image_yscale"]) : 1.0;
+    if (xs_a == 0.0 || ys_a == 0.0) return false;
+
+    double xs_b = b->vars.count("image_xscale") ? to_num(b->vars["image_xscale"]) : 1.0;
+    double ys_b = b->vars.count("image_yscale") ? to_num(b->vars["image_yscale"]) : 1.0;
+    if (xs_b == 0.0 || ys_b == 0.0) return false;
+
+    uint32_t sub_a = a->vars.count("image_index") ? (uint32_t)std::max(0.0, to_num(a->vars["image_index"])) : 0;
+    uint32_t sub_b = b->vars.count("image_index") ? (uint32_t)std::max(0.0, to_num(b->vars["image_index"])) : 0;
+
+    for (int y = iy0; y <= iy1; ++y) {
+        for (int x = ix0; x <= ix1; ++x) {
+            if (prec_a) {
+                int lxa = (int)std::floor((x - ax) / xs_a + sa->origin_x);
+                int lya = (int)std::floor((y - ay) / ys_a + sa->origin_y);
+                if (!sa->mask_pixel(sub_a, lxa, lya)) continue;
+            }
+            if (prec_b) {
+                int lxb = (int)std::floor((x - bx) / xs_b + sb->origin_x);
+                int lyb = (int)std::floor((y - by) / ys_b + sb->origin_y);
+                if (!sb->mask_pixel(sub_b, lxb, lyb)) continue;
+            }
+            return true;
+        }
+    }
+    return false;
 }
 static bool match_target(const DataWin& dw, Instance* inst, int target) {
     if (!inst) return false;
@@ -1404,10 +1466,32 @@ static double collision_rect(Runtime& rt, double x1, double y1, double x2, doubl
         if (!ip->alive) continue;
         if (notme && rt.cur && ip->iid == rt.cur->iid) continue;
         if (!match_target(rt.dw, ip.get(), target)) continue;
+        double bx = to_num(ip->vars.count("x")?ip->vars["x"]:Value(0.0));
+        double by = to_num(ip->vars.count("y")?ip->vars["y"]:Value(0.0));
         double bb[4];
-        if (bbox_of(rt, ip.get(), to_num(ip->vars.count("x")?ip->vars["x"]:Value(0.0)),
-                    to_num(ip->vars.count("y")?ip->vars["y"]:Value(0.0)), bb) && overlap(rect, bb))
-            return (double)ip->iid;
+        if (!bbox_of(rt, ip.get(), bx, by, bb) || !overlap(rect, bb)) continue;
+        int spr_idx = inst_mask_or_sprite(rt, ip.get());
+        const Sprite* s = (spr_idx >= 0 && spr_idx < (int)rt.dw.sprites.size()) ? &rt.dw.sprites[spr_idx] : nullptr;
+        if (s && s->is_precise()) {
+            int ix0 = (int)std::floor(std::max(rect[0], bb[0]));
+            int iy0 = (int)std::floor(std::max(rect[1], bb[1]));
+            int ix1 = (int)std::floor(std::min(rect[2], bb[2]));
+            int iy1 = (int)std::floor(std::min(rect[3], bb[3]));
+            double xs = ip->vars.count("image_xscale") ? to_num(ip->vars["image_xscale"]) : 1.0;
+            double ys = ip->vars.count("image_yscale") ? to_num(ip->vars["image_yscale"]) : 1.0;
+            if (xs == 0.0 || ys == 0.0) continue;
+            uint32_t sub = ip->vars.count("image_index") ? (uint32_t)std::max(0.0, to_num(ip->vars["image_index"])) : 0;
+            bool hit = false;
+            for (int py = iy0; py <= iy1 && !hit; ++py) {
+                for (int px = ix0; px <= ix1 && !hit; ++px) {
+                    int lx = (int)std::floor((px - bx) / xs + s->origin_x);
+                    int ly = (int)std::floor((py - by) / ys + s->origin_y);
+                    if (s->mask_pixel(sub, lx, ly)) hit = true;
+                }
+            }
+            if (!hit) continue;
+        }
+        return (double)ip->iid;
     }
     return -4.0;
 }
@@ -1423,9 +1507,9 @@ static double instance_place_impl(Runtime& rt, double x, double y, int target, b
             if (!is_solid) continue;
         }
         if (target != -1 && !match_target(rt.dw, ip.get(), target)) continue;
-        double bb[4];
-        if (bbox_of(rt, ip.get(), to_num(ip->vars.count("x")?ip->vars["x"]:Value(0.0)),
-                    to_num(ip->vars.count("y")?ip->vars["y"]:Value(0.0)), bb) && overlap(me, bb))
+        double bx = to_num(ip->vars.count("x")?ip->vars["x"]:Value(0.0));
+        double by = to_num(ip->vars.count("y")?ip->vars["y"]:Value(0.0));
+        if (check_instances_collide(rt, rt.cur, x, y, ip.get(), bx, by))
             return (double)ip->iid;
     }
     return -4.0;
@@ -1727,6 +1811,12 @@ void Runtime::register_builtins() {
     builtins["instance_destroy"] = [](Runtime& rt, std::vector<Value>& a){
         auto kill = [&](Instance* inst) {
             if (inst && inst->alive) {
+                if (inst->obj >= 0 && inst->obj < (int)rt.dw.objects.size()) {
+                    const std::string& oname = rt.dw.objects[inst->obj].name;
+                    if (oname == "obj_napstablook2" || oname == "obj_napstablook") {
+                        rt.globals["interact"] = vnum(0);
+                    }
+                }
                 rt.run_event(inst, 1, 0);
                 inst->alive = false;
             }
@@ -3702,7 +3792,63 @@ void Runtime::register_builtins() {
         rt.blit_sub_screen(pg, t.sx, t.sy, t.sw, t.sh, (int)narg(a,1) + t.tx - rt.view_x, (int)narg(a,2) + t.ty - rt.view_y, rt.draw_alpha);
         return vnum(0);
     };
-    builtins["draw_background_part"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+    struct PartDrawInfo {
+        int src_x = 0;
+        int src_y = 0;
+        int src_w = 0;
+        int src_h = 0;
+        int dst_offset_x = 0;
+        int dst_offset_y = 0;
+        bool valid = false;
+    };
+
+    auto intersect_part = [](const Tpag& t, int l, int tt, int w, int h) -> PartDrawInfo {
+        PartDrawInfo res;
+        if (w <= 0 || h <= 0) return res;
+        int tx = (int)t.tx;
+        int ty = (int)t.ty;
+        int sw = (int)t.sw;
+        int sh = (int)t.sh;
+        int crop_l = std::max(l, tx);
+        int crop_r = std::min(l + w, tx + sw);
+        int crop_t = std::max(tt, ty);
+        int crop_b = std::min(tt + h, ty + sh);
+        if (crop_r <= crop_l || crop_b <= crop_t) return res;
+
+        res.src_w = crop_r - crop_l;
+        res.src_h = crop_b - crop_t;
+        res.src_x = (int)t.sx + (crop_l - tx);
+        res.src_y = (int)t.sy + (crop_t - ty);
+        res.dst_offset_x = crop_l - l;
+        res.dst_offset_y = crop_t - tt;
+        res.valid = true;
+        return res;
+    };
+
+    builtins["draw_background_ext"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+        if (a.empty()) return vnum(0);
+        int b = (int)narg(a,0);
+        if (b < 0 || b >= (int)rt.dw.bgnds.size()) return vnum(0);
+        int tp = rt.dw.bgnds[b].tpag; if (tp < 0 || tp >= (int)rt.dw.tpags.size()) return vnum(0);
+        const Tpag& t = rt.dw.tpags[tp];
+        if (t.tex < 0 || t.tex >= (int)rt.dw.tex_ptrs.size()) return vnum(0);
+        const Image& pg = rt.page(t.tex);
+        if (pg.w <= 0 || t.sx + t.sw > pg.w || t.sy + t.sh > pg.h) return vnum(0);
+        int dx = (int)narg(a,1), dy = (int)narg(a,2);
+        double xs = a.size() > 3 ? narg(a,3) : 1.0;
+        double ys = a.size() > 4 ? narg(a,4) : 1.0;
+        double rot = a.size() > 5 ? narg(a,5) : 0.0;
+        uint32_t col = a.size() > 6 ? (uint32_t)narg(a,6) : 0xFFFFFF;
+        double alpha = a.size() > 7 ? narg(a,7) * rt.draw_alpha : rt.draw_alpha;
+        int out_w = (int)std::lround(t.sw * xs);
+        int out_h = (int)std::lround(t.sh * ys);
+        if (out_w <= 0 || out_h <= 0) return vnum(0);
+        int dst_x = dx + (int)std::lround(t.tx * xs);
+        int dst_y = dy + (int)std::lround(t.ty * ys);
+        rt.blit_sub_screen_scaled(pg, t.sx, t.sy, t.sw, t.sh, dst_x - rt.view_x, dst_y - rt.view_y, out_w, out_h, alpha, col, rot);
+        return vnum(0);
+    };
+    builtins["draw_background_part"] = [intersect_part](Runtime& rt, std::vector<Value>& a) -> Value {
         if (a.size() < 7) return vnum(0);
         int b = (int)narg(a, 0);
         if (b < 0 || b >= (int)rt.dw.bgnds.size()) return vnum(0);
@@ -3713,10 +3859,16 @@ void Runtime::register_builtins() {
         if (pg.w <= 0) return vnum(0);
         int l = (int)narg(a, 1), tt = (int)narg(a, 2), w = (int)narg(a, 3), h = (int)narg(a, 4);
         int dx = (int)narg(a, 5), dy = (int)narg(a, 6);
-        rt.blit_sub_screen(pg, t.sx + l, t.sy + tt, w, h, dx - rt.view_x, dy - rt.view_y, rt.draw_alpha);
+        PartDrawInfo p = intersect_part(t, l, tt, w, h);
+        if (!p.valid) return vnum(0);
+        if (p.src_x < 0 || p.src_y < 0 || p.src_x + p.src_w > pg.w || p.src_y + p.src_h > pg.h) return vnum(0);
+        rt.blit_sub_screen(pg, p.src_x, p.src_y, p.src_w, p.src_h,
+                           dx + p.dst_offset_x - rt.view_x,
+                           dy + p.dst_offset_y - rt.view_y,
+                           rt.draw_alpha);
         return vnum(0);
     };
-    builtins["draw_background_part_ext"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
+    builtins["draw_background_part_ext"] = [intersect_part](Runtime& rt, std::vector<Value>& a) -> Value {
         if (a.size() < 7) return vnum(0);
         int b = (int)narg(a, 0);
         if (b < 0 || b >= (int)rt.dw.bgnds.size()) return vnum(0);
@@ -3731,12 +3883,20 @@ void Runtime::register_builtins() {
         double ys = a.size() > 8 ? narg(a, 8) : 1.0;
         uint32_t col = a.size() > 9 ? (uint32_t)narg(a, 9) : 0xFFFFFF;
         double alpha = a.size() > 10 ? narg(a, 10) * rt.draw_alpha : rt.draw_alpha;
-        int out_w = (int)std::lround(w * xs);
-        int out_h = (int)std::lround(h * ys);
-        rt.blit_sub_screen_scaled(pg, t.sx + l, t.sy + tt, w, h, dx - rt.view_x, dy - rt.view_y, out_w, out_h, alpha, col, 0.0);
+        PartDrawInfo p = intersect_part(t, l, tt, w, h);
+        if (!p.valid) return vnum(0);
+        if (p.src_x < 0 || p.src_y < 0 || p.src_x + p.src_w > pg.w || p.src_y + p.src_h > pg.h) return vnum(0);
+        int out_w = (int)std::lround(p.src_w * xs);
+        int out_h = (int)std::lround(p.src_h * ys);
+        if (out_w == 0 || out_h == 0) return vnum(0);
+        int dst_x = dx + (int)std::lround(p.dst_offset_x * xs);
+        int dst_y = dy + (int)std::lround(p.dst_offset_y * ys);
+        rt.blit_sub_screen_scaled(pg, p.src_x, p.src_y, p.src_w, p.src_h,
+                                  dst_x - rt.view_x, dst_y - rt.view_y,
+                                  out_w, out_h, alpha, col, 0.0);
         return vnum(0);
     };
-    builtins["draw_sprite_part"] = [](Runtime& rt, std::vector<Value>& a){
+    builtins["draw_sprite_part"] = [intersect_part](Runtime& rt, std::vector<Value>& a){
         int si = (int)narg(a,0); if (si < 0 || si >= (int)rt.dw.sprites.size()) return vnum(0);
         const Sprite& sp = rt.dw.sprites[si]; if (sp.frames.empty()) return vnum(0);
         int n = (int)sp.frames.size(); int fi = (((int)narg(a,1)) % n + n) % n;
@@ -3745,10 +3905,17 @@ void Runtime::register_builtins() {
         if (t.tex < 0 || t.tex >= (int)rt.dw.tex_ptrs.size()) return vnum(0);
         const Image& pg = rt.page(t.tex); if (pg.w <= 0) return vnum(0);
         int l = (int)narg(a,2), tt = (int)narg(a,3), w = (int)narg(a,4), h = (int)narg(a,5);
-        rt.blit_sub_screen(pg, t.sx + l, t.sy + tt, w, h, (int)narg(a,6) - rt.view_x, (int)narg(a,7) - rt.view_y, rt.draw_alpha);
+        int dx = (int)narg(a,6), dy = (int)narg(a,7);
+        PartDrawInfo p = intersect_part(t, l, tt, w, h);
+        if (!p.valid) return vnum(0);
+        if (p.src_x < 0 || p.src_y < 0 || p.src_x + p.src_w > pg.w || p.src_y + p.src_h > pg.h) return vnum(0);
+        rt.blit_sub_screen(pg, p.src_x, p.src_y, p.src_w, p.src_h,
+                           dx + p.dst_offset_x - rt.view_x,
+                           dy + p.dst_offset_y - rt.view_y,
+                           rt.draw_alpha);
         return vnum(0);
     };
-    builtins["draw_sprite_part_ext"] = [](Runtime& rt, std::vector<Value>& a){
+    builtins["draw_sprite_part_ext"] = [intersect_part](Runtime& rt, std::vector<Value>& a){
         int si = (int)narg(a,0); if (si < 0 || si >= (int)rt.dw.sprites.size()) return vnum(0);
         const Sprite& sp = rt.dw.sprites[si]; if (sp.frames.empty()) return vnum(0);
         int n = (int)sp.frames.size(); int fi = (((int)narg(a,1)) % n + n) % n;
@@ -3762,9 +3929,17 @@ void Runtime::register_builtins() {
         double ys = a.size() > 9 ? narg(a,9) : 1.0;
         uint32_t col = a.size() > 10 ? (uint32_t)narg(a,10) : 0xFFFFFF;
         double alpha = a.size() > 11 ? narg(a,11) * rt.draw_alpha : rt.draw_alpha;
-        int out_w = (int)std::lround(w * xs);
-        int out_h = (int)std::lround(h * ys);
-        rt.blit_sub_screen_scaled(pg, t.sx + l, t.sy + tt, w, h, dx - rt.view_x, dy - rt.view_y, out_w, out_h, alpha, col, 0.0);
+        PartDrawInfo p = intersect_part(t, l, tt, w, h);
+        if (!p.valid) return vnum(0);
+        if (p.src_x < 0 || p.src_y < 0 || p.src_x + p.src_w > pg.w || p.src_y + p.src_h > pg.h) return vnum(0);
+        int out_w = (int)std::lround(p.src_w * xs);
+        int out_h = (int)std::lround(p.src_h * ys);
+        if (out_w == 0 || out_h == 0) return vnum(0);
+        int dst_x = dx + (int)std::lround(p.dst_offset_x * xs);
+        int dst_y = dy + (int)std::lround(p.dst_offset_y * ys);
+        rt.blit_sub_screen_scaled(pg, p.src_x, p.src_y, p.src_w, p.src_h,
+                                  dst_x - rt.view_x, dst_y - rt.view_y,
+                                  out_w, out_h, alpha, col, 0.0);
         return vnum(0);
     };
 
@@ -3893,82 +4068,12 @@ void Runtime::register_builtins() {
 
     // ---- Undertale caster_* audio engine ----
     builtins["caster_load"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
-        rt.ensure_audio();
         if (a.empty()) return vnum(-1);
         std::string raw_name = to_str(a[0]);
         if (raw_name.empty()) return vnum(-1);
-
         auto it = rt.caster_path_to_id.find(raw_name);
         if (it != rt.caster_path_to_id.end()) return vnum(it->second);
-
-        std::string base_dir = ".";
-        size_t last_slash = rt.dw.filepath.find_last_of("/\\");
-        if (last_slash != std::string::npos) {
-            base_dir = rt.dw.filepath.substr(0, last_slash);
-        }
-
-        std::string clean = raw_name;
-        if (clean.rfind("./", 0) == 0) clean = clean.substr(2);
-        else if (clean.rfind(".\\", 0) == 0) clean = clean.substr(2);
-
-        std::string fname_only = clean;
-        size_t slash_pos = clean.find_last_of("/\\");
-        if (slash_pos != std::string::npos) fname_only = clean.substr(slash_pos + 1);
-
-        std::vector<std::string> candidates = {
-            base_dir + "/" + clean,
-            base_dir + "/mus/" + clean,
-            base_dir + "/music/" + clean,
-            base_dir + "/" + fname_only,
-            clean
-        };
-        if (fname_only.rfind("mus_", 0) != 0) {
-            candidates.push_back(base_dir + "/mus_" + fname_only);
-            candidates.push_back("mus_" + fname_only);
-        }
-        size_t n_cands = candidates.size();
-        for (size_t ci = 0; ci < n_cands; ++ci) {
-            std::string c = candidates[ci];
-            if (c.size() < 4 || c.substr(c.size() - 4) != ".ogg") {
-                candidates.push_back(c + ".ogg");
-            }
-        }
-
-        std::vector<uint8_t> file_bytes;
-        for (const auto& path : candidates) {
-            FILE* fp = std::fopen(path.c_str(), "rb");
-            if (fp) {
-                std::fseek(fp, 0, SEEK_END);
-                long sz = std::ftell(fp);
-                std::fseek(fp, 0, SEEK_SET);
-                if (sz > 0) {
-                    file_bytes.resize((size_t)sz);
-                    if (std::fread(file_bytes.data(), 1, sz, fp) == (size_t)sz) {
-                        std::fclose(fp);
-                        break;
-                    }
-                }
-                std::fclose(fp);
-                file_bytes.clear();
-            }
-        }
-
-        if (file_bytes.empty()) {
-            int s_idx = rt.dw.sound_index_by_name(raw_name);
-            if (s_idx >= 0) {
-                rt.caster_path_to_id[raw_name] = s_idx;
-                return vnum(s_idx);
-            }
-            return vnum(-1);
-        }
-
-        AudioClip clip;
-        if (!decode_audio(file_bytes.data(), file_bytes.size(), clip)) return vnum(-1);
-
-        int id = rt.next_caster_id++;
-        rt.audio->set_clip(id, std::make_shared<AudioClip>(std::move(clip)));
-        rt.caster_path_to_id[raw_name] = id;
-        return vnum(id);
+        return vnum(rt.load_caster_sound(raw_name));
     };
     builtins["caster_play"] = [](Runtime& rt, std::vector<Value>& a) -> Value {
         rt.ensure_audio();
@@ -4511,6 +4616,44 @@ void Runtime::start_room(int index, std::vector<std::unique_ptr<Instance>> keep)
         vv[0] = vnum(1.0);
     }
 
+    auto& b_vis = global_arrays["background_visible"]; b_vis.assign(8, vnum(0.0));
+    auto& b_fg = global_arrays["background_foreground"]; b_fg.assign(8, vnum(0.0));
+    auto& b_idx = global_arrays["background_index"]; b_idx.assign(8, vnum(-1.0));
+    auto& b_x = global_arrays["background_x"]; b_x.assign(8, vnum(0.0));
+    auto& b_y = global_arrays["background_y"]; b_y.assign(8, vnum(0.0));
+    auto& b_width = global_arrays["background_width"]; b_width.assign(8, vnum(0.0));
+    auto& b_height = global_arrays["background_height"]; b_height.assign(8, vnum(0.0));
+    auto& b_htile = global_arrays["background_htiled"]; b_htile.assign(8, vnum(1.0));
+    auto& b_vtile = global_arrays["background_vtiled"]; b_vtile.assign(8, vnum(1.0));
+    auto& b_xsc = global_arrays["background_xscale"]; b_xsc.assign(8, vnum(1.0));
+    auto& b_ysc = global_arrays["background_yscale"]; b_ysc.assign(8, vnum(1.0));
+    auto& b_hspd = global_arrays["background_hspeed"]; b_hspd.assign(8, vnum(0.0));
+    auto& b_vspd = global_arrays["background_vspeed"]; b_vspd.assign(8, vnum(0.0));
+    auto& b_blend = global_arrays["background_blend"]; b_blend.assign(8, vnum((double)0xFFFFFF));
+    auto& b_alpha = global_arrays["background_alpha"]; b_alpha.assign(8, vnum(1.0));
+
+    for (size_t bi = 0; bi < room.backgrounds.size() && bi < 8; ++bi) {
+        const auto& rb = room.backgrounds[bi];
+        b_vis[bi] = vnum(rb.enabled ? 1.0 : 0.0);
+        b_fg[bi] = vnum(rb.foreground ? 1.0 : 0.0);
+        b_idx[bi] = vnum(rb.bgnd);
+        b_x[bi] = vnum(rb.x);
+        b_y[bi] = vnum(rb.y);
+        b_htile[bi] = vnum(rb.tile_x ? 1.0 : 0.0);
+        b_vtile[bi] = vnum(rb.tile_y ? 1.0 : 0.0);
+        b_hspd[bi] = vnum(rb.speed_x);
+        b_vspd[bi] = vnum(rb.speed_y);
+        if (rb.bgnd >= 0 && rb.bgnd < (int)dw.bgnds.size()) {
+            int tp = dw.bgnds[rb.bgnd].tpag;
+            if (tp >= 0 && tp < (int)dw.tpags.size()) {
+                const auto& t = dw.tpags[tp];
+                b_width[bi] = vnum(t.bw > 0 ? t.bw : t.sw);
+                b_height[bi] = vnum(t.bh > 0 ? t.bh : t.sh);
+            }
+        }
+    }
+    globals["background_color"] = vnum(room.draw_bg_color && room.bg_color != 0x00FFFF ? room.bg_color : 0);
+
     auto it_pers = persistent_rooms.find(index);
     if (it_pers != persistent_rooms.end()) {
         current_room_persistent = true;
@@ -4523,6 +4666,17 @@ void Runtime::start_room(int index, std::vector<std::unique_ptr<Instance>> keep)
         std::vector<std::pair<Instance*, int>> initial_new;
         for (const auto& ri : room.instances) {
             if (ri.obj < 0 || ri.obj >= (int)dw.objects.size()) continue;
+            if ((int)ri.iid >= next_iid) next_iid = (int)ri.iid + 1;
+            if (dw.objects[ri.obj].persistent) {
+                bool exists = false;
+                for (const auto& existing : instances) {
+                    if (existing->alive && is_obj(dw, existing.get(), ri.obj)) {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (exists) continue;
+            }
             auto inst = std::make_unique<Instance>(ri.iid, ri.obj);
             inst->vars["x"] = vnum(ri.x); inst->vars["y"] = vnum(ri.y);
             inst->vars["xstart"] = vnum(ri.x); inst->vars["ystart"] = vnum(ri.y);
@@ -4536,7 +4690,6 @@ void Runtime::start_room(int index, std::vector<std::unique_ptr<Instance>> keep)
             inst->vars["persistent"] = vnum(dw.objects[ri.obj].persistent ? 1 : 0);
             inst->vars["object_index"] = vnum(ri.obj);
             inst->vars["id"] = vnum(ri.iid);
-            if ((int)ri.iid >= next_iid) next_iid = (int)ri.iid + 1;
             Instance* ip = inst.get();
             instances.push_back(std::move(inst));
             initial_new.push_back({ip, ri.creation_code});
@@ -4644,20 +4797,19 @@ void Runtime::step() {
     for (size_t j = 0; j < instances.size(); ++j) {
         Instance* inst = instances[j].get();
         if (!inst || !inst->alive) continue;
-        const ObjDef& obj = dw.objects[inst->obj];
 
-        if (obj.events.count(9)) {
+        if (obj_has_event(dw, inst->obj, 9)) {
             for (int k : keys_pressed) run_event(inst, 9, k);
         }
-        if (obj.events.count(5)) {
+        if (obj_has_event(dw, inst->obj, 5)) {
             for (int k : keys_held) run_event(inst, 5, k);
         }
-        if (obj.events.count(10)) {
+        if (obj_has_event(dw, inst->obj, 10)) {
             for (int k : keys_released) run_event(inst, 10, k);
         }
 
-        auto m_it = obj.events.find(6);
-        if (m_it != obj.events.end() && !m_it->second.empty()) {
+        if (obj_has_event(dw, inst->obj, 6)) {
+
             double bb[4];
             bool inside = bbox_of(*this, inst, to_num(inst->vars.count("x")?inst->vars["x"]:Value(0.0)),
                                   to_num(inst->vars.count("y")?inst->vars["y"]:Value(0.0)), bb)
@@ -4740,7 +4892,11 @@ void Runtime::step() {
                 } else if (inst->path_endaction == 1) { // restart
                     inst->path_position = std::fmod(inst->path_position, 1.0);
                 } else if (inst->path_endaction == 2) { // continue
-                    inst->path_position = std::fmod(inst->path_position, 1.0);
+                    inst->path_position = 1.0;
+                    v["speed"] = vnum(inst->path_speed);
+                    inst->path_index = -1;
+                    v["path_index"] = vnum(-1);
+                    inst->path_speed = 0.0;
                 } else if (inst->path_endaction == 3) { // reverse
                     inst->path_position = 1.0 - (inst->path_position - 1.0);
                     inst->path_speed = -inst->path_speed;
@@ -4753,7 +4909,11 @@ void Runtime::step() {
                 } else if (inst->path_endaction == 1) { // restart
                     inst->path_position = 1.0 + std::fmod(inst->path_position, 1.0);
                 } else if (inst->path_endaction == 2) { // continue
-                    inst->path_position = 1.0 + std::fmod(inst->path_position, 1.0);
+                    inst->path_position = 0.0;
+                    v["speed"] = vnum(std::abs(inst->path_speed));
+                    inst->path_index = -1;
+                    v["path_index"] = vnum(-1);
+                    inst->path_speed = 0.0;
                 } else if (inst->path_endaction == 3) { // reverse
                     inst->path_position = -inst->path_position;
                     inst->path_speed = -inst->path_speed;
@@ -4860,24 +5020,30 @@ void Runtime::step() {
         if (anim_ended) run_event(inst, 7, 7); // Other 7: Animation End
     }
 
-    update_view_follow();
-
-    // End step (subtype 2)
-    {
-        size_t n = instances.size();
-        for (size_t j = 0; j < n && j < instances.size(); ++j) {
-            Instance* inst = instances[j].get();
-            if (inst && inst->alive) run_event(inst, 3, 2);
-        }
-    }
-
     // collision events (event 4)
     for (size_t i = 0; i < instances.size(); ++i) {
         Instance* a = instances[i].get();
         if (!a || !a->alive) continue;
-        const ObjDef& oa = dw.objects[a->obj];
-        auto e4_it = oa.events.find(4);
-        if (e4_it == oa.events.end() || e4_it->second.empty()) continue;
+
+        struct ColHandler {
+            int def_obj;
+            const std::vector<int>* codes;
+        };
+        std::unordered_map<uint32_t, ColHandler> col_events;
+        int cur_obj = a->obj;
+        for (int p = 0; p < 16 && cur_obj >= 0 && cur_obj < (int)dw.objects.size(); ++p) {
+            const ObjDef& o = dw.objects[cur_obj];
+            auto it = o.events.find(4);
+            if (it != o.events.end()) {
+                for (const auto& kv : it->second) {
+                    if (col_events.find(kv.first) == col_events.end() && !kv.second.empty()) {
+                        col_events[kv.first] = { cur_obj, &kv.second };
+                    }
+                }
+            }
+            cur_obj = o.parent;
+        }
+        if (col_events.empty()) continue;
 
         double bb_a[4];
         double ax = to_num(a->vars.count("x") ? a->vars["x"] : Value(0.0));
@@ -4892,28 +5058,71 @@ void Runtime::step() {
             double bx = to_num(b->vars.count("x") ? b->vars["x"] : Value(0.0));
             double by = to_num(b->vars.count("y") ? b->vars["y"] : Value(0.0));
 
-            for (const auto& ev_pair : e4_it->second) {
+            for (const auto& ev_pair : col_events) {
                 int target_obj = (int)ev_pair.first;
                 if (match_target(dw, b, target_obj)) {
-                    double bb_b[4];
-                    if (bbox_of(*this, b, bx, by, bb_b) && overlap(bb_a, bb_b)) {
+                    if (check_instances_collide(*this, a, ax, ay, b, bx, by)) {
                         bool b_solid = (b->vars.count("solid") && to_num(b->vars["solid"]) != 0) || dw.objects[b->obj].solid;
                         if (b_solid) {
                             a->vars["x"] = a->vars.count("xprevious") ? a->vars["xprevious"] : Value(ax);
                             a->vars["y"] = a->vars.count("yprevious") ? a->vars["yprevious"] : Value(ay);
                         }
-                        for (int ci : ev_pair.second) {
+                        bool a_solid = (a->vars.count("solid") && to_num(a->vars["solid"]) != 0) || dw.objects[a->obj].solid;
+                        if (a_solid) {
+                            b->vars["x"] = b->vars.count("xprevious") ? b->vars["xprevious"] : Value(bx);
+                            b->vars["y"] = b->vars.count("yprevious") ? b->vars["yprevious"] : Value(by);
+                        }
+                        const auto& handler = ev_pair.second;
+                        event_stack.push_back({a, handler.def_obj, 4, target_obj});
+                        for (int ci : *handler.codes) {
                             if (ci >= 0 && ci < (int)dw.code.size()) {
                                 std::vector<Value> noargs;
                                 run_entry(&dw.code[ci], noargs, a, b);
                             }
                         }
+                        event_stack.pop_back();
+
+                        if (!a->alive) break;
+                        ax = to_num(a->vars.count("x") ? a->vars["x"] : Value(0.0));
+                        ay = to_num(a->vars.count("y") ? a->vars["y"] : Value(0.0));
+                        if (!bbox_of(*this, a, ax, ay, bb_a)) break;
                     }
                     break;
                 }
             }
+            if (!a->alive) break;
         }
     }
+
+    // End step (subtype 2) runs AFTER collision events per GMS 1.4 spec
+    {
+        size_t n = instances.size();
+        for (size_t j = 0; j < n && j < instances.size(); ++j) {
+            Instance* inst = instances[j].get();
+            if (inst && inst->alive) run_event(inst, 3, 2);
+        }
+    }
+
+    // Advance scrolling backgrounds by hspeed / vspeed
+    if (global_arrays.count("background_x") && global_arrays.count("background_hspeed")) {
+        auto& bx = global_arrays["background_x"];
+        auto& bhs = global_arrays["background_hspeed"];
+        for (size_t i = 0; i < 8 && i < bx.size() && i < bhs.size(); ++i) {
+            double s = to_num(bhs[i]);
+            if (s != 0.0) bx[i] = vnum(to_num(bx[i]) + s);
+        }
+    }
+    if (global_arrays.count("background_y") && global_arrays.count("background_vspeed")) {
+        auto& by = global_arrays["background_y"];
+        auto& bvs = global_arrays["background_vspeed"];
+        for (size_t i = 0; i < 8 && i < by.size() && i < bvs.size(); ++i) {
+            double s = to_num(bvs[i]);
+            if (s != 0.0) by[i] = vnum(to_num(by[i]) + s);
+        }
+    }
+
+    update_view_follow();
+
 
     if (pending_room >= 0) { int r = pending_room; pending_room = -1; change_room(r); }
 
@@ -5006,15 +5215,65 @@ void Runtime::update_view_follow() {
     auto it_vo = global_arrays.find("view_object");
     if (it_vo != global_arrays.end() && !it_vo->second.empty()) follow_obj = (int)to_num(it_vo->second[0]);
 
-    if (follow_obj >= 0 && (room.width > (uint32_t)cw || room.height > (uint32_t)ch)) {
+    if (views_on && follow_obj >= 0) {
+        int hborder = 32, vborder = 32;
+        int hspeed = -1, vspeed = -1;
+        if (global_arrays.count("view_hborder") && !global_arrays["view_hborder"].empty())
+            hborder = (int)to_num(global_arrays["view_hborder"][0]);
+        if (global_arrays.count("view_vborder") && !global_arrays["view_vborder"].empty())
+            vborder = (int)to_num(global_arrays["view_vborder"][0]);
+        if (global_arrays.count("view_hspeed") && !global_arrays["view_hspeed"].empty())
+            hspeed = (int)to_num(global_arrays["view_hspeed"][0]);
+        if (global_arrays.count("view_vspeed") && !global_arrays["view_vspeed"].empty())
+            vspeed = (int)to_num(global_arrays["view_vspeed"][0]);
+
+        int cur_cam_x = 0, cur_cam_y = 0;
+        if (global_arrays.count("view_xview") && !global_arrays["view_xview"].empty())
+            cur_cam_x = (int)std::lround(to_num(global_arrays["view_xview"][0]));
+        if (global_arrays.count("view_yview") && !global_arrays["view_yview"].empty())
+            cur_cam_y = (int)std::lround(to_num(global_arrays["view_yview"][0]));
+
         for (auto& inst : instances) {
             if (inst->alive && is_obj(dw, inst.get(), follow_obj)) {
                 double px = to_num(inst->vars.count("x") ? inst->vars["x"] : Value(0.0));
                 double py = to_num(inst->vars.count("y") ? inst->vars["y"] : Value(0.0));
-                int cam_x = (int)px - cw / 2;
-                int cam_y = (int)py - ch / 2;
-                cam_x = std::clamp(cam_x, 0, std::max(0, (int)room.width - cw));
-                cam_y = std::clamp(cam_y, 0, std::max(0, (int)room.height - ch));
+
+                int target_cam_x = cur_cam_x;
+                if (hborder <= 0) {
+                    if (px < cur_cam_x) target_cam_x = (int)px;
+                    else if (px > cur_cam_x + cw) target_cam_x = (int)px - cw;
+                } else {
+                    int left_m = hborder;
+                    int right_m = cw - hborder;
+                    if (right_m < left_m) target_cam_x = (int)px - cw / 2;
+                    else if (px < cur_cam_x + left_m) target_cam_x = (int)px - left_m;
+                    else if (px > cur_cam_x + right_m) target_cam_x = (int)px - right_m;
+                }
+
+                int target_cam_y = cur_cam_y;
+                if (vborder <= 0) {
+                    if (py < cur_cam_y) target_cam_y = (int)py;
+                    else if (py > cur_cam_y + ch) target_cam_y = (int)py - ch;
+                } else {
+                    int top_m = vborder;
+                    int bottom_m = ch - vborder;
+                    if (bottom_m < top_m) target_cam_y = (int)py - ch / 2;
+                    else if (py < cur_cam_y + top_m) target_cam_y = (int)py - top_m;
+                    else if (py > cur_cam_y + bottom_m) target_cam_y = (int)py - bottom_m;
+                }
+
+                if (hspeed > 0) {
+                    int diff = target_cam_x - cur_cam_x;
+                    if (std::abs(diff) > hspeed) target_cam_x = cur_cam_x + (diff > 0 ? hspeed : -hspeed);
+                }
+                if (vspeed > 0) {
+                    int diff = target_cam_y - cur_cam_y;
+                    if (std::abs(diff) > vspeed) target_cam_y = cur_cam_y + (diff > 0 ? vspeed : -vspeed);
+                }
+
+                int cam_x = std::clamp(target_cam_x, 0, std::max(0, (int)room.width - cw));
+                int cam_y = std::clamp(target_cam_y, 0, std::max(0, (int)room.height - ch));
+
                 if (!global_arrays.count("view_xview") || global_arrays["view_xview"].empty())
                     global_arrays["view_xview"].resize(1, Value(0.0));
                 global_arrays["view_xview"][0] = Value((double)cam_x);
@@ -5031,35 +5290,36 @@ void Runtime::update_view_follow() {
 void Runtime::update_camera() {
     if (room_index < 0 || room_index >= (int)dw.rooms.size()) return;
     const Room& room = dw.rooms[room_index];
-    int cw = 320, ch = 240;
+
     bool views_on = (globals.count("view_enabled") && to_bool(globals["view_enabled"]));
-    if (views_on && global_arrays.count("view_wview") && !global_arrays["view_wview"].empty()) {
-        int vw = (int)to_num(global_arrays["view_wview"][0]);
-        int vh = (int)to_num(global_arrays["view_hview"][0]);
-        if (vw > 0 && vh > 0) { cw = vw; ch = vh; }
-    } else if (room.width > 0 && room.height > 0) {
-        cw = (int)room.width;
-        ch = (int)room.height;
+    if (!views_on) {
+        view_x = 0;
+        view_y = 0;
+        return;
     }
 
     int cam_x = 0, cam_y = 0;
     auto it_vx = global_arrays.find("view_xview");
     auto it_vy = global_arrays.find("view_yview");
-    if (it_vx != global_arrays.end() && !it_vx->second.empty()) cam_x = (int)to_num(it_vx->second[0]);
-    if (it_vy != global_arrays.end() && !it_vy->second.empty()) cam_y = (int)to_num(it_vy->second[0]);
+    if (it_vx != global_arrays.end() && !it_vx->second.empty()) cam_x = (int)std::lround(to_num(it_vx->second[0]));
+    if (it_vy != global_arrays.end() && !it_vy->second.empty()) cam_y = (int)std::lround(to_num(it_vy->second[0]));
 
-    cam_x = std::clamp(cam_x, 0, std::max(0, (int)room.width - cw));
-    cam_y = std::clamp(cam_y, 0, std::max(0, (int)room.height - ch));
+    int cw = 320, ch = 240;
+    if (global_arrays.count("view_wview") && !global_arrays["view_wview"].empty()) {
+        int vw = (int)to_num(global_arrays["view_wview"][0]);
+        int vh = (int)to_num(global_arrays["view_hview"][0]);
+        if (vw > 0 && vh > 0) { cw = vw; ch = vh; }
+    }
+    bool in_cutscene = (globals.count("interact") && to_num(globals["interact"]) != 0.0);
+    if (!in_cutscene) {
+        cam_x = std::clamp(cam_x, 0, std::max(0, (int)room.width - cw));
+        cam_y = std::clamp(cam_y, 0, std::max(0, (int)room.height - ch));
+        if (it_vx != global_arrays.end() && !it_vx->second.empty()) it_vx->second[0] = Value((double)cam_x);
+        if (it_vy != global_arrays.end() && !it_vy->second.empty()) it_vy->second[0] = Value((double)cam_y);
+    }
 
     view_x = cam_x;
     view_y = cam_y;
-    if (!global_arrays.count("view_xview") || global_arrays["view_xview"].empty())
-        global_arrays["view_xview"].resize(1, Value(0.0));
-    global_arrays["view_xview"][0] = Value((double)cam_x);
-
-    if (!global_arrays.count("view_yview") || global_arrays["view_yview"].empty())
-        global_arrays["view_yview"].resize(1, Value(0.0));
-    global_arrays["view_yview"][0] = Value((double)cam_y);
 }
 
 Image Runtime::draw() {
@@ -5078,70 +5338,155 @@ Image Runtime::draw() {
     Image canvas;
     canvas.w = cw; canvas.h = ch;
     canvas.rgba.assign((size_t)canvas.w * canvas.h * 4, 0);
-    uint8_t bg[4] = { (uint8_t)(room.bg_color & 0xFF), (uint8_t)((room.bg_color >> 8) & 0xFF),
-                      (uint8_t)((room.bg_color >> 16) & 0xFF), 255 };
+    uint8_t bg[4] = { 0, 0, 0, 255 };
+    if (room.draw_bg_color && room.bg_color != 0x00FFFF) {
+        bg[0] = (uint8_t)(room.bg_color & 0xFF);
+        bg[1] = (uint8_t)((room.bg_color >> 8) & 0xFF);
+        bg[2] = (uint8_t)((room.bg_color >> 16) & 0xFF);
+    }
     for (size_t i = 0; i < canvas.rgba.size(); i += 4) std::memcpy(&canvas.rgba[i], bg, 4);
     screen = &canvas;
 
-    // Draw room backgrounds
-    for (const auto& rb : room.backgrounds) {
-        if (!rb.enabled || rb.bgnd < 0 || rb.bgnd >= (int)dw.bgnds.size() || rb.foreground) continue;
-        int tp = dw.bgnds[rb.bgnd].tpag;
-        if (tp < 0 || tp >= (int)dw.tpags.size()) continue;
+    auto draw_room_bg = [&](Image& cv, int b_idx, double bx_pos, double by_pos, bool tile_x, bool tile_y, double alpha) {
+        if (b_idx < 0 || b_idx >= (int)dw.bgnds.size()) return;
+        int tp = dw.bgnds[b_idx].tpag;
+        if (tp < 0 || tp >= (int)dw.tpags.size()) return;
         const Tpag& t = dw.tpags[tp];
-        if (t.tex < 0 || t.tex >= (int)dw.tex_ptrs.size()) continue;
+        if (t.tex < 0 || t.tex >= (int)dw.tex_ptrs.size()) return;
         const Image& pg = page(t.tex);
-        if (pg.w <= 0 || t.sx + t.sw > pg.w || t.sy + t.sh > pg.h) continue;
+        if (pg.w <= 0 || t.sx + t.sw > pg.w || t.sy + t.sh > pg.h) return;
 
-        int bg_w = t.sw, bg_h = t.sh;
-        if (bg_w <= 0 || bg_h <= 0) continue;
+        int orig_w = (t.bw > 0) ? (int)t.bw : (int)t.sw;
+        int orig_h = (t.bh > 0) ? (int)t.bh : (int)t.sh;
+        if (orig_w <= 0 || orig_h <= 0) return;
 
-        int start_x = rb.x - view_x;
-        int start_y = rb.y - view_y;
-        if (rb.tile_x) start_x = (start_x % bg_w) - bg_w;
-        if (rb.tile_y) start_y = (start_y % bg_h) - bg_h;
-        int end_x = rb.tile_x ? canvas.w : start_x + bg_w;
-        int end_y = rb.tile_y ? canvas.h : start_y + bg_h;
+        int start_x = (int)std::lround(bx_pos) - view_x;
+        int start_y = (int)std::lround(by_pos) - view_y;
+        if (tile_x) {
+            start_x = (start_x % orig_w);
+            if (start_x > 0) start_x -= orig_w;
+        }
+        if (tile_y) {
+            start_y = (start_y % orig_h);
+            if (start_y > 0) start_y -= orig_h;
+        }
+        int end_x = tile_x ? cv.w : start_x + orig_w;
+        int end_y = tile_y ? cv.h : start_y + orig_h;
 
-        for (int by = start_y; by < end_y; by += bg_h) {
-            for (int bx = start_x; bx < end_x; bx += bg_w) {
-                blit_sub_screen(pg, t.sx, t.sy, bg_w, bg_h, bx, by, 1.0);
+        for (int by = start_y; by < end_y; by += orig_h) {
+            for (int bx = start_x; bx < end_x; bx += orig_w) {
+                blit_sub_screen(pg, t.sx, t.sy, t.sw, t.sh, bx + t.tx, by + t.ty, alpha);
             }
         }
-    }
+    };
 
-    // Tiles (with frustum culling and zero-copy blitting)
-    struct IndexedTile { const Tile* tl; size_t idx; };
-    std::vector<IndexedTile> ts;
+    auto draw_bg_pass = [&](bool foreground_pass) {
+        int max_bg = std::max(8, (int)room.backgrounds.size());
+        for (int bi = 0; bi < max_bg; ++bi) {
+            bool vis = false;
+            bool fg = false;
+            int bg_id = -1;
+            double bx = 0, by = 0;
+            bool htile = true, vtile = true;
+            double alpha = 1.0;
+
+            if (global_arrays.count("background_visible") && bi < (int)global_arrays["background_visible"].size()) {
+                vis = (to_num(global_arrays["background_visible"][bi]) != 0.0);
+            } else if (bi < (int)room.backgrounds.size()) {
+                vis = room.backgrounds[bi].enabled;
+            }
+            if (!vis) continue;
+
+            if (global_arrays.count("background_foreground") && bi < (int)global_arrays["background_foreground"].size()) {
+                fg = (to_num(global_arrays["background_foreground"][bi]) != 0.0);
+            } else if (bi < (int)room.backgrounds.size()) {
+                fg = room.backgrounds[bi].foreground;
+            }
+            if (fg != foreground_pass) continue;
+
+            if (global_arrays.count("background_index") && bi < (int)global_arrays["background_index"].size()) {
+                bg_id = (int)to_num(global_arrays["background_index"][bi]);
+            } else if (bi < (int)room.backgrounds.size()) {
+                bg_id = room.backgrounds[bi].bgnd;
+            }
+            if (bg_id < 0 || bg_id >= (int)dw.bgnds.size()) continue;
+
+            if (global_arrays.count("background_x") && bi < (int)global_arrays["background_x"].size()) {
+                bx = to_num(global_arrays["background_x"][bi]);
+            } else if (bi < (int)room.backgrounds.size()) {
+                bx = room.backgrounds[bi].x;
+            }
+
+            if (global_arrays.count("background_y") && bi < (int)global_arrays["background_y"].size()) {
+                by = to_num(global_arrays["background_y"][bi]);
+            } else if (bi < (int)room.backgrounds.size()) {
+                by = room.backgrounds[bi].y;
+            }
+
+            if (global_arrays.count("background_htiled") && bi < (int)global_arrays["background_htiled"].size()) {
+                htile = (to_num(global_arrays["background_htiled"][bi]) != 0.0);
+            } else if (bi < (int)room.backgrounds.size()) {
+                htile = room.backgrounds[bi].tile_x;
+            }
+
+            if (global_arrays.count("background_vtiled") && bi < (int)global_arrays["background_vtiled"].size()) {
+                vtile = (to_num(global_arrays["background_vtiled"][bi]) != 0.0);
+            } else if (bi < (int)room.backgrounds.size()) {
+                vtile = room.backgrounds[bi].tile_y;
+            }
+
+            if (global_arrays.count("background_alpha") && bi < (int)global_arrays["background_alpha"].size()) {
+                alpha = to_num(global_arrays["background_alpha"][bi]);
+            }
+
+            draw_room_bg(canvas, bg_id, bx, by, htile, vtile, alpha);
+        }
+    };
+
+    // Draw room backgrounds
+    draw_bg_pass(false);
+
+    // Unified Draw (0) queue interleaving Tiles and Instances by depth descending
+    struct RenderItem {
+        double depth;
+        int type; // 0 = Tile, 1 = Instance
+        size_t index;
+        const Tile* tile;
+        Instance* inst;
+    };
+    std::vector<RenderItem> render_queue;
     const int margin = cfg.culling_margin;
+
+    // Collect tiles within frustum
     for (size_t i = 0; i < room.tiles.size(); ++i) {
         const auto& t = room.tiles[i];
         if (t.x + t.w < view_x - margin || t.x > view_x + canvas.w + margin ||
             t.y + t.h < view_y - margin || t.y > view_y + canvas.h + margin) continue;
-        ts.push_back({&t, i});
-    }
-    std::sort(ts.begin(), ts.end(), [](const IndexedTile& a, const IndexedTile& b){
-        if (a.tl->depth != b.tl->depth) return a.tl->depth > b.tl->depth;
-        return a.idx < b.idx;
-    });
-    for (const auto& it : ts) {
-        const Tile* tl = it.tl;
-        if (tl->bgnd < 0 || tl->bgnd >= (int)dw.bgnds.size()) continue;
-        int tp = dw.bgnds[tl->bgnd].tpag;
-        if (tp < 0 || tp >= (int)dw.tpags.size()) continue;
-        const Tpag& t = dw.tpags[tp];
-        if (t.tex < 0 || t.tex >= (int)dw.tex_ptrs.size()) continue;
-        const Image& pg = page(t.tex);
-        int sx = t.sx + tl->srcx;
-        int sy = t.sy + tl->srcy;
-        if (sx < 0 || sy < 0 || sx + tl->w > pg.w || sy + tl->h > pg.h) continue;
-        blit_sub_screen(pg, sx, sy, tl->w, tl->h, tl->x - view_x, tl->y - view_y, 1.0);
+        render_queue.push_back({(double)t.depth, 0, i, &t, nullptr});
     }
 
-    // instances by depth
+    // Collect alive visible instances
+    for (size_t i = 0; i < instances.size(); ++i) {
+        Instance* inst = instances[i].get();
+        if (!inst || !inst->alive) continue;
+        if (to_num(inst->vars.count("visible") ? inst->vars["visible"] : Value(1.0)) == 0.0) continue;
+        double d = to_num(inst->vars.count("depth") ? inst->vars["depth"] : Value(0.0));
+        render_queue.push_back({d, 1, i, nullptr, inst});
+    }
+
+    // Sort render items: higher depth first (drawn in background).
+    // At same depth, tiles draw before instances (type 0 before 1).
+    // Secondary tie-breaker: original index.
+    std::sort(render_queue.begin(), render_queue.end(), [](const RenderItem& a, const RenderItem& b) {
+        if (a.depth != b.depth) return a.depth > b.depth;
+        if (a.type != b.type) return a.type < b.type;
+        return a.index < b.index;
+    });
+
+    // instances by depth for other passes
     std::vector<Instance*> order;
     for (auto& i : instances) if (i->alive) order.push_back(i.get());
-    std::sort(order.begin(), order.end(), [](Instance* a, Instance* b){
+    std::stable_sort(order.begin(), order.end(), [](Instance* a, Instance* b){
         return to_num(a->vars.count("depth")?a->vars["depth"]:Value(0.0)) >
                to_num(b->vars.count("depth")?b->vars["depth"]:Value(0.0)); });
 
@@ -5175,10 +5520,61 @@ Image Runtime::draw() {
         }
     };
 
-    // Pre-Draw (76), Draw Begin (72), Draw (0), Draw End (73), Post-Draw (77)
+    // Pre-Draw (76), Draw Begin (72)
     dispatch_draw(76);
     dispatch_draw(72);
-    dispatch_draw(0);
+
+    // Draw (0) unified pass
+    for (const auto& item : render_queue) {
+        if (item.type == 0) {
+            const Tile* tl = item.tile;
+            if (tl->bgnd < 0 || tl->bgnd >= (int)dw.bgnds.size()) continue;
+            int tp = dw.bgnds[tl->bgnd].tpag;
+            if (tp < 0 || tp >= (int)dw.tpags.size()) continue;
+            const Tpag& t = dw.tpags[tp];
+            if (t.tex < 0 || t.tex >= (int)dw.tex_ptrs.size()) continue;
+            const Image& pg = page(t.tex);
+            int sx = t.sx + tl->srcx;
+            int sy = t.sy + tl->srcy;
+            int bw = std::min((int)tl->w, std::max(0, (int)t.sw - (int)tl->srcx));
+            int bh = std::min((int)tl->h, std::max(0, (int)t.sh - (int)tl->srcy));
+            if (bw <= 0 || bh <= 0) continue;
+            if (sx < 0 || sy < 0 || sx + bw > pg.w || sy + bh > pg.h) continue;
+            blit_sub_screen(pg, sx, sy, bw, bh, tl->x - view_x, tl->y - view_y, 1.0);
+        } else {
+            Instance* inst = item.inst;
+            if (!inst->alive) continue;
+            if (to_num(inst->vars.count("visible") ? inst->vars["visible"] : Value(1.0)) == 0.0) continue;
+            bool found = false;
+            int cur_obj = inst->obj;
+            for (int p = 0; p < 16 && cur_obj >= 0 && cur_obj < (int)dw.objects.size(); ++p) {
+                auto it = dw.objects[cur_obj].events.find(8);
+                if (it != dw.objects[cur_obj].events.end() && it->second.count(0)) {
+                    found = true;
+                    break;
+                }
+                cur_obj = dw.objects[cur_obj].parent;
+            }
+            if (found) {
+                run_event(inst, 8, 0);
+            } else {
+                draw_sprite_impl(*this, to_num(inst->vars.count("sprite_index")?inst->vars["sprite_index"]:Value(-1.0)),
+                                 to_num(inst->vars.count("image_index")?inst->vars["image_index"]:Value(0.0)),
+                                 to_num(inst->vars.count("x")?inst->vars["x"]:Value(0.0)),
+                                 to_num(inst->vars.count("y")?inst->vars["y"]:Value(0.0)),
+                                 to_num(inst->vars.count("image_xscale")?inst->vars["image_xscale"]:Value(1.0)),
+                                 to_num(inst->vars.count("image_yscale")?inst->vars["image_yscale"]:Value(1.0)),
+                                 to_num(inst->vars.count("image_alpha")?inst->vars["image_alpha"]:Value(1.0)),
+                                 to_num(inst->vars.count("image_angle")?inst->vars["image_angle"]:Value(0.0)),
+                                 (uint32_t)to_num(inst->vars.count("image_blend")?inst->vars["image_blend"]:Value((double)0xFFFFFF)));
+            }
+        }
+    }
+
+    // Draw foreground room backgrounds
+    draw_bg_pass(true);
+
+    // Draw End (73), Post-Draw (77)
     dispatch_draw(73);
     dispatch_draw(77);
 
@@ -5196,6 +5592,602 @@ Image Runtime::draw() {
 
     screen = nullptr;
     return canvas;
+}
+
+int Runtime::load_caster_sound(const std::string& raw_name, int forced_id) {
+    ensure_audio();
+    if (raw_name.empty()) return -1;
+
+    std::string base_dir = ".";
+    size_t last_slash = dw.filepath.find_last_of("/\\");
+    if (last_slash != std::string::npos) {
+        base_dir = dw.filepath.substr(0, last_slash);
+    }
+
+    std::string clean = raw_name;
+    if (clean.rfind("./", 0) == 0) clean = clean.substr(2);
+    else if (clean.rfind(".\\", 0) == 0) clean = clean.substr(2);
+
+    std::string fname_only = clean;
+    size_t slash_pos = clean.find_last_of("/\\");
+    if (slash_pos != std::string::npos) fname_only = clean.substr(slash_pos + 1);
+
+    std::string stripped = fname_only;
+    size_t dot_pos = stripped.find_last_of('.');
+    if (dot_pos != std::string::npos) stripped = stripped.substr(0, dot_pos);
+
+    std::vector<std::string> candidates = {
+        base_dir + "/" + clean,
+        base_dir + "/mus/" + clean,
+        base_dir + "/music/" + clean,
+        base_dir + "/" + fname_only,
+        clean
+    };
+    if (fname_only.rfind("mus_", 0) != 0) {
+        candidates.push_back(base_dir + "/mus_" + fname_only);
+        candidates.push_back("mus_" + fname_only);
+        candidates.push_back(base_dir + "/mus/mus_" + fname_only);
+        candidates.push_back(base_dir + "/music/mus_" + fname_only);
+    }
+    size_t n_cands = candidates.size();
+    for (size_t ci = 0; ci < n_cands; ++ci) {
+        std::string c = candidates[ci];
+        if (c.size() < 4 || c.substr(c.size() - 4) != ".ogg") {
+            candidates.push_back(c + ".ogg");
+        }
+    }
+
+    std::vector<uint8_t> file_bytes;
+    for (const auto& path : candidates) {
+        FILE* fp = std::fopen(path.c_str(), "rb");
+        if (fp) {
+            std::fseek(fp, 0, SEEK_END);
+            long sz = std::ftell(fp);
+            std::fseek(fp, 0, SEEK_SET);
+            if (sz > 0) {
+                file_bytes.resize((size_t)sz);
+                if (std::fread(file_bytes.data(), 1, sz, fp) == (size_t)sz) {
+                    std::fclose(fp);
+                    break;
+                }
+            }
+            std::fclose(fp);
+            file_bytes.clear();
+        }
+    }
+
+    if (file_bytes.empty()) {
+        int s_idx = dw.sound_index_by_name(raw_name);
+        if (s_idx < 0) s_idx = dw.sound_index_by_name(clean);
+        if (s_idx < 0) s_idx = dw.sound_index_by_name(fname_only);
+        if (s_idx < 0) s_idx = dw.sound_index_by_name(stripped);
+        if (s_idx < 0) s_idx = dw.sound_index_by_name("mus_" + stripped);
+        if (s_idx >= 0) {
+            const Sound& s = dw.sounds[s_idx];
+            if (!s.file.empty()) {
+                std::vector<std::string> s_cands = {
+                    base_dir + "/" + s.file,
+                    base_dir + "/mus/" + s.file,
+                    base_dir + "/music/" + s.file,
+                    s.file
+                };
+                for (const auto& path : s_cands) {
+                    FILE* fp = std::fopen(path.c_str(), "rb");
+                    if (fp) {
+                        std::fseek(fp, 0, SEEK_END);
+                        long sz = std::ftell(fp);
+                        std::fseek(fp, 0, SEEK_SET);
+                        if (sz > 0) {
+                            file_bytes.resize((size_t)sz);
+                            if (std::fread(file_bytes.data(), 1, sz, fp) == (size_t)sz) {
+                                std::fclose(fp);
+                                break;
+                            }
+                        }
+                        std::fclose(fp);
+                        file_bytes.clear();
+                    }
+                }
+            }
+            if (file_bytes.empty()) {
+                caster_path_to_id[raw_name] = s_idx;
+                return s_idx;
+            }
+        } else {
+            return -1;
+        }
+    }
+
+    AudioClip clip;
+    if (!decode_audio(file_bytes.data(), file_bytes.size(), clip)) return -1;
+
+    int id = (forced_id >= 0) ? forced_id : next_caster_id++;
+    if (id >= next_caster_id) next_caster_id = id + 1;
+    audio->set_clip(id, std::make_shared<AudioClip>(std::move(clip)));
+    caster_path_to_id[raw_name] = id;
+    return id;
+}
+
+namespace {
+
+static void wr_u8(std::ostream& os, uint8_t v) { os.write((const char*)&v, 1); }
+static void wr_i32(std::ostream& os, int32_t v) { os.write((const char*)&v, 4); }
+static void wr_u32(std::ostream& os, uint32_t v) { os.write((const char*)&v, 4); }
+static void wr_f64(std::ostream& os, double v) { os.write((const char*)&v, 8); }
+static void wr_str(std::ostream& os, const std::string& s) {
+    wr_u32(os, (uint32_t)s.size());
+    if (!s.empty()) os.write(s.data(), s.size());
+}
+
+static uint8_t rd_u8(std::istream& is) { uint8_t v = 0; is.read((char*)&v, 1); return v; }
+static int32_t rd_i32(std::istream& is) { int32_t v = 0; is.read((char*)&v, 4); return v; }
+static uint32_t rd_u32(std::istream& is) { uint32_t v = 0; is.read((char*)&v, 4); return v; }
+static double rd_f64(std::istream& is) { double v = 0.0; is.read((char*)&v, 8); return v; }
+static std::string rd_str(std::istream& is) {
+    uint32_t sz = rd_u32(is);
+    std::string s(sz, '\0');
+    if (sz > 0) is.read(&s[0], sz);
+    return s;
+}
+
+static void wr_val(std::ostream& os, const Value& v) {
+    wr_u8(os, (uint8_t)v.type);
+    wr_f64(os, v.num);
+    wr_str(os, v.str);
+}
+
+static Value rd_val(std::istream& is) {
+    Value v;
+    v.type = (Value::Type)rd_u8(is);
+    v.num = rd_f64(is);
+    v.str = rd_str(is);
+    return v;
+}
+
+static void wr_val_vec(std::ostream& os, const std::vector<Value>& vec) {
+    wr_u32(os, (uint32_t)vec.size());
+    for (const auto& item : vec) wr_val(os, item);
+}
+
+static std::vector<Value> rd_val_vec(std::istream& is) {
+    uint32_t sz = rd_u32(is);
+    std::vector<Value> vec(sz);
+    for (uint32_t i = 0; i < sz; ++i) vec[i] = rd_val(is);
+    return vec;
+}
+
+static void wr_instance(std::ostream& os, const Instance& inst) {
+    wr_i32(os, inst.iid);
+    wr_i32(os, inst.obj);
+    wr_u8(os, inst.alive ? 1 : 0);
+    wr_u32(os, (uint32_t)inst.alarms.size());
+    for (int a : inst.alarms) wr_i32(os, a);
+    wr_i32(os, inst.path_index);
+    wr_f64(os, inst.path_speed);
+    wr_f64(os, inst.path_position);
+    wr_i32(os, inst.path_endaction);
+    wr_u8(os, inst.path_absolute ? 1 : 0);
+    wr_f64(os, inst.path_scale);
+    wr_f64(os, inst.path_orientation);
+    wr_f64(os, inst.path_start_x);
+    wr_f64(os, inst.path_start_y);
+
+    wr_u32(os, (uint32_t)inst.arrays.size());
+    for (const auto& kv : inst.arrays) {
+        wr_str(os, kv.first);
+        wr_val_vec(os, kv.second);
+    }
+
+    wr_u32(os, (uint32_t)inst.vars.size());
+    for (const auto& kv : inst.vars) {
+        wr_str(os, kv.first);
+        wr_val(os, kv.second);
+    }
+}
+
+static std::unique_ptr<Instance> rd_instance(std::istream& is) {
+    int iid = rd_i32(is);
+    int obj = rd_i32(is);
+    auto inst = std::make_unique<Instance>(iid, obj);
+    inst->alive = (rd_u8(is) != 0);
+    uint32_t n_alarms = rd_u32(is);
+    inst->alarms.resize(n_alarms);
+    for (uint32_t i = 0; i < n_alarms; ++i) inst->alarms[i] = rd_i32(is);
+    inst->path_index = rd_i32(is);
+    inst->path_speed = rd_f64(is);
+    inst->path_position = rd_f64(is);
+    inst->path_endaction = rd_i32(is);
+    inst->path_absolute = (rd_u8(is) != 0);
+    inst->path_scale = rd_f64(is);
+    inst->path_orientation = rd_f64(is);
+    inst->path_start_x = rd_f64(is);
+    inst->path_start_y = rd_f64(is);
+
+    uint32_t n_arrays = rd_u32(is);
+    for (uint32_t i = 0; i < n_arrays; ++i) {
+        std::string name = rd_str(is);
+        inst->arrays[name] = rd_val_vec(is);
+    }
+
+    uint32_t n_vars = rd_u32(is);
+    for (uint32_t i = 0; i < n_vars; ++i) {
+        std::string name = rd_str(is);
+        inst->vars[name] = rd_val(is);
+    }
+
+    // Relink VARPTR
+    for (auto& kv : inst->arrays) {
+        if (inst->vars.count(kv.first)) {
+            inst->vars[kv.first].type = Value::VARPTR;
+            inst->vars[kv.first].arrref = &kv.second;
+        }
+    }
+
+    return inst;
+}
+
+static std::string normalize_state_filepath(const std::string& input_name) {
+    std::string p = input_name;
+    while (!p.empty() && (p.front() == ' ' || p.front() == '\t')) p.erase(p.begin());
+    while (!p.empty() && (p.back() == ' ' || p.back() == '\t' || p.back() == '\r' || p.back() == '\n')) p.pop_back();
+    if (p.empty()) p = "quicksave";
+
+    if (p.find('/') == std::string::npos && p.find('\\') == std::string::npos) {
+#ifdef _WIN32
+        _mkdir("states");
+#else
+        mkdir("states", 0755);
+#endif
+        p = "states/" + p;
+    }
+    if (p.size() < 6 || p.substr(p.size() - 6) != ".state") {
+        p += ".state";
+    }
+    return p;
+}
+
+} // namespace
+
+bool Runtime::save_state(std::ostream& os) const {
+    if (!os.good()) return false;
+
+    // Header
+    os.write("GM14STAT", 8);
+    wr_u32(os, 1); // version 1
+    wr_i32(os, room_index);
+    wr_i32(os, frame_count);
+    wr_i32(os, next_iid);
+    wr_i32(os, view_x);
+    wr_i32(os, view_y);
+    wr_u8(os, current_room_persistent ? 1 : 0);
+    wr_i32(os, draw_color);
+    wr_f64(os, draw_alpha);
+    wr_i32(os, draw_blend_mode);
+    wr_i32(os, draw_font);
+    wr_i32(os, draw_halign);
+    wr_i32(os, draw_valign);
+    wr_i32(os, next_ds_map);
+    wr_i32(os, next_ds_list);
+    wr_i32(os, next_ds_grid);
+    wr_i32(os, next_caster_id);
+    wr_i32(os, gui_width);
+    wr_i32(os, gui_height);
+
+    // Global arrays
+    wr_u32(os, (uint32_t)global_arrays.size());
+    for (const auto& kv : global_arrays) {
+        wr_str(os, kv.first);
+        wr_val_vec(os, kv.second);
+    }
+
+    // Globals
+    wr_u32(os, (uint32_t)globals.size());
+    for (const auto& kv : globals) {
+        wr_str(os, kv.first);
+        wr_val(os, kv.second);
+    }
+
+    // Global builtins
+    wr_u32(os, (uint32_t)global_builtins.size());
+    for (const auto& kv : global_builtins) {
+        wr_str(os, kv.first);
+        wr_val(os, kv.second);
+    }
+
+    // Active Instances
+    wr_u32(os, (uint32_t)instances.size());
+    for (const auto& inst : instances) {
+        if (inst) wr_instance(os, *inst);
+    }
+
+    // Persistent Rooms
+    wr_u32(os, (uint32_t)persistent_rooms.size());
+    for (const auto& pr : persistent_rooms) {
+        wr_i32(os, pr.first);
+        wr_u32(os, (uint32_t)pr.second.size());
+        for (const auto& inst : pr.second) {
+            if (inst) wr_instance(os, *inst);
+        }
+    }
+
+    // Data structures: ds_maps
+    wr_u32(os, (uint32_t)ds_maps.size());
+    for (const auto& kv : ds_maps) {
+        wr_i32(os, kv.first);
+        wr_u32(os, (uint32_t)kv.second.size());
+        for (const auto& mkv : kv.second) {
+            wr_str(os, mkv.first);
+            wr_val(os, mkv.second);
+        }
+    }
+
+    // ds_lists
+    wr_u32(os, (uint32_t)ds_lists.size());
+    for (const auto& kv : ds_lists) {
+        wr_i32(os, kv.first);
+        wr_val_vec(os, kv.second);
+    }
+
+    // ds_grids
+    wr_u32(os, (uint32_t)ds_grids.size());
+    for (const auto& kv : ds_grids) {
+        wr_i32(os, kv.first);
+        wr_i32(os, kv.second.width);
+        wr_i32(os, kv.second.height);
+        wr_val_vec(os, kv.second.data);
+    }
+
+    // Caster path mapping
+    wr_u32(os, (uint32_t)caster_path_to_id.size());
+    for (const auto& kv : caster_path_to_id) {
+        wr_str(os, kv.first);
+        wr_i32(os, kv.second);
+    }
+
+    // Audio voices
+    std::vector<SavedVoice> voices;
+    if (audio) voices = audio->get_active_voices();
+    wr_u32(os, (uint32_t)voices.size());
+    for (const auto& sv : voices) {
+        wr_i32(os, sv.asset);
+        wr_i32(os, sv.handle);
+        wr_u8(os, sv.loop ? 1 : 0);
+        wr_u8(os, sv.paused ? 1 : 0);
+        wr_f64(os, sv.position_seconds);
+        wr_f64(os, sv.gain);
+        wr_f64(os, sv.pitch);
+        wr_f64(os, sv.priority);
+    }
+
+    return os.good();
+}
+
+bool Runtime::load_state(std::istream& is) {
+    if (!is.good()) return false;
+
+    char magic[8] = {0};
+    is.read(magic, 8);
+    if (std::memcmp(magic, "GM14STAT", 8) != 0) return false;
+
+    uint32_t ver = rd_u32(is);
+    if (ver != 1) return false;
+
+    int32_t saved_room = rd_i32(is);
+    int32_t saved_frame_count = rd_i32(is);
+    int32_t saved_next_iid = rd_i32(is);
+    int32_t saved_view_x = rd_i32(is);
+    int32_t saved_view_y = rd_i32(is);
+    uint8_t saved_persistent = rd_u8(is);
+    int32_t saved_draw_color = rd_i32(is);
+    double saved_draw_alpha = rd_f64(is);
+    int32_t saved_draw_blend_mode = rd_i32(is);
+    int32_t saved_draw_font = rd_i32(is);
+    int32_t saved_draw_halign = rd_i32(is);
+    int32_t saved_draw_valign = rd_i32(is);
+    int32_t saved_next_ds_map = rd_i32(is);
+    int32_t saved_next_ds_list = rd_i32(is);
+    int32_t saved_next_ds_grid = rd_i32(is);
+    int32_t saved_next_caster_id = rd_i32(is);
+    int32_t saved_gui_width = rd_i32(is);
+    int32_t saved_gui_height = rd_i32(is);
+
+    // Global arrays
+    uint32_t n_ga = rd_u32(is);
+    std::unordered_map<std::string, std::vector<Value>> new_ga;
+    for (uint32_t i = 0; i < n_ga; ++i) {
+        std::string k = rd_str(is);
+        new_ga[k] = rd_val_vec(is);
+    }
+
+    // Globals
+    uint32_t n_g = rd_u32(is);
+    std::unordered_map<std::string, Value> new_globals;
+    for (uint32_t i = 0; i < n_g; ++i) {
+        std::string k = rd_str(is);
+        new_globals[k] = rd_val(is);
+    }
+
+    // Relink VARPTR on globals
+    for (auto& kv : new_ga) {
+        if (new_globals.count(kv.first)) {
+            new_globals[kv.first].type = Value::VARPTR;
+            new_globals[kv.first].arrref = &kv.second;
+        }
+    }
+
+    // Global builtins
+    uint32_t n_gb = rd_u32(is);
+    std::unordered_map<std::string, Value> new_gb;
+    for (uint32_t i = 0; i < n_gb; ++i) {
+        std::string k = rd_str(is);
+        new_gb[k] = rd_val(is);
+    }
+
+    // Instances
+    uint32_t n_inst = rd_u32(is);
+    std::vector<std::unique_ptr<Instance>> new_instances;
+    new_instances.reserve(n_inst);
+    for (uint32_t i = 0; i < n_inst; ++i) {
+        new_instances.push_back(rd_instance(is));
+    }
+
+    // Persistent rooms
+    uint32_t n_pr = rd_u32(is);
+    std::unordered_map<int, std::vector<std::unique_ptr<Instance>>> new_pr;
+    for (uint32_t i = 0; i < n_pr; ++i) {
+        int r_idx = rd_i32(is);
+        uint32_t r_cnt = rd_u32(is);
+        auto& r_vec = new_pr[r_idx];
+        r_vec.reserve(r_cnt);
+        for (uint32_t j = 0; j < r_cnt; ++j) {
+            r_vec.push_back(rd_instance(is));
+        }
+    }
+
+    // ds_maps
+    uint32_t n_dsm = rd_u32(is);
+    std::unordered_map<int, std::unordered_map<std::string, Value>> new_dsm;
+    for (uint32_t i = 0; i < n_dsm; ++i) {
+        int id = rd_i32(is);
+        uint32_t msz = rd_u32(is);
+        auto& m = new_dsm[id];
+        for (uint32_t j = 0; j < msz; ++j) {
+            std::string mk = rd_str(is);
+            m[mk] = rd_val(is);
+        }
+    }
+
+    // ds_lists
+    uint32_t n_dsl = rd_u32(is);
+    std::unordered_map<int, std::vector<Value>> new_dsl;
+    for (uint32_t i = 0; i < n_dsl; ++i) {
+        int id = rd_i32(is);
+        new_dsl[id] = rd_val_vec(is);
+    }
+
+    // ds_grids
+    uint32_t n_dsg = rd_u32(is);
+    std::unordered_map<int, DsGrid> new_dsg;
+    for (uint32_t i = 0; i < n_dsg; ++i) {
+        int id = rd_i32(is);
+        int w = rd_i32(is);
+        int h = rd_i32(is);
+        DsGrid g(w, h);
+        g.data = rd_val_vec(is);
+        new_dsg[id] = std::move(g);
+    }
+
+    // caster_path_to_id
+    uint32_t n_cpath = rd_u32(is);
+    std::unordered_map<std::string, int> new_cpath;
+    for (uint32_t i = 0; i < n_cpath; ++i) {
+        std::string k = rd_str(is);
+        int id = rd_i32(is);
+        new_cpath[k] = id;
+    }
+
+    // voices
+    uint32_t n_voices = rd_u32(is);
+    std::vector<SavedVoice> voices(n_voices);
+    for (uint32_t i = 0; i < n_voices; ++i) {
+        voices[i].asset = rd_i32(is);
+        voices[i].handle = rd_i32(is);
+        voices[i].loop = (rd_u8(is) != 0);
+        voices[i].paused = (rd_u8(is) != 0);
+        voices[i].position_seconds = rd_f64(is);
+        voices[i].gain = rd_f64(is);
+        voices[i].pitch = rd_f64(is);
+        voices[i].priority = rd_f64(is);
+    }
+
+    if (!is.good()) return false;
+
+    // Apply state to runtime
+    room_index = saved_room;
+    frame_count = saved_frame_count;
+    next_iid = saved_next_iid;
+    view_x = saved_view_x;
+    view_y = saved_view_y;
+    current_room_persistent = (saved_persistent != 0);
+    draw_color = saved_draw_color;
+    draw_alpha = saved_draw_alpha;
+    draw_blend_mode = saved_draw_blend_mode;
+    draw_font = saved_draw_font;
+    draw_halign = saved_draw_halign;
+    draw_valign = saved_draw_valign;
+    next_ds_map = saved_next_ds_map;
+    next_ds_list = saved_next_ds_list;
+    next_ds_grid = saved_next_ds_grid;
+    next_caster_id = saved_next_caster_id;
+    gui_width = saved_gui_width;
+    gui_height = saved_gui_height;
+
+    global_arrays = std::move(new_ga);
+    globals = std::move(new_globals);
+    global_builtins = std::move(new_gb);
+    instances = std::move(new_instances);
+    persistent_rooms = std::move(new_pr);
+    ds_maps = std::move(new_dsm);
+    ds_lists = std::move(new_dsl);
+    ds_grids = std::move(new_dsg);
+    caster_path_to_id = std::move(new_cpath);
+
+    pending_room = -1;
+    cur = nullptr;
+    other = nullptr;
+    env_stack.clear();
+    event_stack.clear();
+    keys_held.clear();
+    keys_pressed.clear();
+    keys_released.clear();
+    mouse_buttons_held.clear();
+    mouse_buttons_pressed.clear();
+    mouse_buttons_released.clear();
+    surface_target_stack.clear();
+
+    // Audio restoration
+    if (audio) {
+        for (const auto& sv : voices) {
+            if (sv.asset >= 10000 && !audio->has_clip(sv.asset)) {
+                for (const auto& cp : caster_path_to_id) {
+                    if (cp.second == sv.asset) {
+                        load_caster_sound(cp.first, sv.asset);
+                        break;
+                    }
+                }
+            }
+        }
+        audio->restore_voices(voices);
+    }
+
+    update_camera();
+    return true;
+}
+
+bool Runtime::save_state_file(const std::string& filepath) const {
+    std::string full_path = normalize_state_filepath(filepath);
+    size_t last_slash = full_path.find_last_of("/\\");
+    if (last_slash != std::string::npos) {
+        std::string dir = full_path.substr(0, last_slash);
+#ifdef _WIN32
+        _mkdir(dir.c_str());
+#else
+        mkdir(dir.c_str(), 0755);
+#endif
+    }
+    std::ofstream ofs(full_path, std::ios::binary);
+    if (!ofs.is_open()) return false;
+    return save_state(ofs);
+}
+
+bool Runtime::load_state_file(const std::string& filepath) {
+    std::string full_path = normalize_state_filepath(filepath);
+    std::ifstream ifs(full_path, std::ios::binary);
+    if (!ifs.is_open()) {
+        ifs.open(filepath, std::ios::binary);
+        if (!ifs.is_open()) return false;
+    }
+    return load_state(ifs);
 }
 
 } // namespace gm14

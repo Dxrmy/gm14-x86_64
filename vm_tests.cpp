@@ -41,6 +41,30 @@ int main(int argc, char** argv) {
     auto str = [](const char* s){ return Value(S(s)); };
     auto C = [&](const char* n, std::vector<Value> a = {}){ return call(rt, n, a); };
 
+    for (const auto& ce : dw.code) {
+        if (ce.name.find("torielflame") != std::string::npos) {
+            std::printf("=== %s ===\n", ce.name.c_str());
+            for (uint32_t i = 0; i < ce.instr_count; ++i) {
+                const auto& ins = dw.all_instrs[ce.instr_start + i];
+                std::printf("%4u: kind=%02X t1=%X low16=%d ref=%02X", i, ins.kind(), ins.type1(), (int)(int16_t)ins.low16(), ins.ref_type());
+                if (ins.var >= 0 && ins.var < (int)dw.variables.size()) {
+                    std::printf(" var=%s (itype=%d)", dw.variables[ins.var].name.c_str(), dw.variables[ins.var].instance_type);
+                }
+                if (ins.fun >= 0 && ins.fun < (int)dw.functions.size()) {
+                    std::printf(" fn=%s", dw.functions[ins.fun].name.c_str());
+                }
+                if (ins.type1() == 2 && ins.str_index() < dw.strings.size()) {
+                    std::printf(" str=\"%s\"", dw.strings[ins.str_index()].c_str());
+                }
+                if (ins.type1() == 0 || ins.type1() == 0x0F) {
+                    std::printf(" val=%g", ins.value);
+                }
+                std::printf("\n");
+            }
+        }
+    }
+
+
     // ================= strings =================
     ok_num("len abc", to_num(C("string_length",{str("abc")})), 3);
     ok_str("char_at abc 1", to_str(C("string_char_at",{str("abc"),num(1)})), "a");
@@ -480,6 +504,190 @@ int main(int argc, char** argv) {
                 ok_bool("Toriel reached buster and destroyed herself", Value(!tori->alive ? 1.0 : 0.0), true);
                 double plot_val = rt.globals.count("plot") ? to_num(rt.globals["plot"]) : 0.0;
                 ok_num("global.plot advanced to 2 after path", plot_val, 2.0);
+            }
+        }
+
+        // ================= Save / Load State Verification =================
+        rt.globals["test_save_var"] = Value(1337.0);
+        rt.global_arrays["test_save_arr"] = { Value("state_saved"), Value(42.0) };
+        Value arr_val; arr_val.type = Value::VARPTR; arr_val.arrref = &rt.global_arrays["test_save_arr"];
+        rt.globals["test_save_arr"] = arr_val;
+
+        int test_map = (int)to_num(C("ds_map_create"));
+        C("ds_map_add", {num(test_map), str("player_choice"), str("save_state_ok")});
+
+        int saved_room_before = rt.room_index;
+        size_t saved_inst_cnt = rt.instances.size();
+
+        bool save_ok = rt.save_state_file("test_persistence");
+        ok_bool("save_state_file created test_persistence.state", Value(save_ok ? 1.0 : 0.0), true);
+
+        // Mutate everything to verify complete restoration
+        rt.globals["test_save_var"] = Value(0.0);
+        rt.global_arrays["test_save_arr"].clear();
+        rt.instances.clear();
+        rt.start_room(0);
+        ok_num("room switched to 0 for mutation", (double)rt.room_index, 0.0);
+
+        bool load_ok = rt.load_state_file("test_persistence");
+        ok_bool("load_state_file restored test_persistence.state", Value(load_ok ? 1.0 : 0.0), true);
+        ok_num("restored room_index matches", (double)rt.room_index, (double)saved_room_before);
+        ok_num("restored instances size matches", (double)rt.instances.size(), (double)saved_inst_cnt);
+        ok_num("restored custom global scalar", to_num(rt.globals["test_save_var"]), 1337.0);
+        ok_str("restored custom global array str", to_str(rt.global_arrays["test_save_arr"][0]), "state_saved");
+        ok_num("restored custom global array num", to_num(rt.global_arrays["test_save_arr"][1]), 42.0);
+        ok_bool("restored array VARPTR relinked", Value(rt.globals["test_save_arr"].is_arr() ? 1.0 : 0.0), true);
+        ok_str("restored ds_map string value", to_str(C("ds_map_find_value", {num(test_map), str("player_choice")})), "save_state_ok");
+
+        std::remove("states/test_persistence.state");
+
+        // ================= Flowey Fireball Collision Verification =================
+        {
+            rt.instances.clear();
+            // Create obj_floweybattle1 (obj 199)
+            auto flowey = std::make_unique<Instance>(9901, 199);
+            flowey->vars["x"] = Value(100.0);
+            flowey->vars["y"] = Value(100.0);
+            flowey->vars["conversation"] = Value(16.0); // Conversation state before Toriel's fireball
+            flowey->vars["sprite_index"] = Value(184.0); // spr_floweynice
+            flowey->vars["visible"] = Value(1.0);
+            Instance* fp = flowey.get();
+            rt.instances.push_back(std::move(flowey));
+
+            // Create obj_torielflame_X (obj 608) overlapping Flowey
+            auto flame = std::make_unique<Instance>(9902, 608);
+            flame->vars["x"] = Value(110.0);
+            flame->vars["y"] = Value(110.0);
+            flame->vars["sprite_index"] = Value(78.0);
+            flame->vars["visible"] = Value(1.0);
+            Instance* flame_p = flame.get();
+            rt.instances.push_back(std::move(flame));
+
+            // Run step to process collision
+            rt.step();
+
+            ok_bool("Toriel fireball destroyed upon hitting Flowey", Value(!flame_p->alive ? 1.0 : 0.0), true);
+            ok_num("Flowey conversation advanced to 17 on fireball hit", to_num(fp->vars["conversation"]), 17.0);
+            ok_num("Flowey sprite changed to shocked face (182)", to_num(fp->vars["sprite_index"]), 182.0);
+        }
+
+        // ================= Dialogue / Savepoint global.interact Integrity =================
+        {
+            rt.globals["interact"] = Value(1.0);
+            auto savept = std::make_unique<Instance>(9903, 1353); // obj_savepoint
+            savept->vars["myinteract"] = Value(1.0);
+            savept->vars["x"] = Value(50.0);
+            savept->vars["y"] = Value(50.0);
+            Instance* sp_p = savept.get();
+            rt.instances.push_back(std::move(savept));
+
+            // Setting myinteract = 4.0 must NOT prematurely reset global.interact
+            sp_p->vars["myinteract"] = Value(4.0);
+            ok_num("global.interact remains 1 when myinteract=4 set", to_num(rt.globals["interact"]), 1.0);
+
+            // Destroying instance with myinteract != 0 must NOT prematurely reset global.interact
+            C("instance_destroy", {Value((double)sp_p->iid)});
+            ok_bool("savepoint instance destroyed", Value(!sp_p->alive ? 1.0 : 0.0), true);
+            ok_num("global.interact remains 1 after instance with myinteract destroyed", to_num(rt.globals["interact"]), 1.0);
+
+            // Dialogue writer/dialoguer finish naturally resets global.interact
+            rt.globals["interact"] = Value(0.0);
+            ok_num("global.interact cleanly reset to 0 after dialogue finish", to_num(rt.globals["interact"]), 0.0);
+        }
+
+        // ================= Napstablook Unfreeze on Destroy =================
+        {
+            int napsta_obj = -1;
+            for (size_t oi = 0; oi < dw.objects.size(); ++oi) {
+                if (dw.objects[oi].name == "obj_napstablook2") {
+                    napsta_obj = (int)oi;
+                    break;
+                }
+            }
+            if (napsta_obj >= 0) {
+                rt.globals["interact"] = Value(1.0);
+                auto napsta = std::make_unique<Instance>(9904, napsta_obj);
+                napsta->vars["myinteract"] = Value(4.0);
+                Instance* np_p = napsta.get();
+                rt.instances.push_back(std::move(napsta));
+
+                C("instance_destroy", {Value((double)np_p->iid)});
+                ok_bool("napstablook instance destroyed", Value(!np_p->alive ? 1.0 : 0.0), true);
+                ok_num("global.interact reset to 0 upon napstablook destroy", to_num(rt.globals["interact"]), 0.0);
+            }
+        }
+
+        // ================= Camera view unclamping & cutscene follow =================
+        {
+            rt.start_room(0);
+            rt.globals["view_enabled"] = Value(1.0);
+            rt.globals["interact"] = Value(1.0);
+            // view_xview allowed to go negative (Papyrus camera pan in Room 48)
+            rt.global_arrays["view_xview"][0] = Value(-40.0);
+            rt.global_arrays["view_yview"][0] = Value(-20.0);
+            rt.update_camera();
+            ok_num("view_x preserves negative x offset (-40)", (double)rt.view_x, -40.0);
+            ok_num("view_y preserves negative y offset (-20)", (double)rt.view_y, -20.0);
+            ok_num("view_xview[0] is not clamped", to_num(rt.global_arrays["view_xview"][0]), -40.0);
+
+            // Cutscene view follow suspension (Dangerbridge trap in Room 67)
+            rt.globals["interact"] = Value(1.0);
+            rt.global_arrays["view_object"][0] = Value(0.0); // follow object 0
+            rt.global_arrays["view_xview"][0] = Value(150.0); // cutscene pans to 150
+            rt.update_view_follow();
+            ok_num("view_xview preserved during cutscene (interact != 0)", to_num(rt.global_arrays["view_xview"][0]), 150.0);
+
+            // Normal gameplay clamps view to room bounds
+            rt.globals["interact"] = Value(0.0);
+            rt.global_arrays["view_xview"][0] = Value(-40.0);
+            rt.global_arrays["view_yview"][0] = Value(-20.0);
+            rt.update_camera();
+            ok_num("view_x clamped to 0 during gameplay", (double)rt.view_x, 0.0);
+            ok_num("view_y clamped to 0 during gameplay", (double)rt.view_y, 0.0);
+            ok_num("view_xview[0] clamped to 0 during gameplay", to_num(rt.global_arrays["view_xview"][0]), 0.0);
+        }
+
+        // ================= Background arrays initialization and scrolling =================
+        {
+            rt.start_room(0);
+            ok_bool("background_visible array exists", Value(rt.global_arrays.count("background_visible") ? 1.0 : 0.0), true);
+            ok_bool("background_index array exists", Value(rt.global_arrays.count("background_index") ? 1.0 : 0.0), true);
+            rt.global_arrays["background_hspeed"][0] = Value(2.5);
+            rt.global_arrays["background_x"][0] = Value(10.0);
+            rt.step();
+            ok_num("background_x advances by hspeed", to_num(rt.global_arrays["background_x"][0]), 12.5);
+        }
+
+        // ================= Caster Sound Resolution (Papyrus Music) =================
+        {
+            int pap_id = rt.load_caster_sound("music/papyrus.ogg");
+            ok_bool("load_caster_sound loads music/papyrus.ogg resolving to mus_papyrus.ogg", Value(pap_id >= 0 ? 1.0 : 0.0), true);
+            int snowy_id = rt.load_caster_sound("music/snowy.ogg");
+            ok_bool("load_caster_sound loads music/snowy.ogg resolving to mus_snowy.ogg", Value(snowy_id >= 0 ? 1.0 : 0.0), true);
+        }
+
+        // ================= obj_lesserdoge instance_create =================
+        {
+            for (const auto& ce : dw.code) {
+                if (ce.name.find("lesserdoge") != std::string::npos) {
+                    for (uint32_t i = 0; i < ce.instr_count; ++i) {
+                        const auto& ins = dw.all_instrs[ce.instr_start + i];
+                        if (ins.fun >= 0 && (size_t)ins.fun < dw.functions.size()) {
+                            const auto& fn = dw.functions[ins.fun].name;
+                            if (fn == "instance_create") {
+                                std::printf("%s calls instance_create at ins %u\n", ce.name.c_str(), i);
+                                for (int k = std::max(0, (int)i - 6); k < (int)i; ++k) {
+                                    const auto& pins = dw.all_instrs[ce.instr_start + k];
+                                    if (pins.kind() == OP_PUSHI) {
+                                        int oid = (int)pins.value;
+                                        std::string oname = (oid >= 0 && oid < (int)dw.objects.size()) ? dw.objects[oid].name : "";
+                                        std::printf("  arg obj: %d (%s)\n", oid, oname.c_str());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

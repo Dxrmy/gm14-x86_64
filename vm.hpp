@@ -10,6 +10,7 @@
 #include <set>
 #include <utility>
 #include <algorithm>
+#include <iostream>
 
 namespace gm14 {
 
@@ -269,6 +270,13 @@ public:
 
     void step();
     Image draw();
+
+    // State Saver & Loader
+    bool save_state(std::ostream& os) const;
+    bool load_state(std::istream& is);
+    bool save_state_file(const std::string& filepath) const;
+    bool load_state_file(const std::string& filepath);
+    int load_caster_sound(const std::string& raw_name, int forced_id = -1);
 
     Value call(const std::string& name, std::vector<Value>& args);
     Value run_entry(const CodeEntry* entry, std::vector<Value>& args,

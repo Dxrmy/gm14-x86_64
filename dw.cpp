@@ -400,10 +400,12 @@ void DataWin::parse_sprites() {
         s.name = str_content(u32(p));
         s.width = u32(p+4); s.height = u32(p+8);
         s.ml = i32(p+12); s.mr = i32(p+16); s.mb = i32(p+20); s.mt = i32(p+24);
+        s.sep_masks = u32(p+44);
         s.origin_x = i32(p+48); s.origin_y = i32(p+52);
         uint32_t tag = u32(p+56);
         uint32_t fc = 0;
         uint32_t frames_start = 0;
+        uint32_t mask_start = 0;
         if (tag == 0xFFFFFFFF) {
             // Modern GMS sprite format (bytecode 17+ / GMS2 / updated GMS 1.4)
             uint32_t sversion = u32(p+60);
@@ -415,15 +417,26 @@ void DataWin::parse_sprites() {
                 frames_start = p+80;
             }
             if (fc > 10000) fc = 0;
+            mask_start = frames_start + 4 * fc;
         } else {
             // Classic GMS 1.4 sprite format
             fc = tag;
             frames_start = p+60;
+            mask_start = frames_start + 4 * fc;
         }
         for (uint32_t i = 0; i < fc; ++i) {
             uint32_t fp = u32(frames_start + 4*i);
             auto it = tmap.find(fp);
             s.frames.push_back(it == tmap.end() ? -1 : it->second);
+        }
+        if (s.sep_masks == 1 && s.width > 0 && s.height > 0) {
+            uint32_t mc = u32(mask_start);
+            s.mask_count = mc;
+            uint32_t stride = (s.width + 7) / 8;
+            uint32_t total_bytes = mc * stride * s.height;
+            if (total_bytes > 0 && total_bytes < 50000000) {
+                s.mask_data = bytes_at(mask_start + 4, total_bytes);
+            }
         }
         sprites.push_back(std::move(s));
     }
@@ -914,8 +927,10 @@ Image DataWin::render_room(int room_index) const {
                 blit(canvas, rs, bg.x, bg.y);
             } else {
                 // Support tile_x only, tile_y only, or both correctly
-                int step_x = std::max(1, src.w);
-                int step_y = std::max(1, src.h);
+                int orig_w = (tp->bw > 0) ? (int)tp->bw : (int)tp->sw;
+                int orig_h = (tp->bh > 0) ? (int)tp->bh : (int)tp->sh;
+                int step_x = std::max(1, orig_w);
+                int step_y = std::max(1, orig_h);
                 int start_x = bg.x;
                 int end_x = bg.x + 1;
                 if (bg.tile_x) {
@@ -932,7 +947,7 @@ Image DataWin::render_room(int room_index) const {
                 }
                 for (int cy = start_y; cy < end_y; cy += step_y) {
                     for (int cx = start_x; cx < end_x; cx += step_x) {
-                        blit(canvas, src, cx, cy);
+                        blit(canvas, src, cx + tp->tx, cy + tp->ty);
                     }
                 }
             }

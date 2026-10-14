@@ -80,6 +80,17 @@ struct Voice {
     double cursor = 0.0;
 };
 
+struct SavedVoice {
+    int asset = -1;
+    int handle = 0;
+    bool loop = false;
+    bool paused = false;
+    double position_seconds = 0.0;
+    double gain = 1.0;
+    double pitch = 1.0;
+    double priority = 1.0;
+};
+
 class AudioEngine {
 public:
     AudioEngine();
@@ -153,6 +164,10 @@ public:
 
     // Flush accumulated samples to the backend.
     void flush();
+
+    // State save / restore
+    std::vector<SavedVoice> get_active_voices() const;
+    void restore_voices(const std::vector<SavedVoice>& voices);
 
 private:
     Voice* find_free_voice();

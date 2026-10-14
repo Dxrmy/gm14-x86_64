@@ -48,3 +48,8 @@ check_*
 find_*
 test_*
 *.txt
+disasm_*
+obj_info*
+scratch_*
+search_msg.py
+*.ppm

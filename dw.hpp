@@ -98,7 +98,21 @@ struct Sprite {
     uint32_t width = 0, height = 0;
     int32_t ml = 0, mr = 0, mb = 0, mt = 0;
     int32_t origin_x = 0, origin_y = 0;
+    uint32_t sep_masks = 0;
+    uint32_t mask_count = 0;
     std::vector<int> frames;       // TPAG indices
+    std::vector<uint8_t> mask_data; // 1-bit per pixel collision mask data
+
+    bool is_precise() const { return sep_masks == 1 && !mask_data.empty(); }
+    bool mask_pixel(uint32_t frame, int x, int y) const {
+        if (x < 0 || y < 0 || (uint32_t)x >= width || (uint32_t)y >= height) return false;
+        if (mask_data.empty()) return true;
+        uint32_t stride = (width + 7) / 8;
+        uint32_t f = (mask_count > 0) ? (frame % mask_count) : 0;
+        uint32_t offset = f * (stride * height) + (uint32_t)y * stride + ((uint32_t)x / 8);
+        if (offset >= mask_data.size()) return false;
+        return (mask_data[offset] & (1 << (7 - ((uint32_t)x % 8)))) != 0;
+    }
 };
 
 struct Bgnd {
